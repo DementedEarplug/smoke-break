@@ -61,7 +61,7 @@ async function start(id: platform.Identity) {
   const net = createSession(
     { type: 'hello', teamCode: id.teamCode, clientId: id.clientId, name: id.name },
     {
-      onTeam: (team) => widget.setTeam(team),
+      onTeam: (team, you) => widget.setTeam(team, you),
       onError: (message) => widget.showToast(message),
       onFatal: async () => {
         // The team is gone (e.g. the server lost it): send them back to onboarding.
@@ -74,7 +74,7 @@ async function start(id: platform.Identity) {
 
   let look = loadAppearance();
   const widget = new Widget(document.getElementById('app')!, {
-    me: id.clientId,
+    storageKey: id.clientId,
     now: () => net.now(),
     send: (m) => net.send(m),
     scale: look.scale,

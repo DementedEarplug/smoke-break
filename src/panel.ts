@@ -25,8 +25,8 @@ function start(first: JoinMsg, joining: boolean) {
   createAppearancePanel(lookEl);
 
   const net = createSession(first, {
-    onTeam(team) {
-      panel.setTeam(team);
+    onTeam(team, you) {
+      panel.setTeam(team, you);
       if (joining) {
         joining = false;
         void emit('identity-changed');
@@ -41,7 +41,6 @@ function start(first: JoinMsg, joining: boolean) {
   });
 
   const panel = createTeamPanel(panelEl, {
-    me: first.clientId,
     net,
     hint: 'Click the pack to start a break · drag it anywhere · right-click it for do-not-disturb',
     actions: () => {

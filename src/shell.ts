@@ -108,7 +108,7 @@ export function showOnboarding(
 // ── Team panel ──────────────────────────────────────────────────────────────
 
 export interface TeamPanel {
-  setTeam(team: TeamView): void;
+  setTeam(team: TeamView, you: string): void;
   setStatus(status: NetStatus): void;
   setError(message: string): void;
 }
@@ -116,7 +116,6 @@ export interface TeamPanel {
 export function createTeamPanel(
   panel: HTMLElement,
   opts: {
-    me: string;
     net: Net;
     /** Extra buttons for the host (e.g. "Open a teammate tab", "Leave team"). */
     actions?: () => HTMLElement[];
@@ -124,6 +123,7 @@ export function createTeamPanel(
   },
 ): TeamPanel {
   let team: TeamView | null = null;
+  let you = '';
   let status: NetStatus = 'connecting';
   let settingsOpen = false;
   let panelError = '';
@@ -162,7 +162,7 @@ export function createTeamPanel(
       'ul',
       { class: 'sb-members' },
       ...team.members.map((m) =>
-        h('li', { class: m.online ? 'online' : '' }, m.name + (m.id === opts.me ? ' (you)' : '')),
+        h('li', { class: m.online ? 'online' : '' }, m.name + (m.id === you ? ' (you)' : '')),
       ),
     );
 
@@ -234,8 +234,9 @@ export function createTeamPanel(
 
   render();
   return {
-    setTeam(t) {
+    setTeam(t, me) {
       team = t;
+      you = me;
       render();
     },
     setStatus(s) {

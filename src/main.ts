@@ -37,13 +37,13 @@ function start(first: JoinMsg) {
   createAppearancePanel(lookEl);
 
   const net = createSession(first, {
-    onTeam(team) {
+    onTeam(team, you) {
       if (params.get('team') !== team.code) {
         params.set('team', team.code);
         history.replaceState(null, '', `${location.pathname}?${params}`);
       }
-      widget.setTeam(team);
-      panel.setTeam(team);
+      widget.setTeam(team, you);
+      panel.setTeam(team, you);
     },
     onError(message) {
       widget.showToast(message);
@@ -55,7 +55,7 @@ function start(first: JoinMsg) {
 
   const look = loadAppearance();
   const widget = new Widget(desktop, {
-    me: first.clientId,
+    storageKey: first.clientId,
     now: () => net.now(),
     send: (m) => net.send(m),
     scale: look.scale,
@@ -69,7 +69,6 @@ function start(first: JoinMsg) {
     widget.setTheme(a.theme);
   });
   const panel = createTeamPanel(panelEl, {
-    me: first.clientId,
     net,
     hint: 'Click the pack to start a break · drag to move it · right-click for do-not-disturb',
     actions: () => {

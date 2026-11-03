@@ -47,6 +47,7 @@ export interface Break {
 }
 
 export interface MemberView {
+  /** Public id, not the member's private clientId. */
   id: string;
   name: string;
   online: boolean;
@@ -73,5 +74,6 @@ export type ClientMsg =
   | { type: 'settings'; zoomLink?: string; defaultLengthMin?: number; teamName?: string };
 
 export type ServerMsg =
+  /** `you` is your public id: compare it with member and participant ids. */
   | { type: 'state'; team: TeamView; you: string; serverNow: number }
   | { type: 'error'; message: string; fatal?: boolean };

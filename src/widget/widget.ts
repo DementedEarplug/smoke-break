@@ -25,7 +25,8 @@ const BUBBLE_GAP = 3;
 const DRAG_THRESHOLD = 4;
 
 export interface WidgetOptions {
-  me: string;
+  /** Private per-identity key for local storage (so teammate tabs don't share settings). */
+  storageKey: string;
   now(): number;
   send(msg: ClientMsg): void;
   /** Set when the widget is the whole overlay window rather than an element on a page. */
@@ -66,6 +67,8 @@ export class Widget {
   private team: TeamView | null = null;
   private dnd: boolean;
   private flickAt: number | null = null;
+  /** My public member id; empty until the first state arrives. */
+  private me = '';
   /** Lit but waiting for the light-up animation to finish before opening the call. */
   private meetingAfterLight: { since: number; litSeen: number | null } | null = null;
   /** Browser: the delayed popup was blocked, so the next click on the pack opens it. */
@@ -127,8 +130,10 @@ export class Widget {
     requestAnimationFrame(frame);
   }
 
-  setTeam(team: TeamView) {
+  /** `you` is my public member id, as used in the break's participants. */
+  setTeam(team: TeamView, you: string) {
     this.team = team;
+    this.me = you;
     const url = team.brk?.meetingUrl;
     if (url && this.pendingMeetingWindow) {
       this.pendingMeetingWindow.location.href = url;
@@ -215,18 +220,18 @@ export class Widget {
   }
 
   private get myParticipant() {
-    return this.brk?.participants.find((p) => p.id === this.opts.me) ?? null;
+    return this.brk?.participants.find((p) => p.id === this.me) ?? null;
   }
 
   private get canAdjustLength() {
     const b = this.brk;
-    return !!b && b.phase === 'pending' && b.startedBy === this.opts.me && b.participants.length === 1;
+    return !!b && b.phase === 'pending' && b.startedBy === this.me && b.participants.length === 1;
   }
 
   private tick(dt: number) {
     const input = {
       brk: this.brk,
-      me: this.opts.me,
+      me: this.me,
       dnd: this.dnd,
       now: this.opts.now(),
       flickAt: this.flickAt,
@@ -252,7 +257,7 @@ export class Widget {
   private bubbleText(): string | null {
     if (this.toast) return this.toast.text;
     const b = this.brk;
-    const me = this.opts.me;
+    const me = this.me;
     const mine = this.myParticipant;
     const hover = this.hover;
 
@@ -390,7 +395,7 @@ export class Widget {
       return;
     }
     const now = performance.now();
-    if (wait.litSeen === null && this.scene.isLit(this.opts.me)) wait.litSeen = now;
+    if (wait.litSeen === null && this.scene.isLit(this.me)) wait.litSeen = now;
     if ((wait.litSeen !== null && now - wait.litSeen >= LIT_PAUSE_MS) || now - wait.since >= MAX_LIGHT_WAIT_MS) {
       this.meetingAfterLight = null;
       this.openMeeting();
@@ -438,7 +443,7 @@ export class Widget {
 
   /** Per identity, so teammate tabs in one browser don't share it. */
   private get dndKey() {
-    return `sb:dnd:${this.opts.me}`;
+    return `sb:dnd:${this.opts.storageKey}`;
   }
 
   private toggleDnd() {
@@ -462,7 +467,7 @@ export class Widget {
 
   private hitAt(e: { clientX: number; clientY: number }) {
     const p = this.toScene(e);
-    return this.scene.hit(p.x, p.y, this.opts.me);
+    return this.scene.hit(p.x, p.y, this.me);
   }
 
   private bindEvents() {

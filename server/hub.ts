@@ -1,7 +1,7 @@
 // Realtime hub: one shared break per team, broadcast to every connected pack.
 // The server owns the clock: every deadline is scheduled here.
 
-import { randomInt, randomUUID } from 'node:crypto';
+import { createHash, randomInt, randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { IncomingMessage } from 'node:http';
@@ -26,6 +26,9 @@ const DISCONNECT_GRACE_MS = 20_000;
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 
 interface Member {
+  /** The client's private clientId. Proves who a socket is; never sent to anyone. */
+  key: string;
+  /** Public id shown to teammates and used in breaks. */
   id: string;
   name: string;
   sockets: Set<WebSocket>;
@@ -45,8 +48,19 @@ interface Team {
 
 type SavedTeam = Pick<Team, 'code' | 'name' | 'defaultLengthMin' | 'zoomLink' | 'meetingProvider'>;
 
+const NAME_MAX = 24;
 const cleanName = (s: unknown, fallback: string) =>
-  (typeof s === 'string' ? s.trim().replace(/\s+/g, ' ').slice(0, 24) : '') || fallback;
+  (typeof s === 'string' ? s.trim().replace(/\s+/g, ' ').slice(0, NAME_MAX) : '') || fallback;
+
+/** clientIds are the only proof of identity, so they must be long random strings. */
+const CLIENT_ID = /^[A-Za-z0-9_-]{16,64}$/;
+
+/**
+ * Teammates see a one-way hash of the clientId, scoped to the team: stable across
+ * reconnects, but it can't be turned back into the clientId to impersonate someone.
+ */
+export const publicId = (teamCode: string, clientId: string) =>
+  createHash('sha256').update(`${teamCode}:${clientId}`).digest('base64url').slice(0, 16);
 
 export function isValidMeetingLink(s: string): boolean {
   if (s === '') return true;
@@ -169,13 +183,25 @@ export function createHub(opts: { dataFile: string }) {
     }
   }
 
+  /** Two people can't share a display name, so nobody can pass as someone else. */
+  function uniqueName(team: Team, key: string, name: string) {
+    const taken = new Set(
+      [...team.members.values()].filter((m) => m.key !== key).map((m) => m.name.toLowerCase()),
+    );
+    for (let n = 2, candidate = name; ; n++) {
+      if (!taken.has(candidate.toLowerCase())) return candidate;
+      const suffix = ` ${n}`;
+      candidate = name.slice(0, NAME_MAX - suffix.length) + suffix;
+    }
+  }
+
   function attach(team: Team, ws: WebSocket, clientId: string, name: string) {
     let m = team.members.get(clientId);
     if (!m) {
-      m = { id: clientId, name, sockets: new Set(), leaveTimer: null };
+      m = { key: clientId, id: publicId(team.code, clientId), name, sockets: new Set(), leaveTimer: null };
       team.members.set(clientId, m);
     }
-    m.name = name;
+    m.name = uniqueName(team, clientId, name);
     m.sockets.add(ws);
     if (m.leaveTimer) clearTimeout(m.leaveTimer);
     m.leaveTimer = null;
@@ -189,7 +215,7 @@ export function createHub(opts: { dataFile: string }) {
       m.leaveTimer = setTimeout(() => {
         m.leaveTimer = null;
         if (m.sockets.size > 0) return;
-        team.members.delete(m.id);
+        team.members.delete(m.key);
         apply(team, machine.leave(team.brk, m.id, Date.now()));
       }, DISCONNECT_GRACE_MS);
     }
@@ -245,8 +271,8 @@ export function createHub(opts: { dataFile: string }) {
 
       if (msg.type === 'create' || msg.type === 'hello') {
         if (team) return;
-        const clientId = typeof msg.clientId === 'string' ? msg.clientId.slice(0, 64) : '';
-        if (!clientId) return;
+        const clientId = typeof msg.clientId === 'string' ? msg.clientId : '';
+        if (!CLIENT_ID.test(clientId)) return send(ws, { type: 'error', message: 'Invalid client id.', fatal: true });
         const name = cleanName(msg.name, 'Someone');
         if (msg.type === 'create') {
           const code = newCode();
@@ -279,6 +305,14 @@ export function createHub(opts: { dataFile: string }) {
   });
 
   return {
+    /** Stops timers so tests can exit cleanly. */
+    close() {
+      for (const team of teams.values()) {
+        if (team.timer) clearTimeout(team.timer);
+        for (const m of team.members.values()) if (m.leaveTimer) clearTimeout(m.leaveTimer);
+      }
+      wss.close();
+    },
     handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer) {
       wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
     },

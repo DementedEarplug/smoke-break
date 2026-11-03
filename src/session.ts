@@ -6,7 +6,8 @@ import * as platform from './platform.ts';
 import type { JoinMsg } from './shell.ts';
 
 export interface SessionHandlers {
-  onTeam(team: TeamView): void;
+  /** `you` is your public member id in this team. */
+  onTeam(team: TeamView, you: string): void;
   /** Recoverable errors (e.g. a rejected setting). */
   onError(message: string): void;
   /** The team couldn't be joined at all; the connection is closed. */
@@ -34,7 +35,7 @@ export function createSession(first: JoinMsg, handlers: SessionHandlers): Net {
         hello = { type: 'hello', teamCode: msg.team.code, clientId: hello.clientId, name: hello.name };
       }
       if (platform.savedTeam() !== msg.team.code) platform.saveTeam(msg.team.code);
-      handlers.onTeam(msg.team);
+      handlers.onTeam(msg.team, msg.you);
     },
     (s) => handlers.onStatus?.(s),
   );
