@@ -256,16 +256,26 @@ export function createHub(opts: { dataFile: string; limits?: Partial<HubLimits> 
     if (effect.type === 'meeting:start') {
       provider
         .startMeeting(ctx)
-        .catch(() => null)
-        // Fallback: if the provider fails, quietly use the fixed link so a break always starts.
+        .catch((err: unknown) => {
+          console.warn(`[smoke-break] ${team.meetingProvider} failed for team ${team.code}; using the fixed link.`, err);
+          return null;
+        })
+        // Fallback: use the fixed link so a break always starts.
         .then((url) => url ?? fixedLinkProvider.startMeeting(ctx))
         .then((url) => {
           if (team.brk?.id !== brk.id) return;
+          // Everyone's machine opens this link, so it gets the same check as the team setting.
+          if (url && !isValidMeetingLink(url)) {
+            console.warn(`[smoke-break] ignoring a meeting link that isn't an allowed Zoom URL (team ${team.code}).`);
+            url = null;
+          }
           team.brk = { ...team.brk, meetingUrl: url };
           broadcast(team);
         });
     } else {
-      provider.endMeeting(ctx).catch(() => {});
+      provider.endMeeting(ctx).catch((err: unknown) => {
+        console.warn(`[smoke-break] ending the ${team.meetingProvider} meeting failed for team ${team.code}.`, err);
+      });
     }
   }
 

@@ -23,12 +23,19 @@ export const fixedLinkProvider: MeetingProvider = {
   async endMeeting() {},
 };
 
+let warnedZoomApi = false;
+
 export function getProvider(kind: MeetingProviderKind): MeetingProvider {
   switch (kind) {
     case 'fixed-link':
       return fixedLinkProvider;
     case 'zoom-api':
-      // Option B isn't built yet; fall back so a break always starts.
+      // Option B isn't built yet; fall back so a break always starts, but say so.
+      // When it is: keep API credentials in the environment, never in teams.json.
+      if (!warnedZoomApi) {
+        warnedZoomApi = true;
+        console.warn('[smoke-break] zoom-api meetings are not implemented yet; using the fixed link.');
+      }
       return fixedLinkProvider;
   }
 }
