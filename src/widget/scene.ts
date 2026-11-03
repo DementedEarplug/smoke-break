@@ -50,6 +50,23 @@ interface CigVis {
   nextPuff: number;
 }
 
+/** Where a cigarette is this frame; see `Scene.geometry`. */
+interface Pose {
+  paper: number;
+  ash: number;
+  total: number;
+  /** Exact for upright poses. */
+  x: number;
+  top: number;
+  /** Radians clockwise from upright. */
+  angle: number;
+  cx: number;
+  cy: number;
+  tipX: number;
+  tipY: number;
+  inPack: boolean;
+}
+
 interface Particle {
   kind: 'smoke' | 'ash';
   x: number;
@@ -208,7 +225,8 @@ export class Scene {
     // first tips sideways and catches in my lighter's flame; teammates' just catch.
     // Water: the cup in the nook fills.
     const smoke = this.theme === 'smoke';
-    for (const v of [...this.cigs.values()]) {
+    // Deleting from a Map while iterating it is safe.
+    for (const v of this.cigs.values()) {
       v.x += (v.targetX - v.x) * Math.min(1, dt * 10);
       if (!v.removing) {
         v.appear = approach(v.appear, 1, dt * 5);
@@ -315,7 +333,7 @@ export class Scene {
    * Pose of a cigarette: its middle (cx, cy), how far it's turned from upright,
    * and its tip. `x`/`top` are exact for upright poses.
    */
-  private geometry(v: CigVis) {
+  private geometry(v: CigVis): Pose {
     const paper = this.paperLen(v);
     const ash = this.ashLen(v, paper);
     const total = S.cigLength(paper, ash);
@@ -395,7 +413,10 @@ export class Scene {
     ctx.beginPath();
     ctx.rect(0, 0, S.W, S.MOUTH_Y + this.oy + 1);
     ctx.clip();
-    for (const v of this.cigs.values()) if (this.geometry(v).inPack) this.drawOneCig(pen, v);
+    // Work out each pose once per frame; both passes and the hit rects use it.
+    const poses: [CigVis, Pose][] = [];
+    for (const v of this.cigs.values()) poses.push([v, this.geometry(v)]);
+    for (const [v, g] of poses) if (g.inPack) this.drawOneCig(pen, v, g);
     ctx.restore();
 
     S.drawPackFront(packPen, this.flap, this.oy, packSkin);
@@ -405,12 +426,12 @@ export class Scene {
     ctx.beginPath();
     ctx.rect(0, 0, S.W, GROUND);
     ctx.clip();
-    for (const v of this.cigs.values()) if (!this.geometry(v).inPack) this.drawOneCig(pen, v);
+    for (const [v, g] of poses) if (!g.inPack) this.drawOneCig(pen, v, g);
     ctx.restore();
   }
 
-  private drawOneCig(pen: S.Pen, v: CigVis) {
-    const { paper, ash, top, x, total, inPack, angle, cx, cy, tipX, tipY } = this.geometry(v);
+  private drawOneCig(pen: S.Pen, v: CigVis, g: Pose) {
+    const { paper, ash, top, x, total, inPack, angle, cx, cy, tipX, tipY } = g;
     // Emit smoke and drop ash from lit cigarettes.
     if (v.lit && !v.removing) {
       if (this.t >= v.nextPuff) {

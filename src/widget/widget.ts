@@ -11,7 +11,7 @@ import {
   isValidMeetingLink,
 } from '../../shared/protocol.ts';
 import { drawText, textWidth, wrap } from './font.ts';
-import { type Hit, Scene } from './scene.ts';
+import { type Hit, Scene, type SceneInput } from './scene.ts';
 import { type LighterSkin, type PackSkin, LIGHTER_SKINS, PACK_SKINS } from './skins.ts';
 import { COPY, type Theme } from './theme.ts';
 import { H, MOUTH_Y, PACK_W, PACK_X, W } from './sprites.ts';
@@ -101,6 +101,16 @@ export class Widget {
   private lastWake = performance.now();
   /** Set while waiting on a slow quiet-mode frame instead of requestAnimationFrame. */
   private quietTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly input: SceneInput = {
+    brk: null,
+    me: '',
+    dnd: false,
+    now: 0,
+    flickAt: null,
+    packSkin: PACK_SKINS[0],
+    lighterSkin: LIGHTER_SKINS[0],
+    theme: 'smoke',
+  };
 
   constructor(
     parent: HTMLElement,
@@ -283,16 +293,16 @@ export class Widget {
   }
 
   private tick(dt: number) {
-    const input = {
-      brk: this.brk,
-      me: this.me,
-      dnd: this.dnd,
-      now: this.opts.now(),
-      flickAt: this.flickAt,
-      packSkin: this.packSkin,
-      lighterSkin: this.lighterSkin,
-      theme: this.theme,
-    };
+    // One input object, refreshed each frame rather than reallocated.
+    const input = this.input;
+    input.brk = this.brk;
+    input.me = this.me;
+    input.dnd = this.dnd;
+    input.now = this.opts.now();
+    input.flickAt = this.flickAt;
+    input.packSkin = this.packSkin;
+    input.lighterSkin = this.lighterSkin;
+    input.theme = this.theme;
     this.scene.update(input, dt);
     this.scene.draw(input);
     this.maybeOpenMeeting();
