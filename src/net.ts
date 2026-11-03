@@ -1,6 +1,6 @@
 // WebSocket client with auto-reconnect and a server-synced clock.
 
-import type { ClientMsg, ServerMsg } from '../shared/protocol.ts';
+import { type ClientMsg, type ServerMsg, parseServerMsg } from '../shared/protocol.ts';
 import { serverUrl } from './platform.ts';
 
 export type NetStatus = 'connecting' | 'open' | 'closed';
@@ -28,7 +28,8 @@ export class Net {
       ws.send(JSON.stringify(this.hello()));
     };
     ws.onmessage = (e) => {
-      const msg = JSON.parse(e.data) as ServerMsg;
+      const msg = parseServerMsg(e.data);
+      if (!msg) return;
       if (msg.type === 'state') this.offset = msg.serverNow - Date.now();
       this.onMessage(msg);
     };

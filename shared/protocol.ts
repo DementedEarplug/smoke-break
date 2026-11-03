@@ -102,3 +102,29 @@ export type ServerMsg =
   /** `you` is your public id: compare it with member and participant ids. */
   | { type: 'state'; team: TeamView; you: string; serverNow: number }
   | { type: 'error'; message: string; fatal?: boolean };
+
+/** Parses a frame from the hub, or returns null if it isn't a message we understand. */
+export function parseServerMsg(data: unknown): ServerMsg | null {
+  if (typeof data !== 'string') return null;
+  let msg: unknown;
+  try {
+    msg = JSON.parse(data);
+  } catch {
+    return null;
+  }
+  if (!msg || typeof msg !== 'object') return null;
+  const m = msg as Record<string, unknown>;
+  if (m.type === 'error') return typeof m.message === 'string' ? (m as ServerMsg) : null;
+  if (m.type === 'state') {
+    const team = m.team as Record<string, unknown> | null;
+    const ok =
+      typeof m.you === 'string' &&
+      typeof m.serverNow === 'number' &&
+      !!team &&
+      typeof team === 'object' &&
+      typeof team.code === 'string' &&
+      Array.isArray(team.members);
+    return ok ? (m as ServerMsg) : null;
+  }
+  return null;
+}
