@@ -11,6 +11,11 @@ export class WindowLimiter {
     this.windowMs = windowMs;
   }
 
+  /** True if the key has used up its limit (without recording anything). */
+  blocked(key: string, now = Date.now()): boolean {
+    return (this.hits.get(key) ?? []).filter((t) => now - t < this.windowMs).length >= this.max;
+  }
+
   /** Records an event and returns false if the key is over its limit. */
   take(key: string, now = Date.now()): boolean {
     const recent = (this.hits.get(key) ?? []).filter((t) => now - t < this.windowMs);

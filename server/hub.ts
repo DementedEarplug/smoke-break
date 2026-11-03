@@ -35,6 +35,10 @@ export interface HubLimits {
   /** Saved teams nobody has used for this long are forgotten. */
   teamIdleDays: number;
   createsPerIpPerHour: number;
+  /** Wrong invite codes allowed per IP every 10 minutes, so codes can't be guessed. */
+  badCodesPerIp: number;
+  /** Delay before saying a code is wrong. */
+  badCodeDelayMs: number;
   connectionsPerIp: number;
   /** Per-socket message rate: bursts of `messageBurst`, then `messagesPerSecond`. */
   messageBurst: number;
@@ -46,6 +50,8 @@ export const DEFAULT_LIMITS: HubLimits = {
   maxTeams: Number(process.env.SMOKE_BREAK_MAX_TEAMS) || 2000,
   teamIdleDays: 90,
   createsPerIpPerHour: 10,
+  badCodesPerIp: 20,
+  badCodeDelayMs: 500,
   connectionsPerIp: 30,
   messageBurst: 30,
   messagesPerSecond: 10,
@@ -101,6 +107,7 @@ export function createHub(opts: { dataFile: string; limits?: Partial<HubLimits> 
   const teams = new Map<string, Team>();
   const wss = new WebSocketServer({ noServer: true, maxPayload: limits.maxPayloadBytes });
   const creates = new WindowLimiter(limits.createsPerIpPerHour, 3_600_000);
+  const badCodes = new WindowLimiter(limits.badCodesPerIp, 600_000);
   const connections = new Map<string, number>();
 
   load();
@@ -370,8 +377,16 @@ export function createHub(opts: { dataFile: string; limits?: Partial<HubLimits> 
           teams.set(code, team);
           save();
         } else {
-          team = teams.get(String(msg.teamCode).toUpperCase().trim()) ?? null;
-          if (!team) return send(ws, { type: 'error', message: 'No team with that invite code.', fatal: true });
+          // Once an address has guessed wrong too often, refuse even right codes for a while.
+          const blocked = badCodes.blocked(ip);
+          team = blocked ? null : (teams.get(String(msg.teamCode).toUpperCase().trim()) ?? null);
+          if (!team) {
+            const message = blocked || !badCodes.take(ip)
+              ? 'Too many wrong invite codes. Try again in a few minutes.'
+              : 'No team with that invite code.';
+            setTimeout(() => send(ws, { type: 'error', message, fatal: true }), limits.badCodeDelayMs);
+            return;
+          }
         }
         me = attach(team, ws, clientId, name);
         return;

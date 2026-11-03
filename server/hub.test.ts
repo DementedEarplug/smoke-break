@@ -248,3 +248,26 @@ describe('hub limits', () => {
     await expect(connect()).rejects.toThrow(/429/);
   });
 });
+
+describe('hub invite codes', () => {
+  it('locks out an address that guesses too many codes', async () => {
+    hub.close();
+    hub = createHub({
+      dataFile: join(mkdtempSync(join(tmpdir(), 'sb-hub-')), 'teams.json'),
+      limits: { badCodesPerIp: 2, badCodeDelayMs: 0 },
+    });
+    const owner = await connect();
+    owner.send({ type: 'create', teamName: 'Real', clientId: 'owner-client-id-000000', name: 'O' });
+    const real = (await owner.state()).team.code;
+    const guess = async (c: string) => {
+      const g = await connect();
+      g.send({ type: 'hello', teamCode: c, clientId: 'guesser-client-id-0000', name: 'G' });
+      return g.next((_m): _m is ServerMsg => true);
+    };
+    expect(await guess('AAAAAA')).toMatchObject({ type: 'error', message: expect.stringMatching(/No team/) });
+    expect(await guess('BBBBBB')).toMatchObject({ type: 'error', message: expect.stringMatching(/No team/) });
+    expect(await guess('CCCCCC')).toMatchObject({ type: 'error', message: expect.stringMatching(/Too many/) });
+    // Even the right code is refused until the window passes.
+    expect(await guess(real)).toMatchObject({ type: 'error', message: expect.stringMatching(/Too many/) });
+  });
+});
