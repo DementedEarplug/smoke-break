@@ -5,9 +5,8 @@
 import {
   type Break,
   type ClientMsg,
-  MAX_LENGTH_MIN,
-  MIN_LENGTH_MIN,
   type TeamView,
+  clampLength,
   isValidMeetingLink,
 } from '../../shared/protocol.ts';
 import { drawText, textWidth, wrap } from './font.ts';
@@ -501,7 +500,7 @@ export class Widget {
 
   private adjustLength(delta: number) {
     if (!this.canAdjustLength) return;
-    const next = Math.min(MAX_LENGTH_MIN, Math.max(MIN_LENGTH_MIN, this.brk!.lengthMin + delta));
+    const next = clampLength(this.brk!.lengthMin + delta);
     if (next !== this.brk!.lengthMin) this.opts.send({ type: 'setLength', lengthMin: next });
   }
 
