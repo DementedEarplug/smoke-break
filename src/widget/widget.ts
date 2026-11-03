@@ -8,6 +8,7 @@ import {
   MAX_LENGTH_MIN,
   MIN_LENGTH_MIN,
   type TeamView,
+  isValidMeetingLink,
 } from '../../shared/protocol.ts';
 import { drawText, textWidth, wrap } from './font.ts';
 import { type Hit, Scene } from './scene.ts';
@@ -49,6 +50,12 @@ const fmtClock = (ms: number) => {
   const s = Math.max(0, Math.ceil(ms / 1000));
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 };
+
+/** The break's meeting link, if it's one we're willing to open (the hub checks too). */
+function safeMeetingUrl(team: TeamView): string | null {
+  const url = team.brk?.meetingUrl;
+  return url && isValidMeetingLink(url) ? url : null;
+}
 
 function joinNames(names: string[]): string {
   if (names.length <= 1) return names[0] ?? '';
@@ -134,7 +141,7 @@ export class Widget {
   setTeam(team: TeamView, you: string) {
     this.team = team;
     this.me = you;
-    const url = team.brk?.meetingUrl;
+    const url = safeMeetingUrl(team);
     if (url && this.pendingMeetingWindow) {
       this.pendingMeetingWindow.location.href = url;
       this.pendingMeetingWindow = null;
@@ -408,7 +415,7 @@ export class Widget {
    */
   private openMeeting() {
     const team = this.team;
-    const url = team?.brk?.meetingUrl;
+    const url = team && safeMeetingUrl(team);
     const host = this.opts.host;
     if (host) {
       if (url) host.openUrl(url);

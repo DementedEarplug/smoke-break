@@ -15,6 +15,7 @@ import {
   type ServerMsg,
   type TeamView,
   clampLength,
+  isValidMeetingLink,
 } from '../shared/protocol.ts';
 import * as machine from './breakMachine.ts';
 import { fixedLinkProvider, getProvider } from './meeting.ts';
@@ -41,12 +42,14 @@ interface Team {
   defaultLengthMin: number;
   zoomLink: string;
   meetingProvider: MeetingProviderKind;
+  /** Public id of the creator, the only one who can change team settings. */
+  ownerId: string | null;
   members: Map<string, Member>;
   brk: Break | null;
   timer: ReturnType<typeof setTimeout> | null;
 }
 
-type SavedTeam = Pick<Team, 'code' | 'name' | 'defaultLengthMin' | 'zoomLink' | 'meetingProvider'>;
+type SavedTeam = Pick<Team, 'code' | 'name' | 'defaultLengthMin' | 'zoomLink' | 'meetingProvider' | 'ownerId'>;
 
 const NAME_MAX = 24;
 const cleanName = (s: unknown, fallback: string) =>
@@ -62,15 +65,6 @@ const CLIENT_ID = /^[A-Za-z0-9_-]{16,64}$/;
 export const publicId = (teamCode: string, clientId: string) =>
   createHash('sha256').update(`${teamCode}:${clientId}`).digest('base64url').slice(0, 16);
 
-export function isValidMeetingLink(s: string): boolean {
-  if (s === '') return true;
-  try {
-    return new URL(s).protocol === 'https:';
-  } catch {
-    return false;
-  }
-}
-
 export function createHub(opts: { dataFile: string }) {
   const teams = new Map<string, Team>();
   const wss = new WebSocketServer({ noServer: true });
@@ -81,7 +75,9 @@ export function createHub(opts: { dataFile: string }) {
     try {
       const saved = JSON.parse(readFileSync(opts.dataFile, 'utf8')) as SavedTeam[];
       for (const t of saved) {
-        teams.set(t.code, { ...t, members: new Map(), brk: null, timer: null });
+        // Drop saved links that no longer pass validation rather than opening them.
+        const zoomLink = isValidMeetingLink(t.zoomLink) ? t.zoomLink : '';
+        teams.set(t.code, { ...t, zoomLink, ownerId: t.ownerId ?? null, members: new Map(), brk: null, timer: null });
       }
     } catch {
       // No saved teams yet.
@@ -95,12 +91,13 @@ export function createHub(opts: { dataFile: string }) {
     setTimeout(() => {
       saveQueued = false;
       const out: SavedTeam[] = [...teams.values()].map(
-        ({ code, name, defaultLengthMin, zoomLink, meetingProvider }) => ({
+        ({ code, name, defaultLengthMin, zoomLink, meetingProvider, ownerId }) => ({
           code,
           name,
           defaultLengthMin,
           zoomLink,
           meetingProvider,
+          ownerId,
         }),
       );
       mkdirSync(dirname(opts.dataFile), { recursive: true });
@@ -123,6 +120,7 @@ export function createHub(opts: { dataFile: string }) {
       defaultLengthMin: team.defaultLengthMin,
       zoomLink: team.zoomLink,
       meetingProvider: team.meetingProvider,
+      ownerId: team.ownerId,
       members: [...team.members.values()].map((m) => ({ id: m.id, name: m.name, online: m.sockets.size > 0 })),
       brk: team.brk,
     };
@@ -201,6 +199,8 @@ export function createHub(opts: { dataFile: string }) {
       m = { key: clientId, id: publicId(team.code, clientId), name, sockets: new Set(), leaveTimer: null };
       team.members.set(clientId, m);
     }
+    // Teams saved before owners existed: the first person back becomes the owner.
+    team.ownerId ??= m.id;
     m.name = uniqueName(team, clientId, name);
     m.sockets.add(ws);
     if (m.leaveTimer) clearTimeout(m.leaveTimer);
@@ -237,10 +237,13 @@ export function createHub(opts: { dataFile: string }) {
       case 'leave':
         return apply(team, machine.leave(team.brk, me.id, now), ws);
       case 'settings': {
+        if (me.id !== team.ownerId) {
+          return send(ws, { type: 'error', message: 'Only the team owner can change settings.' });
+        }
         if (typeof msg.zoomLink === 'string') {
           const link = msg.zoomLink.trim();
           if (!isValidMeetingLink(link)) {
-            return send(ws, { type: 'error', message: 'The Zoom link must be an https:// URL.' });
+            return send(ws, { type: 'error', message: 'The Zoom link must be an https://…zoom.us link.' });
           }
           team.zoomLink = link;
           // Fixed links are known up front, so an active break picks up the new one.
@@ -282,6 +285,7 @@ export function createHub(opts: { dataFile: string }) {
             defaultLengthMin: DEFAULT_LENGTH_MIN,
             zoomLink: '',
             meetingProvider: 'fixed-link',
+            ownerId: publicId(code, clientId),
             members: new Map(),
             brk: null,
             timer: null,

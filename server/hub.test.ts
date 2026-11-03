@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 import type { ClientMsg, ServerMsg } from '../shared/protocol.ts';
+import { isValidMeetingLink } from '../shared/protocol.ts';
 import { createHub } from './hub.ts';
 
 type StateMsg = Extract<ServerMsg, { type: 'state' }>;
@@ -133,5 +134,49 @@ describe('hub identity', () => {
     const c = await connect();
     c.send({ type: 'create', teamName: 'x', clientId: 'a', name: 'A' });
     expect((await c.error()).fatal).toBe(true);
+  });
+});
+
+describe('isValidMeetingLink', () => {
+  it.each([
+    ['', true],
+    ['https://zoom.us/j/123', true],
+    ['https://us02web.zoom.us/j/123?pwd=abc', true],
+    ['https://app.zoom.com/wc/123', true],
+    ['http://zoom.us/j/123', false],
+    ['javascript:alert(1)', false],
+    ['https://evil.example/login', false],
+    ['https://zoom.us.evil.example/j/1', false],
+    ['https://evilzoom.us/j/1', false],
+    ['https://zoom.us@evil.example/j/1', false],
+    ['not a url', false],
+  ])('%s → %s', (link, ok) => expect(isValidMeetingLink(link)).toBe(ok));
+});
+
+describe('hub settings', () => {
+  it('lets the owner change settings', async () => {
+    const { alex } = await team();
+    const from = alex.msgs.length;
+    alex.send({ type: 'settings', zoomLink: 'https://zoom.us/j/1', teamName: 'Renamed' });
+    const m = await alex.state((s) => s.team.name === 'Renamed', from);
+    expect(m.team.zoomLink).toBe('https://zoom.us/j/1');
+    expect(m.team.ownerId).toBe(m.you);
+  });
+
+  it("rejects settings from anyone but the owner", async () => {
+    const { alex, sam } = await team();
+    const from = sam.msgs.length;
+    sam.send({ type: 'settings', zoomLink: 'https://zoom.us/j/evil', teamName: 'Hijacked' });
+    expect((await sam.error(from)).message).toMatch(/owner/);
+    const last = alex.msgs.filter((m): m is StateMsg => m.type === 'state').at(-1)!;
+    expect(last.team.name).toBe('Crew');
+    expect(last.team.zoomLink).toBe('');
+  });
+
+  it('rejects non-Zoom links', async () => {
+    const { alex } = await team();
+    const from = alex.msgs.length;
+    alex.send({ type: 'settings', zoomLink: 'https://evil.example/login' });
+    expect((await alex.error(from)).message).toMatch(/zoom/i);
   });
 });

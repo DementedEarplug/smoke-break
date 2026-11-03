@@ -152,6 +152,8 @@ export function createTeamPanel(
       }
       setTimeout(() => (copy.textContent = copyLabel), 1500);
     };
+    const isOwner = team.ownerId === you;
+    const owner = team.members.find((m) => m.id === team!.ownerId);
     const settings = h('button', { textContent: 'Settings' });
     settings.onclick = () => {
       settingsOpen = true;
@@ -175,9 +177,17 @@ export function createTeamPanel(
         h('code', { textContent: team.code }),
         status === 'open' ? '' : h('span', { class: 'sb-status', textContent: ` · ${status}…` }),
       ),
-      h('div', { class: 'sb-row' }, copy, settings, ...(opts.actions?.() ?? [])),
+      h('div', { class: 'sb-row' }, copy, isOwner ? settings : '', ...(opts.actions?.() ?? [])),
       members,
-      team.zoomLink ? '' : h('p', { class: 'sb-warn', textContent: 'No Zoom link set yet. Add one in Settings.' }),
+      team.zoomLink
+        ? ''
+        : h('p', {
+            class: 'sb-warn',
+            textContent: isOwner
+              ? 'No Zoom link set yet. Add one in Settings.'
+              : `No Zoom link set yet. Ask ${owner?.name ?? 'the team owner'} to add one.`,
+          }),
+      isOwner ? '' : h('p', { class: 'sb-hint', textContent: `${owner?.name ?? 'The team owner'} manages team settings.` }),
       h('p', { class: 'sb-hint', textContent: opts.hint }),
     );
   }

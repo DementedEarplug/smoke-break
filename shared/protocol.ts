@@ -14,6 +14,29 @@ export function clampLength(min: number): number {
   return Math.min(MAX_LENGTH_MIN, Math.max(MIN_LENGTH_MIN, Math.round(min)));
 }
 
+/** Meeting links must point at one of these hosts (or a subdomain), over https. */
+export const MEETING_HOSTS = ['zoom.us', 'zoom.com', 'zoomgov.com'];
+
+/**
+ * Meeting links get opened automatically on everyone's machine, so only accept
+ * https links to a known meeting service. Empty means "no link yet".
+ */
+export function isValidMeetingLink(s: string): boolean {
+  if (s === '') return true;
+  try {
+    const url = new URL(s);
+    const host = url.hostname.toLowerCase();
+    return (
+      url.protocol === 'https:' &&
+      !url.username &&
+      !url.password &&
+      MEETING_HOSTS.some((h) => host === h || host.endsWith(`.${h}`))
+    );
+  } catch {
+    return false;
+  }
+}
+
 /** Idle is represented by `brk: null`. */
 export type Phase = 'pending' | 'lighter' | 'lit' | 'out';
 export type OutReason = 'burned' | 'nobody' | 'cancelled' | 'everyone-left';
@@ -59,6 +82,8 @@ export interface TeamView {
   defaultLengthMin: number;
   zoomLink: string;
   meetingProvider: MeetingProviderKind;
+  /** Public id of the member who can change team settings (whoever created the team). */
+  ownerId: string | null;
   members: MemberView[];
   brk: Break | null;
 }
