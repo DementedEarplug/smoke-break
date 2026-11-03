@@ -102,6 +102,26 @@ export const publicId = (teamCode: string, clientId: string) =>
 
 const clientIp = (req: IncomingMessage) => req.socket.remoteAddress ?? 'unknown';
 
+/** The desktop app's own origins (macOS/Linux, Windows). */
+const APP_ORIGINS = ['tauri://localhost', 'http://tauri.localhost', 'https://tauri.localhost'];
+const EXTRA_ORIGINS = (process.env.SMOKE_BREAK_ALLOWED_ORIGINS ?? '').split(',').map((o) => o.trim()).filter(Boolean);
+
+/**
+ * Browsers send an Origin with every WebSocket, so this stops other web pages
+ * from driving the hub. Allowed: the page the hub itself serves (same host),
+ * the desktop app, and SMOKE_BREAK_ALLOWED_ORIGINS. Non-browser clients send
+ * no Origin and are let through.
+ */
+export function isAllowedOrigin(origin: string | undefined, host: string | undefined): boolean {
+  if (!origin) return true;
+  if (APP_ORIGINS.includes(origin) || EXTRA_ORIGINS.includes(origin)) return true;
+  try {
+    return !!host && new URL(origin).host === host;
+  } catch {
+    return false;
+  }
+}
+
 export function createHub(opts: { dataFile: string; limits?: Partial<HubLimits> }) {
   const limits = { ...DEFAULT_LIMITS, ...opts.limits };
   const teams = new Map<string, Team>();
@@ -413,6 +433,10 @@ export function createHub(opts: { dataFile: string; limits?: Partial<HubLimits> 
       wss.close();
     },
     handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer) {
+      if (!isAllowedOrigin(req.headers.origin, req.headers.host)) {
+        socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+        return;
+      }
       const ip = clientIp(req);
       if ((connections.get(ip) ?? 0) >= limits.connectionsPerIp) {
         socket.end('HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n');

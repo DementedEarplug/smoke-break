@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 import type { ClientMsg, ServerMsg } from '../shared/protocol.ts';
 import { isValidMeetingLink } from '../shared/protocol.ts';
-import { createHub } from './hub.ts';
+import { createHub, isAllowedOrigin } from './hub.ts';
 
 type StateMsg = Extract<ServerMsg, { type: 'state' }>;
 
@@ -269,5 +269,22 @@ describe('hub invite codes', () => {
     expect(await guess('CCCCCC')).toMatchObject({ type: 'error', message: expect.stringMatching(/Too many/) });
     // Even the right code is refused until the window passes.
     expect(await guess(real)).toMatchObject({ type: 'error', message: expect.stringMatching(/Too many/) });
+  });
+});
+
+describe('hub origins', () => {
+  it.each([
+    [undefined, true],
+    ['tauri://localhost', true],
+    ['http://tauri.localhost', true],
+    ['http://localhost:5173', true],
+    ['https://evil.example', false],
+    ['http://localhost:9999', false],
+    ['null', false],
+  ])('origin %s → %s', (origin, ok) => expect(isAllowedOrigin(origin, 'localhost:5173')).toBe(ok));
+
+  it('refuses sockets from other web pages', async () => {
+    const ws = new WebSocket(url, { origin: 'https://evil.example' });
+    await expect(new Promise((resolve, reject) => (ws.once('open', resolve), ws.once('error', reject)))).rejects.toThrow(/403/);
   });
 });

@@ -30,7 +30,7 @@ npm test        # break state machine tests
 
 Create a team, then use **Open a teammate tab** to play the other side in a second tab (each tab is its own person).
 
-To test with other people, run `npm run share`. It serves on your network at the printed `Network:` URL. For people outside your network, put a tunnel (e.g. `cloudflared tunnel --url http://localhost:4173`) in front of it.
+To test with other people, run `npm run share`. It serves on your network at the printed `Network:` URL. For people outside your network, put a tunnel (e.g. `cloudflared tunnel --url http://localhost:4173`) in front of it. The hub only accepts WebSocket connections from pages it serves itself and from the desktop app; if a proxy changes the `Host` header, list the page's origin in `SMOKE_BREAK_ALLOWED_ORIGINS` (comma-separated).
 
 ## How to use the pack
 
