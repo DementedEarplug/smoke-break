@@ -114,6 +114,11 @@ export class Scene {
     return this.cigs.size === 0 && this.flap === 0;
   }
 
+  /** Nothing is moving except the idle bob, so frames can come slowly. */
+  get settled() {
+    return this.idle && this.particles.length === 0 && this.lighterShow === 0 && this.jugLevel === 1;
+  }
+
   nameOf(id: string) {
     return this.cigs.get(id)?.name ?? '';
   }

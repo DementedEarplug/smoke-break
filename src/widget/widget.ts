@@ -24,6 +24,10 @@ const MAX_LIGHT_WAIT_MS = 4000;
 /** Gap (art pixels) between the bubble's tail and whatever is tallest in the scene. */
 const BUBBLE_GAP = 3;
 const DRAG_THRESHOLD = 4;
+/** Frame interval while nothing is happening: enough for the 1px idle bob, easy on the battery. */
+const QUIET_FRAME_MS = 250;
+/** Stay at full frame rate this long after any input or update. */
+const WAKE_MS = 1000;
 
 export interface WidgetOptions {
   /** Private per-identity key for local storage (so teammate tabs don't share settings). */
@@ -93,6 +97,10 @@ export class Widget {
   private packSkin: PackSkin = PACK_SKINS[0];
   private lighterSkin: LighterSkin = LIGHTER_SKINS[0];
   private theme: Theme = 'smoke';
+  private lastFrame = performance.now();
+  private lastWake = performance.now();
+  /** Set while waiting on a slow quiet-mode frame instead of requestAnimationFrame. */
+  private quietTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     parent: HTMLElement,
@@ -127,20 +135,53 @@ export class Widget {
     if (!opts.host) this.restorePosition();
     this.bindEvents();
 
-    let last = performance.now();
-    const frame = (t: number) => {
-      const dt = Math.min(0.1, (t - last) / 1000);
-      last = t;
-      this.tick(dt);
-      requestAnimationFrame(frame);
-    };
-    requestAnimationFrame(frame);
+    requestAnimationFrame(this.frame);
+  }
+
+  /**
+   * Runs at the display's frame rate while anything animates, and drops to a
+   * few frames a second when the pack is just sitting there (it floats on the
+   * desktop all day). `wake()` brings it back to full speed.
+   */
+  private frame = (t: number) => {
+    const dt = Math.min(QUIET_FRAME_MS / 1000, (t - this.lastFrame) / 1000);
+    this.lastFrame = t;
+    this.tick(dt);
+    if (this.quiet) {
+      this.quietTimer = setTimeout(() => {
+        this.quietTimer = null;
+        this.frame(performance.now());
+      }, QUIET_FRAME_MS);
+    } else {
+      requestAnimationFrame(this.frame);
+    }
+  };
+
+  private get quiet() {
+    return (
+      this.scene.settled &&
+      !this.toast &&
+      !this.drag &&
+      !this.hover &&
+      !this.meetingAfterLight &&
+      performance.now() - this.lastWake > WAKE_MS
+    );
+  }
+
+  private wake() {
+    this.lastWake = performance.now();
+    if (this.quietTimer === null) return;
+    clearTimeout(this.quietTimer);
+    this.quietTimer = null;
+    this.lastFrame = performance.now();
+    requestAnimationFrame(this.frame);
   }
 
   /** `you` is my public member id, as used in the break's participants. */
   setTeam(team: TeamView, you: string) {
     this.team = team;
     this.me = you;
+    this.wake();
     const url = safeMeetingUrl(team);
     if (url && this.pendingMeetingWindow) {
       this.pendingMeetingWindow.location.href = url;
@@ -156,16 +197,19 @@ export class Widget {
     if (scale === this.scale) return;
     this.scale = scale;
     this.applyScale();
+    this.wake();
     if (!this.opts.host) this.moveTo(this.root.offsetLeft, this.root.offsetTop);
   }
 
   setSkins(pack: PackSkin, lighter: LighterSkin) {
     this.packSkin = pack;
     this.lighterSkin = lighter;
+    this.wake();
   }
 
   setTheme(theme: Theme) {
     this.theme = theme;
+    this.wake();
   }
 
   private get copy() {
@@ -208,7 +252,9 @@ export class Widget {
   /** Hover from a polled cursor position, for windows that don't get mouse-move events. */
   setHoverAt(clientX: number, clientY: number) {
     if (this.drag) return;
-    this.hover = this.hitAt({ clientX, clientY });
+    const hover = this.hitAt({ clientX, clientY });
+    if (hover?.target !== this.hover?.target || hover?.cigId !== this.hover?.cigId) this.wake();
+    this.hover = hover;
     this.canvas.style.cursor = this.hover ? 'pointer' : 'default';
   }
 
@@ -218,6 +264,7 @@ export class Widget {
 
   showToast(text: string, ms = 3000) {
     this.toast = { text, until: performance.now() + ms };
+    this.wake();
   }
 
   // ── Frame ─────────────────────────────────────────────────────────────────
@@ -479,6 +526,9 @@ export class Widget {
 
   private bindEvents() {
     const c = this.canvas;
+    for (const type of ['pointerdown', 'pointermove', 'wheel'] as const) {
+      c.addEventListener(type, () => this.wake(), { passive: true });
+    }
 
     c.addEventListener('pointerdown', (e) => {
       if (e.button !== 0) return;
