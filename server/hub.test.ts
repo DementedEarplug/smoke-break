@@ -302,3 +302,31 @@ describe('hub persistence', () => {
     expect(JSON.parse(readFileSync(file, 'utf8'))[0].name).toBe('Saved');
   });
 });
+
+describe('hub breaks', () => {
+  it('runs a break end to end and hands out the Zoom link', async () => {
+    const { alex, sam } = await team();
+    alex.send({ type: 'settings', zoomLink: 'https://zoom.us/j/42' });
+    await sam.state((m) => m.team.zoomLink === 'https://zoom.us/j/42');
+    alex.send({ type: 'invite' });
+    await sam.state((m) => m.team.brk?.phase === 'pending');
+    sam.send({ type: 'join' });
+    await alex.state((m) => m.team.brk?.phase === 'lighter');
+    alex.send({ type: 'light' });
+    const lit = await sam.state((m) => m.team.brk?.phase === 'lit' && !!m.team.brk.meetingUrl);
+    expect(lit.team.brk!.meetingUrl).toBe('https://zoom.us/j/42');
+    expect(lit.team.brk!.endsAt).toBeGreaterThan(lit.serverNow);
+  });
+
+  it("leave only takes yourself out of a break", async () => {
+    const { alex, sam } = await team();
+    alex.send({ type: 'invite' });
+    await sam.state((m) => m.team.brk?.phase === 'pending');
+    sam.send({ type: 'join' });
+    const s = await sam.state((m) => m.team.brk?.participants.length === 2);
+    sam.send({ type: 'leave' });
+    const after = await alex.state((m) => m.team.brk?.participants.length === 1);
+    expect(after.team.brk!.participants[0].id).toBe(s.team.brk!.participants[0].id);
+    expect(after.team.brk!.participants[0].id).not.toBe(s.you);
+  });
+});
