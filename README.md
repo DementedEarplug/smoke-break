@@ -41,6 +41,7 @@ To test with other people, run `npm run share`. It serves on your network at the
 - **Drag** to move the pack. **Right-click** for do-not-disturb.
 - **Pinch** (or ⌃-scroll) on the pack to resize it. Size and pack/lighter skins are under **My pack** in settings; skins only change what you see.
 - **Break style** in settings switches between **Smoke** (a cigarette pack and a lighter) and **Water** (a water cooler whose jug drains as the timer, and a cup to fill instead of a lighter). It's personal: teammates can use different styles for the same break.
+- **Team settings** (name, Zoom link, default length) can only be changed by whoever created the team. The Zoom link must be a `zoom.us` (or `zoom.com` / `zoomgov.com`) https link, since everyone's machine opens it automatically.
 
 ## Layout
 
@@ -48,7 +49,8 @@ To test with other people, run `npm run share`. It serves on your network at the
 | --- | --- |
 | `shared/protocol.ts` | Types and constants shared by client and server |
 | `server/breakMachine.ts` | Pure break state machine: idle → pending → lighter → lit → out |
-| `server/hub.ts` | WebSocket hub: teams, invite codes, server-owned timers |
+| `server/hub.ts` | WebSocket hub: teams, invite codes, server-owned timers, identity and limits |
+| `server/limits.ts` | Rate limiters used by the hub |
 | `server/meeting.ts` | Meeting providers (`fixed-link` now; `zoom-api` is Option B) |
 | `src/widget/` | The floating pack: sprites, animation scene, bubble, input |
 | `src/widget/skins.ts` | Pack and lighter skins (palettes, pack styles, flame colors) |
@@ -63,3 +65,5 @@ To test with other people, run `npm run share`. It serves on your network at the
 | `scripts/make-icons.ts` | Renders the app and tray icons from the pack sprites |
 
 The hub runs inside the Vite server (see `vite.config.ts`), and teams are saved to `.data/teams.json`. Break state lives in memory, so restarting the server ends any break in progress.
+
+The hub doesn't trust clients: each device's private `clientId` proves who it is and is never sent to teammates (they see a one-way hash). It also limits message size, connections and new teams per address, wrong invite codes, and message rates (see `DEFAULT_LIMITS` in `server/hub.ts`; `SMOKE_BREAK_MAX_TEAMS` caps the team count). Teams nobody has used for 90 days are forgotten.
