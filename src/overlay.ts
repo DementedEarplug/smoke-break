@@ -22,7 +22,11 @@ import { BODY_H, H, MOUTH_Y, PACK_W, PACK_X, W } from './widget/sprites.ts';
 import { Widget } from './widget/widget.ts';
 
 const POS_KEY = 'sb:overlayPos';
+/** Cursor polling: fast near the window, slow when the cursor is far away. */
 const CURSOR_POLL_MS = 40;
+const CURSOR_POLL_FAR_MS = 200;
+/** "Near" means within this many CSS px of the window. */
+const CURSOR_NEAR_PX = 300;
 /** Room under the pack for the length buttons (fixed size, not scaled). */
 const CONTROLS_SPACE = 44;
 const CONTROLS_HALF_WIDTH = 72;
@@ -141,18 +145,22 @@ async function clickThrough(win: Window, widget: Widget, isMouseDown: () => bool
   };
 
   const poll = async () => {
+    let next = CURSOR_POLL_MS;
     try {
       const p = await cursorPosition();
       const x = (p.x - origin.x) / scale;
       const y = (p.y - origin.y) / scale;
       const inside = x >= 0 && y >= 0 && x < window.innerWidth && y < window.innerHeight;
+      const dx = Math.max(0, -x, x - window.innerWidth);
+      const dy = Math.max(0, -y, y - window.innerHeight);
+      if (Math.hypot(dx, dy) > CURSOR_NEAR_PX && !isMouseDown()) next = CURSOR_POLL_FAR_MS;
       setIgnore(!(isMouseDown() || (inside && widget.isInteractiveAt(x, y))));
       if (inside) widget.setHoverAt(x, y);
       else widget.clearHover();
     } catch {
       // Window is closing or the API isn't ready; try again next tick.
     }
-    setTimeout(poll, CURSOR_POLL_MS);
+    setTimeout(poll, next);
   };
   setIgnore(true);
   void poll();
