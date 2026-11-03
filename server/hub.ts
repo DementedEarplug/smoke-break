@@ -2,7 +2,7 @@
 // The server owns the clock: every deadline is scheduled here.
 
 import { createHash, randomInt, randomUUID } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
@@ -173,8 +173,10 @@ export function createHub(opts: { dataFile: string; limits?: Partial<HubLimits> 
           lastActive,
         }),
       );
-      mkdirSync(dirname(opts.dataFile), { recursive: true });
-      writeFileSync(opts.dataFile, JSON.stringify(out, null, 2));
+      // Zoom links can carry the meeting passcode, so only this user may read the file.
+      mkdirSync(dirname(opts.dataFile), { recursive: true, mode: 0o700 });
+      writeFileSync(opts.dataFile, JSON.stringify(out, null, 2), { mode: 0o600 });
+      chmodSync(opts.dataFile, 0o600); // mode only applies when the file is created
     }, 200);
   }
 

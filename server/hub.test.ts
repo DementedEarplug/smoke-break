@@ -1,6 +1,6 @@
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -286,5 +286,19 @@ describe('hub origins', () => {
   it('refuses sockets from other web pages', async () => {
     const ws = new WebSocket(url, { origin: 'https://evil.example' });
     await expect(new Promise((resolve, reject) => (ws.once('open', resolve), ws.once('error', reject)))).rejects.toThrow(/403/);
+  });
+});
+
+describe('hub persistence', () => {
+  it('saves teams readable only by this user', async () => {
+    const file = join(mkdtempSync(join(tmpdir(), 'sb-hub-')), 'data', 'teams.json');
+    hub.close();
+    hub = createHub({ dataFile: file });
+    const c = await connect();
+    c.send({ type: 'create', teamName: 'Saved', clientId: 'saver-client-id-000000', name: 'S' });
+    await c.state();
+    await new Promise((r) => setTimeout(r, 300));
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(readFileSync(file, 'utf8'))[0].name).toBe('Saved');
   });
 });
