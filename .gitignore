@@ -1,0 +1,10 @@
+node_modules
+dist
+.data
+.DS_Store
+# Brag video build artifacts (the scripts and final video stay)
+brag-output/work/frames/
+brag-output/work/stills/
+brag-output/work/*.png
+brag-output/work/*.wav
+brag-output/work/*.log

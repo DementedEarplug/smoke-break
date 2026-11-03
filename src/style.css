@@ -1,0 +1,429 @@
+:root {
+  --ink: #1a1020;
+  --paper: #fffaf0;
+  --paper-shade: #e8dcc4;
+  --red: #d23a3a;
+  --red-dark: #8f1f2e;
+  --muted: #6a6078;
+  --mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font: 14px/1.4 var(--mono);
+  color: var(--ink);
+  /* A plain "desktop" so the floating pack has something to float over. */
+  background:
+    linear-gradient(rgba(255, 255, 255, 0.05) 1px, transparent 1px) 0 0 / 24px 24px,
+    linear-gradient(90deg, rgba(255, 255, 255, 0.05) 1px, transparent 1px) 0 0 / 24px 24px,
+    linear-gradient(160deg, #3b4a6b, #2a2f48 60%, #241f36);
+  overflow: hidden;
+}
+
+/* ── Pixel cards ─────────────────────────────────────────────────────────── */
+
+.sb-card {
+  background: var(--paper);
+  border: 3px solid var(--ink);
+  box-shadow:
+    0 6px 0 -3px var(--paper-shade) inset,
+    6px 6px 0 rgba(0, 0, 0, 0.35);
+  padding: 18px 20px;
+}
+
+.sb-card h1,
+.sb-card h2 {
+  margin: 0 0 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.sb-card h1 {
+  color: var(--red);
+  font-size: 26px;
+}
+
+.sb-card h2 {
+  font-size: 16px;
+}
+
+.sb-card label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0 0 12px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.sb-card input,
+.sb-card select {
+  font: inherit;
+  color: var(--ink);
+  background: #fff;
+  border: 2px solid var(--ink);
+  padding: 6px 8px;
+  border-radius: 0;
+}
+
+.sb-card input:focus-visible,
+.sb-card select:focus-visible,
+.sb-card button:focus-visible {
+  outline: 3px solid #ffd040;
+  outline-offset: 1px;
+}
+
+.sb-card button,
+.sb-pixel-btn {
+  font: inherit;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--paper);
+  background: var(--red);
+  border: 2px solid var(--ink);
+  box-shadow: 0 -3px 0 var(--red-dark) inset;
+  padding: 6px 10px 8px;
+  cursor: pointer;
+}
+
+.sb-card button:active,
+.sb-pixel-btn:active {
+  box-shadow: 0 3px 0 var(--red-dark) inset;
+  padding: 8px 10px 6px;
+}
+
+.sb-card button.secondary {
+  color: var(--ink);
+  background: var(--paper-shade);
+  box-shadow: 0 -3px 0 #c8b898 inset;
+}
+
+.sb-card fieldset {
+  border: 2px dashed var(--paper-shade);
+  margin: 0 0 12px;
+  padding: 10px 12px 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.sb-card legend {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  padding: 0 4px;
+}
+
+.sb-card a {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.sb-error {
+  color: var(--red);
+  min-height: 1.4em;
+  margin: 8px 0 0;
+}
+
+.sb-warn {
+  background: #fff3c4;
+  border: 2px solid #e6b34a;
+  padding: 6px 8px;
+  font-size: 12px;
+}
+
+.sb-hint {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* ── Onboarding ──────────────────────────────────────────────────────────── */
+
+.sb-center {
+  height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.sb-onboarding {
+  width: min(380px, 100%);
+  display: flex;
+  flex-direction: column;
+}
+
+.sb-onboarding fieldset input {
+  flex: 1;
+  min-width: 0;
+}
+
+.sb-onboarding > button {
+  margin-bottom: 10px;
+}
+
+.sb-code {
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+}
+
+/* ── Desktop & panel ─────────────────────────────────────────────────────── */
+
+.sb-desktop {
+  position: relative;
+  height: 100%;
+}
+
+.sb-panel {
+  position: absolute;
+  top: 20px;
+  left: 20px;
+  width: 320px;
+}
+
+.sb-meta code {
+  font-weight: 700;
+  letter-spacing: 0.15em;
+  background: var(--paper-shade);
+  padding: 1px 6px;
+}
+
+.sb-status {
+  color: var(--red);
+}
+
+.sb-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.sb-row button {
+  font-size: 11px;
+}
+
+.sb-members {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 12px;
+}
+
+.sb-members li {
+  padding: 2px 0;
+  color: var(--muted);
+}
+
+.sb-members li::before {
+  content: '';
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 8px;
+  background: #b0a8b8;
+  vertical-align: 1px;
+}
+
+.sb-members li.online {
+  color: var(--ink);
+}
+
+.sb-members li.online::before {
+  background: #3ac06a;
+}
+
+.sb-radio {
+  flex-direction: row !important;
+  align-items: center;
+  gap: 8px !important;
+  margin: 0 !important;
+  text-transform: none !important;
+  color: var(--ink) !important;
+  font-size: 13px !important;
+}
+
+.sb-radio.disabled {
+  color: var(--muted) !important;
+}
+
+/* ── Widget ──────────────────────────────────────────────────────────────── */
+
+.sb-widget {
+  position: absolute;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+}
+
+.sb-scene,
+.sb-bubble {
+  display: block;
+  image-rendering: pixelated;
+}
+
+.sb-bubble {
+  position: absolute;
+  pointer-events: none;
+  filter: drop-shadow(3px 3px 0 rgba(0, 0, 0, 0.3));
+}
+
+.sb-bubble[hidden] {
+  display: none;
+}
+
+.sb-controls {
+  position: absolute;
+  top: 100%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+  font: 700 12px var(--mono);
+  text-transform: uppercase;
+  color: var(--paper);
+  white-space: nowrap;
+}
+
+.sb-controls[hidden] {
+  display: none;
+}
+
+.sb-pixel-btn {
+  width: 30px;
+  height: 30px;
+  padding: 0 0 3px;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.sb-pixel-btn:active {
+  padding: 3px 0 0;
+}
+
+/* Translucent ink plate so the length stays readable over busy windows. */
+.sb-length {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 64px;
+  height: 30px;
+  padding: 0 8px;
+  background: rgba(26, 16, 32, 0.8);
+  border: 2px solid var(--ink);
+  text-shadow: 2px 2px 0 var(--ink);
+}
+
+/* ── Desktop overlay window ──────────────────────────────────────────────── */
+
+/* The window is transparent; only the pack and its bubble are drawn. */
+html.sb-overlay,
+html.sb-overlay body {
+  background: transparent;
+  overflow: hidden;
+}
+
+/* ── Desktop settings window ─────────────────────────────────────────────── */
+
+html.sb-panel-window body {
+  overflow: auto;
+  background: linear-gradient(160deg, #3b4a6b, #2a2f48 60%, #241f36);
+}
+
+/* Cards stack down the window instead of floating over a desktop. */
+.sb-panel--window {
+  position: static;
+  width: auto;
+  margin: 16px;
+}
+
+/* ── My pack ─────────────────────────────────────────────────────────────── */
+
+.sb-field-label {
+  margin: 14px 0 6px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.sb-sizes {
+  display: flex;
+  gap: 6px;
+}
+
+.sb-card .sb-sizes button,
+.sb-card .sb-skin {
+  color: var(--ink);
+  background: #fff;
+  box-shadow: 0 -3px 0 var(--paper-shade) inset;
+}
+
+.sb-card .sb-sizes button {
+  flex: 1;
+  padding: 6px 0 8px;
+}
+
+.sb-card .sb-sizes button.selected,
+.sb-card .sb-skin.selected {
+  background: #fff3c4;
+  border-color: var(--red);
+  box-shadow:
+    0 0 0 2px var(--red),
+    0 -3px 0 #f0d890 inset;
+}
+
+.sb-skins {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(76px, 1fr));
+  gap: 8px;
+}
+
+.sb-card .sb-skin {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  min-height: 92px;
+  padding: 8px 4px 10px;
+  font-size: 10px;
+  text-transform: none;
+}
+
+.sb-card .sb-skin canvas {
+  display: block;
+}
+
+/* Browser version: team panel and My pack stacked on the left. */
+.sb-side {
+  position: absolute;
+  top: 20px;
+  left: 20px;
+  bottom: 20px;
+  width: 340px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  overflow-y: auto;
+  padding: 0 8px 8px 0;
+}
+
+.sb-side .sb-panel {
+  position: static;
+  width: auto;
+}

@@ -1,0 +1,31 @@
+{
+  "name": "smoke-break",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "demo": "SMOKE_BREAK_MINUTE_MS=3000 vite",
+    "server": "node server/main.ts",
+    "desktop": "tauri dev",
+    "desktop:demo": "SMOKE_BREAK_MINUTE_MS=3000 tauri dev",
+    "desktop:build": "tauri build",
+    "build": "tsc --noEmit && vite build",
+    "share": "vite build && vite preview --host",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.12.4",
+    "@tauri-apps/plugin-opener": "^2.7.2",
+    "ws": "^8.22.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.4",
+    "@types/node": "^26.6.6",
+    "@types/ws": "^8.18.2",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5",
+    "vitest": "^5.0.5"
+  }
+}
