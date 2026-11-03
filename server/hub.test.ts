@@ -1,6 +1,6 @@
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -178,5 +178,73 @@ describe('hub settings', () => {
     const from = alex.msgs.length;
     alex.send({ type: 'settings', zoomLink: 'https://evil.example/login' });
     expect((await alex.error(from)).message).toMatch(/zoom/i);
+  });
+});
+
+describe('hub limits', () => {
+  it('closes sockets that send oversized messages', async () => {
+    const c = await connect();
+    const closed = new Promise<number>((r) => c.ws.once('close', r));
+    c.ws.send('x'.repeat(64 * 1024));
+    expect(await closed).toBe(1009);
+  });
+
+  it('limits how many teams one address can create', async () => {
+    hub.close();
+    hub = createHub({ dataFile: join(mkdtempSync(join(tmpdir(), 'sb-hub-')), 'teams.json'), limits: { createsPerIpPerHour: 2 } });
+    const results = [];
+    for (let i = 0; i < 3; i++) {
+      const c = await connect();
+      c.send({ type: 'create', teamName: `T${i}`, clientId: `creator-client-id-${i}-000`, name: 'A' });
+      results.push((await c.next((_m): _m is ServerMsg => true)).type);
+    }
+    expect(results).toEqual(['state', 'state', 'error']);
+  });
+
+  it('refuses new teams when full of active ones, else forgets the stalest empty one', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sb-hub-'));
+    const saved = { name: 'Old', defaultLengthMin: 12, zoomLink: '', meetingProvider: 'fixed-link', ownerId: null };
+    writeFileSync(
+      join(dir, 'teams.json'),
+      JSON.stringify([
+        { ...saved, code: 'OLDONE', lastActive: Date.now() - 5 * 86_400_000 },
+        { ...saved, code: 'NEWONE', lastActive: Date.now() - 86_400_000 },
+        { ...saved, code: 'GONEEE', lastActive: Date.now() - 365 * 86_400_000 },
+      ]),
+    );
+    hub.close();
+    hub = createHub({ dataFile: join(dir, 'teams.json'), limits: { maxTeams: 2 } });
+    const join_ = async (code: string) => {
+      const c = await connect();
+      c.send({ type: 'hello', teamCode: code, clientId: `joiner-client-id-${code}`, name: 'J' });
+      return c.next((_m): _m is ServerMsg => true);
+    };
+    // A year-old team was dropped on load.
+    expect((await join_('GONEEE')).type).toBe('error');
+    const c = await connect();
+    c.send({ type: 'create', teamName: 'Fresh', clientId: 'fresh-client-id-00000', name: 'F' });
+    expect((await c.state()).team.name).toBe('Fresh');
+    // OLDONE was the stalest empty team, so it made room; NEWONE is still there.
+    expect((await join_('OLDONE')).type).toBe('error');
+    expect((await join_('NEWONE')).type).toBe('state');
+    // Now both teams have people in them, so there's no room.
+    const d = await connect();
+    d.send({ type: 'create', teamName: 'More', clientId: 'more-client-id-000000', name: 'M' });
+    expect((await d.error()).message).toMatch(/full/);
+  });
+
+  it('throttles message floods', async () => {
+    const { alex } = await team();
+    const closed = new Promise<number>((r) => alex.ws.once('close', r));
+    for (let i = 0; i < 200; i++) alex.send({ type: 'leave' });
+    expect(await closed).toBe(1008);
+  });
+
+  it('caps connections per address', async () => {
+    hub.close();
+    hub = createHub({ dataFile: join(mkdtempSync(join(tmpdir(), 'sb-hub-')), 'teams.json'), limits: { connectionsPerIp: 2 } });
+    await connect();
+    await connect();
+    await expect(connect()).rejects.toThrow(/429/);
   });
 });

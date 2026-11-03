@@ -18,6 +18,7 @@ import {
   isValidMeetingLink,
 } from '../shared/protocol.ts';
 import * as machine from './breakMachine.ts';
+import { TokenBucket, WindowLimiter } from './limits.ts';
 import { fixedLinkProvider, getProvider } from './meeting.ts';
 
 /** Dev demo mode: e.g. SMOKE_BREAK_MINUTE_MS=3000 makes a 12-minute break last 36 seconds. */
@@ -25,6 +26,32 @@ const MINUTE_MS = Number(process.env.SMOKE_BREAK_MINUTE_MS) || 60_000;
 /** How long a closed tab keeps its spot in a break before it's stubbed out. */
 const DISCONNECT_GRACE_MS = 20_000;
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const DAY_MS = 86_400_000;
+
+export interface HubLimits {
+  /** Largest WebSocket message accepted; real messages are well under 1 KiB. */
+  maxPayloadBytes: number;
+  maxTeams: number;
+  /** Saved teams nobody has used for this long are forgotten. */
+  teamIdleDays: number;
+  createsPerIpPerHour: number;
+  connectionsPerIp: number;
+  /** Per-socket message rate: bursts of `messageBurst`, then `messagesPerSecond`. */
+  messageBurst: number;
+  messagesPerSecond: number;
+}
+
+export const DEFAULT_LIMITS: HubLimits = {
+  maxPayloadBytes: 16 * 1024,
+  maxTeams: Number(process.env.SMOKE_BREAK_MAX_TEAMS) || 2000,
+  teamIdleDays: 90,
+  createsPerIpPerHour: 10,
+  connectionsPerIp: 30,
+  messageBurst: 30,
+  messagesPerSecond: 10,
+};
+/** A socket that keeps flooding after being throttled this many times is closed. */
+const MAX_DROPPED_MESSAGES = 50;
 
 interface Member {
   /** The client's private clientId. Proves who a socket is; never sent to anyone. */
@@ -45,11 +72,13 @@ interface Team {
   /** Public id of the creator, the only one who can change team settings. */
   ownerId: string | null;
   members: Map<string, Member>;
+  /** Last time anyone connected or the team was created (ms). */
+  lastActive: number;
   brk: Break | null;
   timer: ReturnType<typeof setTimeout> | null;
 }
 
-type SavedTeam = Pick<Team, 'code' | 'name' | 'defaultLengthMin' | 'zoomLink' | 'meetingProvider' | 'ownerId'>;
+type SavedTeam = Pick<Team, 'code' | 'name' | 'defaultLengthMin' | 'zoomLink' | 'meetingProvider' | 'ownerId' | 'lastActive'>;
 
 const NAME_MAX = 24;
 const cleanName = (s: unknown, fallback: string) =>
@@ -65,19 +94,35 @@ const CLIENT_ID = /^[A-Za-z0-9_-]{16,64}$/;
 export const publicId = (teamCode: string, clientId: string) =>
   createHash('sha256').update(`${teamCode}:${clientId}`).digest('base64url').slice(0, 16);
 
-export function createHub(opts: { dataFile: string }) {
+const clientIp = (req: IncomingMessage) => req.socket.remoteAddress ?? 'unknown';
+
+export function createHub(opts: { dataFile: string; limits?: Partial<HubLimits> }) {
+  const limits = { ...DEFAULT_LIMITS, ...opts.limits };
   const teams = new Map<string, Team>();
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: limits.maxPayloadBytes });
+  const creates = new WindowLimiter(limits.createsPerIpPerHour, 3_600_000);
+  const connections = new Map<string, number>();
 
   load();
 
   function load() {
     try {
       const saved = JSON.parse(readFileSync(opts.dataFile, 'utf8')) as SavedTeam[];
+      const now = Date.now();
       for (const t of saved) {
+        const lastActive = t.lastActive ?? now;
+        if (now - lastActive > limits.teamIdleDays * DAY_MS) continue;
         // Drop saved links that no longer pass validation rather than opening them.
         const zoomLink = isValidMeetingLink(t.zoomLink) ? t.zoomLink : '';
-        teams.set(t.code, { ...t, zoomLink, ownerId: t.ownerId ?? null, members: new Map(), brk: null, timer: null });
+        teams.set(t.code, {
+          ...t,
+          zoomLink,
+          ownerId: t.ownerId ?? null,
+          lastActive,
+          members: new Map(),
+          brk: null,
+          timer: null,
+        });
       }
     } catch {
       // No saved teams yet.
@@ -91,18 +136,32 @@ export function createHub(opts: { dataFile: string }) {
     setTimeout(() => {
       saveQueued = false;
       const out: SavedTeam[] = [...teams.values()].map(
-        ({ code, name, defaultLengthMin, zoomLink, meetingProvider, ownerId }) => ({
+        ({ code, name, defaultLengthMin, zoomLink, meetingProvider, ownerId, lastActive }) => ({
           code,
           name,
           defaultLengthMin,
           zoomLink,
           meetingProvider,
           ownerId,
+          lastActive,
         }),
       );
       mkdirSync(dirname(opts.dataFile), { recursive: true });
       writeFileSync(opts.dataFile, JSON.stringify(out, null, 2));
     }, 200);
+  }
+
+  /** Makes room for a new team by forgetting the least recently used empty one. */
+  function roomForTeam(): boolean {
+    if (teams.size < limits.maxTeams) return true;
+    let stalest: Team | null = null;
+    for (const t of teams.values()) {
+      if (t.members.size || t.brk) continue;
+      if (!stalest || t.lastActive < stalest.lastActive) stalest = t;
+    }
+    if (!stalest) return false;
+    teams.delete(stalest.code);
+    return true;
   }
 
   function newCode(): string {
@@ -201,6 +260,8 @@ export function createHub(opts: { dataFile: string }) {
     }
     // Teams saved before owners existed: the first person back becomes the owner.
     team.ownerId ??= m.id;
+    team.lastActive = Date.now();
+    save();
     m.name = uniqueName(team, clientId, name);
     m.sockets.add(ws);
     if (m.leaveTimer) clearTimeout(m.leaveTimer);
@@ -259,11 +320,20 @@ export function createHub(opts: { dataFile: string }) {
     }
   }
 
-  wss.on('connection', (ws: WebSocket) => {
+  wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
+    const ip = clientIp(req);
     let team: Team | null = null;
     let me: Member | null = null;
+    const bucket = new TokenBucket(limits.messageBurst, limits.messagesPerSecond);
+    let dropped = 0;
+    // e.g. an oversized frame. ws closes the socket itself; without a listener the error would crash the hub.
+    ws.on('error', () => {});
 
     ws.on('message', (raw) => {
+      if (!bucket.take()) {
+        if (++dropped > MAX_DROPPED_MESSAGES) ws.close(1008, 'Too many messages');
+        return;
+      }
       let msg: ClientMsg;
       try {
         msg = JSON.parse(String(raw));
@@ -278,6 +348,12 @@ export function createHub(opts: { dataFile: string }) {
         if (!CLIENT_ID.test(clientId)) return send(ws, { type: 'error', message: 'Invalid client id.', fatal: true });
         const name = cleanName(msg.name, 'Someone');
         if (msg.type === 'create') {
+          if (!creates.take(ip)) {
+            return send(ws, { type: 'error', message: 'Too many new teams. Try again later.', fatal: true });
+          }
+          if (!roomForTeam()) {
+            return send(ws, { type: 'error', message: 'This server is full. Try again later.', fatal: true });
+          }
           const code = newCode();
           team = {
             code,
@@ -287,6 +363,7 @@ export function createHub(opts: { dataFile: string }) {
             meetingProvider: 'fixed-link',
             ownerId: publicId(code, clientId),
             members: new Map(),
+            lastActive: Date.now(),
             brk: null,
             timer: null,
           };
@@ -304,6 +381,9 @@ export function createHub(opts: { dataFile: string }) {
     });
 
     ws.on('close', () => {
+      const n = (connections.get(ip) ?? 1) - 1;
+      if (n > 0) connections.set(ip, n);
+      else connections.delete(ip);
       if (team && me) detach(team, me, ws);
     });
   });
@@ -318,7 +398,15 @@ export function createHub(opts: { dataFile: string }) {
       wss.close();
     },
     handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer) {
-      wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+      const ip = clientIp(req);
+      if ((connections.get(ip) ?? 0) >= limits.connectionsPerIp) {
+        socket.end('HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n');
+        return;
+      }
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        connections.set(ip, (connections.get(ip) ?? 0) + 1);
+        wss.emit('connection', ws, req);
+      });
     },
   };
 }
