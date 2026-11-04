@@ -489,7 +489,7 @@ export class Scene {
       const gone = v.removing === 'stub' ? v.stub : 0;
       const drop = Math.round((1 - easeOutBack(v.appear)) * 5 + gone * 5);
       const x = Math.round(v.x);
-      S.drawPaperCup(pen, x, bottom + drop, v.lit && !v.removing ? 1 : v.rise);
+      S.drawPaperCup(pen, x, bottom + drop, v.lit && !v.removing ? 1 : v.rise, packSkin.drink);
       this.cigRects.push({ id: v.id, x: x - 1, y: bottom - 4, w: S.CIG_W + 2, h: 6 });
     }
     ctx.restore();
@@ -517,7 +517,8 @@ export class Scene {
       base += Math.round((1 - easeOutBack(this.lighterShow)) * 22);
       // The striker wheel wiggles while the lighter is waiting to be clicked.
       const frame = flame === 'none' ? Math.floor(this.t * 2) : Math.floor(this.t * 12);
-      S.drawLighter(pen, x, base, flame, frame, input.lighterSkin, input.theme);
+      const liquid = themedPack(input.packSkin, input.theme).drink?.liquid;
+      S.drawLighter(pen, x, base, flame, frame, input.lighterSkin, input.theme, liquid);
       this.lighterRect = { x: x - 1, y: base - 20, w: 10, h: 21 };
     }
   }

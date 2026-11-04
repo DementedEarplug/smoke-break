@@ -2,7 +2,7 @@
 // up with `image-rendering: pixelated`. All coordinates are in art pixels.
 
 import { ADVANCE, glyphBits } from './font.ts';
-import { type LighterSkin, type PackSkin, LIGHTER_SKINS, PACK_SKINS } from './skins.ts';
+import { type Drink, type LighterSkin, type Liquid, type PackSkin, LIGHTER_SKINS, PACK_SKINS, WATER } from './skins.ts';
 import type { Theme } from './theme.ts';
 
 /** Logical canvas size. */
@@ -39,14 +39,10 @@ const BAND = ['#f8e08a', '#e8c860', '#b89838'];
 export const SMOKE = ['#f2f2f8', '#d4d4e0', '#b0b0c4', '#8c8ca4'];
 
 // Water break.
-const WATER = '#4aa8e8';
-const WATER_LIGHT = '#9ad8ff';
-const WATER_DARK = '#2a78c0';
-const WATER_SURFACE = '#c8eeff';
 const AIR = '#e6f4fc';
 const AIR_LIGHT = '#ffffff';
 const AIR_SHADE = '#b8d4e4';
-const PAPER_CUP = ['#ffffff', '#e8eef4', '#b8c4d0'];
+const PAPER_CUP: [string, string, string] = ['#ffffff', '#e8eef4', '#b8c4d0'];
 const RECESS = '#2a2838';
 
 /** Pixel pen with an optional color remap (used to grey out the pack in do-not-disturb). */
@@ -251,6 +247,7 @@ function jugSpan(r: number): [number, number] {
  * drains as the break's timer. `glug` sends bubbles up through the water.
  */
 export function drawCooler(pen: Pen, oy: number, skin: PackSkin, level: number, t: number, glug: boolean) {
+  const liq = skin.drink?.liquid ?? WATER;
   // Jug.
   const rows = JUG_NECK_BOTTOM - JUG_TOP + 1;
   const inner = rows - 1;
@@ -268,9 +265,9 @@ export function drawCooler(pen: Pen, oy: number, skin: PackSkin, level: number, 
     const ridge = r === 8 || r === 14;
     for (let x = x0 + 1; x < x1; x++) {
       let c: string;
-      if (wet) c = JUG_TOP + r === waterTop ? WATER_SURFACE : x === x0 + 1 ? WATER_LIGHT : x === x1 - 1 ? WATER_DARK : WATER;
+      if (wet) c = JUG_TOP + r === waterTop ? liq.surface : x === x0 + 1 ? liq.light : x === x1 - 1 ? liq.dark : liq.main;
       else c = x === x0 + 1 ? AIR_LIGHT : x === x1 - 1 ? AIR_SHADE : AIR;
-      if (ridge && x > x0 + 1 && x < x1 - 1) c = wet ? WATER_DARK : AIR_SHADE;
+      if (ridge && x > x0 + 1 && x < x1 - 1) c = wet ? liq.dark : AIR_SHADE;
       pen.px(x, y, c);
     }
   }
@@ -282,8 +279,20 @@ export function drawCooler(pen: Pen, oy: number, skin: PackSkin, level: number, 
       if (y <= waterTop) continue;
       const [x0, x1] = jugSpan(y - JUG_TOP);
       const x = x0 + 2 + ((i * 5 + Math.floor(t * 1.5 + i)) % Math.max(1, x1 - x0 - 3));
-      pen.px(x, y + oy, WATER_SURFACE);
+      pen.px(x, y + oy, liq.surface);
     }
+  }
+  // Fruit bobbing just under the surface, riding it down as the jug drains.
+  if (skin.drink && level > 0) {
+    skin.drink.fruit.forEach(([color, shine], i) => {
+      const y = waterTop + 1 + [0, 2, 1][i % 3] + (Math.floor(t * 1.5 + i * 0.7) % 2);
+      if (y + 1 >= JUG_NECK_BOTTOM) return;
+      const x = COOLER_X + 4 + i * 4;
+      const [l, r] = jugSpan(y + 1 - JUG_TOP);
+      if (x <= l + 1 || x + 1 >= r - 1) return;
+      pen.rect(x, y + oy, 2, 2, color);
+      pen.px(x, y + oy, shine);
+    });
   }
 
   // Cabinet, colored by the pack skin.
@@ -319,12 +328,14 @@ export function drawCooler(pen: Pen, oy: number, skin: PackSkin, level: number, 
   drawGlyphs(pen, skin.monogram, x0 + Math.floor((COOLER_W - textW) / 2), NOOK.tray + 3 + oy, skin.label);
 }
 
-/** A teammate's paper cup in the cooler's nook. `fill` 0–1 animates filling up. */
-export function drawPaperCup(pen: Pen, x: number, bottom: number, fill: number) {
-  // Rim (water shows from above once it's full), body, narrow base.
-  for (let c = 0; c < CIG_W; c++) pen.px(x + c, bottom - 3, fill >= 1 ? (c === 0 ? WATER_LIGHT : WATER) : fill > 0 ? WATER_SURFACE : PAPER_CUP[1]);
-  for (let r = 2; r >= 1; r--) for (let c = 0; c < CIG_W; c++) pen.px(x + c, bottom - r, PAPER_CUP[c]);
-  pen.px(x + 1, bottom, PAPER_CUP[1]);
+/** A teammate's cup in the cooler's nook. `fill` 0–1 animates filling up. */
+export function drawPaperCup(pen: Pen, x: number, bottom: number, fill: number, drink?: Drink) {
+  const liq = drink?.liquid ?? WATER;
+  const cup = drink?.cup ?? PAPER_CUP;
+  // Rim (the drink shows from above once it's full), body, narrow base.
+  for (let c = 0; c < CIG_W; c++) pen.px(x + c, bottom - 3, fill >= 1 ? (c === 0 ? liq.light : liq.main) : fill > 0 ? liq.surface : cup[1]);
+  for (let r = 2; r >= 1; r--) for (let c = 0; c < CIG_W; c++) pen.px(x + c, bottom - r, cup[c]);
+  pen.px(x + 1, bottom, cup[1]);
 }
 
 // ── Lighter ─────// ── Lighter ─────────────────────────────────────────────────────────────────
@@ -345,8 +356,10 @@ export function drawLighter(
   frame: number,
   skin: LighterSkin = LIGHTER_SKINS[0],
   theme: Theme = 'smoke',
+  /** What pours into the cup on water breaks. */
+  liquid: Liquid = WATER,
 ) {
-  if (theme === 'water') return drawCup(pen, x, baseY, flame, frame, skin);
+  if (theme === 'water') return drawCup(pen, x, baseY, flame, frame, skin, liquid);
   const capTop = baseY - 14;
   // Body.
   pen.rect(x, baseY - 10, 8, 11, K);
@@ -396,13 +409,12 @@ export function drawLighter(
   }
 }
 
-const SPLASH = { o: WATER, y: WATER_LIGHT, W: '#ffffff', b: WATER_DARK };
-
 /**
  * Water-break stand-in for the lighter: a cup in the lighter's skin colors.
  * While waiting a drip falls into it; clicked, water pours in and splashes.
  */
-function drawCup(pen: Pen, x: number, baseY: number, flame: FlameState, frame: number, skin: LighterSkin) {
+function drawCup(pen: Pen, x: number, baseY: number, flame: FlameState, frame: number, skin: LighterSkin, liq: Liquid) {
+  const splash = { o: liq.main, y: liq.light, W: '#ffffff', b: liq.dark };
   const h = 11;
   const top = baseY - h + 1;
   for (let i = 0; i < h; i++) {
@@ -418,7 +430,7 @@ function drawCup(pen: Pen, x: number, baseY: number, flame: FlameState, frame: n
     pen.px(r, y, K);
     for (let cx = l + 1; cx < r; cx++) {
       let c: string;
-      if (i === 1) c = flame === 'flame' ? (cx === l + 1 ? WATER_LIGHT : WATER) : '#3a3848';
+      if (i === 1) c = flame === 'flame' ? (cx === l + 1 ? liq.light : liq.main) : '#3a3848';
       else if (skin.stripes) c = skin.stripes[Math.min(skin.stripes.length - 1, i - 1)];
       else c = cx === l + 1 ? skin.light : cx === r - 1 ? skin.shade : skin.body;
       if (i === 5 || i === 6) c = i === 5 ? skin.accent : c;
@@ -428,19 +440,19 @@ function drawCup(pen: Pen, x: number, baseY: number, flame: FlameState, frame: n
   if (flame === 'none') {
     // A drip from above, hinting that the cup wants filling.
     const dy = frame % 2 === 0 ? 0 : 2;
-    pen.px(x + 4, top - 5 + dy, WATER_LIGHT);
-    pen.px(x + 4, top - 4 + dy, WATER);
+    pen.px(x + 4, top - 5 + dy, liq.light);
+    pen.px(x + 4, top - 4 + dy, liq.main);
   } else if (flame === 'spark') {
-    pen.px(x + 3, top - 2, WATER_LIGHT);
-    pen.px(x + 5, top - 3, WATER_LIGHT);
+    pen.px(x + 3, top - 2, liq.light);
+    pen.px(x + 5, top - 3, liq.light);
   } else {
     // Stream pouring in from above, with a splash at the rim.
-    for (let y = top - 8; y < top; y++) pen.px(x + 4, y, (y + frame) % 3 ? WATER : WATER_LIGHT);
+    for (let y = top - 8; y < top; y++) pen.px(x + 4, y, (y + frame) % 3 ? liq.main : liq.light);
     FLAME_FRAMES[frame % 2].forEach((row, ry) => {
       if (ry > 2) return;
       for (let rx = 0; rx < 3; rx++) {
-        const ch = row[rx] as keyof typeof SPLASH | '.';
-        if (ch !== '.') pen.px(x + 1 + rx * 2, top - 3 + ry, SPLASH[ch]);
+        const ch = row[rx] as keyof typeof splash | '.';
+        if (ch !== '.') pen.px(x + 1 + rx * 2, top - 3 + ry, splash[ch]);
       }
     });
   }

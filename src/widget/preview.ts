@@ -1,6 +1,6 @@
 // Small static renders of skins for the settings screen.
 
-import type { LighterSkin, PackSkin } from './skins.ts';
+import type { LighterSkin, Liquid, PackSkin } from './skins.ts';
 import * as S from './sprites.ts';
 import { type Theme, themedPack } from './theme.ts';
 
@@ -32,8 +32,8 @@ export function packPreview(skin: PackSkin, scale = 2, theme: Theme = 'smoke'): 
 }
 
 /** A lit lighter (or a cup being filled, for water breaks). */
-export function lighterPreview(skin: LighterSkin, scale = 2, theme: Theme = 'smoke'): HTMLCanvasElement {
+export function lighterPreview(skin: LighterSkin, scale = 2, theme: Theme = 'smoke', liquid?: Liquid): HTMLCanvasElement {
   const c = pixelCanvas(8, 21, scale);
-  S.drawLighter(new S.Pen(c.getContext('2d')!), 0, 20, 'flame', 0, skin, theme);
+  S.drawLighter(new S.Pen(c.getContext('2d')!), 0, 20, 'flame', 0, skin, theme, liquid);
   return c;
 }

@@ -3,7 +3,7 @@
 // for anyone who'd rather not see smoking.
 // Personal, like skins: teammates can use different styles for the same break.
 
-import type { PackSkin } from './skins.ts';
+import { PACK_SKINS, type PackSkin } from './skins.ts';
 
 export type Theme = 'smoke' | 'water';
 
@@ -54,7 +54,11 @@ export const COPY: Record<Theme, ThemeCopy> = {
 
 export const isTheme = (v: unknown): v is Theme => v === 'smoke' || v === 'water';
 
-/** Water coolers wear the pack skin's colors with an H2O label. */
+/** Water coolers wear the pack skin's colors with an H2O label. Water-only skins fall back to Classic for smoke. */
 export function themedPack(skin: PackSkin, theme: Theme): PackSkin {
-  return theme === 'water' ? { ...skin, monogram: 'H2O' } : skin;
+  if (theme === 'smoke') return skin.waterOnly ? PACK_SKINS[0] : skin;
+  return skin.waterOnly ? skin : { ...skin, monogram: 'H2O' };
 }
+
+/** Skins offered for a style. */
+export const packSkinsFor = (theme: Theme) => PACK_SKINS.filter((s) => theme === 'water' || !s.waterOnly);
