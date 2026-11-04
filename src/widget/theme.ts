@@ -12,6 +12,7 @@ export const THEMES: { id: Theme; name: string }[] = [
   { id: 'smoke', name: 'Smoke' },
   { id: 'water', name: 'Water' },
   { id: 'coffee', name: 'Coffee' },
+  { id: 'donut', name: 'Donut' },
 ];
 
 export interface ThemeCopy {
