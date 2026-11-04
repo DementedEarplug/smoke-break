@@ -244,5 +244,6 @@ export const smoke: StyleModule = {
   create: () => new Smoke(),
   previewBox: { x: S.PACK_X, y: S.MOUTH_Y - S.LID_H, w: S.PACK_W, h: S.LID_H + S.BODY_H },
   drawPreview: (pen, skin) => S.drawPackFront(pen, 0, 0, skin),
+  toolBox: { w: 8, h: 21 },
   drawToolPreview: (pen, skin) => S.drawLighter(pen, 0, 20, 'flame', 0, skin),
 };

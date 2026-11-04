@@ -119,7 +119,9 @@ export interface StyleModule {
   previewBox: Rect;
   /** A resting container, for skin previews. */
   drawPreview(pen: Pen, skin: PackSkin): void;
-  /** The tool mid-action, on an 8×21 canvas, for skin previews. */
+  /** Canvas size for tool previews. */
+  toolBox: { w: number; h: number };
+  /** The tool mid-action, for skin previews. */
   drawToolPreview(pen: Pen, skin: LighterSkin, pack: PackSkin): void;
 }
 

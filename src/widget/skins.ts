@@ -1,3 +1,5 @@
+import type { Theme } from './theme.ts';
+
 // Cosmetic skins for your own pack and lighter. Personal: they change how the
 // pack looks on your screen only.
 
@@ -26,8 +28,8 @@ export interface PackSkin {
   label: string;
   /** Two letters on the front. */
   monogram: string;
-  /** Water-cooler only: hidden from the picker for smoke breaks. */
-  waterOnly?: boolean;
+  /** Only offered for these break styles (others fall back to Classic). */
+  only?: Theme[];
   /** What's in the cooler, if not plain water. */
   drink?: Drink;
 }
@@ -196,7 +198,7 @@ export const PACK_SKINS: PackSkin[] = [
     baseBottom: '#f2e2c0',
     label: '#e8307a',
     monogram: 'JJ',
-    waterOnly: true,
+    only: ['water'],
     drink: {
       liquid: { main: '#e8307a', light: '#ff7aa8', dark: '#a81850', surface: '#ffb0c8' },
       fruit: [

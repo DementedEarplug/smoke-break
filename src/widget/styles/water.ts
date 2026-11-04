@@ -281,5 +281,6 @@ export const water: StyleModule = {
   create: () => new Water(),
   previewBox: { x: COOLER_X, y: JUG_TOP, w: COOLER_W, h: MOUTH_Y + BODY_H - JUG_TOP },
   drawPreview: (pen, skin) => drawCooler(pen, 0, skin, 1, 0, false),
+  toolBox: { w: 8, h: 21 },
   drawToolPreview: (pen, skin, pack) => drawCup(pen, 0, 20, 'flame', 0, skin, pack.drink?.liquid ?? WATER),
 };

@@ -208,6 +208,44 @@ export function drawCigTurned(
   }
 }
 
+/**
+ * A `w`×`h` grid of cells turned `angle` radians clockwise about (cx, cy).
+ * Upright grids draw pixel for pixel; turned ones are sampled at half pixels so
+ * diagonals stay solid.
+ */
+export function drawRotated(
+  pen: Pen,
+  cx: number,
+  cy: number,
+  w: number,
+  h: number,
+  cell: (c: number, r: number) => string | null,
+  angle: number,
+) {
+  if (angle === 0) {
+    const x0 = Math.round(cx - (w - 1) / 2);
+    const y0 = Math.round(cy - (h - 1) / 2);
+    for (let r = 0; r < h; r++) {
+      for (let c = 0; c < w; c++) {
+        const color = cell(c, r);
+        if (color) pen.px(x0 + c, y0 + r, color);
+      }
+    }
+    return;
+  }
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+  for (let r = 0; r < h; r += 0.5) {
+    for (let c = 0; c < w; c += 0.5) {
+      const color = cell(Math.floor(c), Math.floor(r));
+      if (!color) continue;
+      const dx = c - (w - 1) / 2;
+      const dy = r - (h - 1) / 2;
+      pen.px(Math.round(cx + dx * cos - dy * sin), Math.round(cy + dx * sin + dy * cos), color);
+    }
+  }
+}
+
 // ── Lighter ─────────────────────────────────────────────────────────────────
 
 export const FLAME_FRAMES = [

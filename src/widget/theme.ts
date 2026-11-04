@@ -1,15 +1,17 @@
 // Break styles. "smoke" is a cigarette pack and a lighter; "water" is a water
 // cooler whose jug drains as the timer, with a cup to fill instead of a lighter,
-// for anyone who'd rather not see smoking.
+// for anyone who'd rather not see smoking; "coffee" pours everyone a mug from a
+// pot that drains as the timer; "donut" is a bakery box of donuts that get eaten.
 // Personal, like skins: teammates can use different styles for the same break.
 
 import { PACK_SKINS, type PackSkin } from './skins.ts';
 
-export type Theme = 'smoke' | 'water';
+export type Theme = 'smoke' | 'water' | 'coffee' | 'donut';
 
 export const THEMES: { id: Theme; name: string }[] = [
   { id: 'smoke', name: 'Smoke' },
   { id: 'water', name: 'Water' },
+  { id: 'coffee', name: 'Coffee' },
 ];
 
 export interface ThemeCopy {
@@ -50,15 +52,44 @@ export const COPY: Record<Theme, ThemeCopy> = {
     lighterLabel: 'Cup',
     myPack: 'My cooler',
   },
+  coffee: {
+    title: 'Coffee Break',
+    breakName: 'coffee break',
+    lightUp: 'Pour one?',
+    lastMinute: 'Last sip!',
+    leaveLit: 'Click to head back',
+    leaveToast: 'Click your mug to head back',
+    packLabel: 'Coffee maker',
+    lighterLabel: 'Pot',
+    myPack: 'My coffee maker',
+  },
+  donut: {
+    title: 'Donut Break',
+    breakName: 'donut break',
+    lightUp: 'Grab one?',
+    lastMinute: 'Last bite!',
+    leaveLit: 'Click to brush off the crumbs',
+    leaveToast: 'Click your donut to head back',
+    packLabel: 'Box',
+    lighterLabel: 'Sprinkles',
+    myPack: 'My donut box',
+  },
 };
 
-export const isTheme = (v: unknown): v is Theme => v === 'smoke' || v === 'water';
+export const isTheme = (v: unknown): v is Theme => THEMES.some((t) => t.id === v);
 
-/** Water coolers wear the pack skin's colors with an H2O label. Water-only skins fall back to Classic for smoke. */
-export function themedPack(skin: PackSkin, theme: Theme): PackSkin {
-  if (theme === 'smoke') return skin.waterOnly ? PACK_SKINS[0] : skin;
-  return skin.waterOnly ? skin : { ...skin, monogram: 'H2O' };
-}
+const MONOGRAMS: Partial<Record<Theme, string>> = { water: 'H2O', coffee: 'JOE', donut: 'YUM' };
 
 /** Skins offered for a style. */
-export const packSkinsFor = (theme: Theme) => PACK_SKINS.filter((s) => theme === 'water' || !s.waterOnly);
+const offered = (skin: PackSkin, theme: Theme) => !skin.only || skin.only.includes(theme);
+export const packSkinsFor = (theme: Theme) => PACK_SKINS.filter((s) => offered(s, theme));
+
+/**
+ * Other styles wear the pack skin's colors with their own label. Skins made for
+ * one style keep theirs, and fall back to Classic elsewhere.
+ */
+export function themedPack(skin: PackSkin, theme: Theme): PackSkin {
+  if (!offered(skin, theme)) skin = PACK_SKINS[0];
+  const monogram = MONOGRAMS[theme];
+  return skin.only || !monogram ? skin : { ...skin, monogram };
+}

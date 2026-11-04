@@ -28,7 +28,8 @@ export function packPreview(skin: PackSkin, scale = 2, theme: Theme = 'smoke'): 
 
 /** A lit lighter (or the style's stand-in, mid-action). `pack` colors what it pours. */
 export function lighterPreview(skin: LighterSkin, scale = 2, theme: Theme = 'smoke', pack?: PackSkin): HTMLCanvasElement {
-  const c = pixelCanvas(8, 21, scale);
-  STYLES[theme].drawToolPreview(new S.Pen(c.getContext('2d')!), skin, themedPack(pack ?? PACK_SKINS[0], theme));
+  const style = STYLES[theme];
+  const c = pixelCanvas(style.toolBox.w, style.toolBox.h, scale);
+  style.drawToolPreview(new S.Pen(c.getContext('2d')!), skin, themedPack(pack ?? PACK_SKINS[0], theme));
   return c;
 }
