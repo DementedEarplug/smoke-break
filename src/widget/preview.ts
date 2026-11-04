@@ -1,7 +1,8 @@
 // Small static renders of skins for the settings screen.
 
-import type { LighterSkin, Liquid, PackSkin } from './skins.ts';
+import { type LighterSkin, type PackSkin, PACK_SKINS } from './skins.ts';
 import * as S from './sprites.ts';
+import { STYLES } from './styles/index.ts';
 import { type Theme, themedPack } from './theme.ts';
 
 function pixelCanvas(w: number, h: number, scale: number) {
@@ -14,26 +15,20 @@ function pixelCanvas(w: number, h: number, scale: number) {
   return c;
 }
 
-/** A closed pack (or a full water cooler), cropped to its outline. */
+/** A closed pack (or the style's stand-in), cropped to its outline. */
 export function packPreview(skin: PackSkin, scale = 2, theme: Theme = 'smoke'): HTMLCanvasElement {
-  if (theme === 'water') {
-    const bottom = S.MOUTH_Y + S.BODY_H;
-    const c = pixelCanvas(S.COOLER_W, bottom - S.JUG_TOP, scale);
-    const ctx = c.getContext('2d')!;
-    ctx.translate(-S.COOLER_X, -S.JUG_TOP);
-    S.drawCooler(new S.Pen(ctx), 0, themedPack(skin, theme), 1, 0, false);
-    return c;
-  }
-  const c = pixelCanvas(S.PACK_W, S.LID_H + S.BODY_H, scale);
+  const style = STYLES[theme];
+  const box = style.previewBox;
+  const c = pixelCanvas(box.w, box.h, scale);
   const ctx = c.getContext('2d')!;
-  ctx.translate(-S.PACK_X, -(S.MOUTH_Y - S.LID_H));
-  S.drawPackFront(new S.Pen(ctx), 0, 0, themedPack(skin, theme));
+  ctx.translate(-box.x, -box.y);
+  style.drawPreview(new S.Pen(ctx), themedPack(skin, theme));
   return c;
 }
 
-/** A lit lighter (or a cup being filled, for water breaks). */
-export function lighterPreview(skin: LighterSkin, scale = 2, theme: Theme = 'smoke', liquid?: Liquid): HTMLCanvasElement {
+/** A lit lighter (or the style's stand-in, mid-action). `pack` colors what it pours. */
+export function lighterPreview(skin: LighterSkin, scale = 2, theme: Theme = 'smoke', pack?: PackSkin): HTMLCanvasElement {
   const c = pixelCanvas(8, 21, scale);
-  S.drawLighter(new S.Pen(c.getContext('2d')!), 0, 20, 'flame', 0, skin, theme, liquid);
+  STYLES[theme].drawToolPreview(new S.Pen(c.getContext('2d')!), skin, themedPack(pack ?? PACK_SKINS[0], theme));
   return c;
 }

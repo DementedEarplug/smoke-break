@@ -12,7 +12,7 @@ import type { Net, NetStatus } from './net.ts';
 import * as platform from './platform.ts';
 import { lighterPreview, packPreview } from './widget/preview.ts';
 import { LIGHTER_SKINS, packSkin } from './widget/skins.ts';
-import { COPY, THEMES, packSkinsFor, themedPack } from './widget/theme.ts';
+import { COPY, THEMES, packSkinsFor } from './widget/theme.ts';
 
 /** App name for the current break style ("Smoke Break" or "Water Break"). */
 const appTitle = () => COPY[loadAppearance().theme].title;
@@ -267,7 +267,6 @@ export function createAppearancePanel(panel: HTMLElement) {
   function render() {
     const look = loadAppearance();
     const copy = COPY[look.theme];
-    const drink = themedPack(packSkin(look.pack), look.theme).drink;
 
     const choices = <T,>(options: { value: T; label: string; title?: string }[], selected: T, pick: (v: T) => void) =>
       h(
@@ -328,7 +327,7 @@ export function createAppearancePanel(panel: HTMLElement) {
       tiles(
         LIGHTER_SKINS,
         look.lighter,
-        (s) => lighterPreview(s, 2, look.theme, drink?.liquid),
+        (s) => lighterPreview(s, 2, look.theme, packSkin(look.pack)),
         (lighter) => saveAppearance({ lighter }),
       ),
       h('p', {
