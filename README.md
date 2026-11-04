@@ -6,7 +6,7 @@ Click the pack to invite your team. When a second person joins, a lighter appear
 
 Not a smoker? Switch to the **Water** style: a water cooler whose jug drains as the timer, with a cup to fill instead of a lighter. Styles and skins are personal, so smokers and non-smokers can share the same break and each see their own.
 
-[![Smoke Break in action (20-second video)](brag-output/brag.jpg)](brag-output/brag.mp4)
+[![Smoke Break in action (36-second video)](brag-output/brag.jpg)](brag-output/brag.mp4)
 
 > **Status:** a working prototype. The desktop app has only been built and tested on macOS so far; Windows and Linux are tracked in [#1](https://github.com/DementedEarplug/smoke-break/issues/1).
 
