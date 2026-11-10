@@ -14,7 +14,7 @@ import {
   LogicalSize,
   PhysicalPosition,
 } from '@tauri-apps/api/window';
-import { openUrl } from '@tauri-apps/plugin-opener';
+import { normalizeMeetingLink } from '../shared/protocol.ts';
 import * as platform from './platform.ts';
 import { createSession } from './session.ts';
 import { lighterSkin, packSkin } from './widget/skins.ts';
@@ -52,7 +52,8 @@ const win = getCurrentWindow();
 void listen('identity-changed', () => location.reload());
 
 const identity = platform.loadIdentity();
-if (identity) {
+// A refused server address is explained (and fixed) in the settings window.
+if (identity && !platform.serverProblem()) {
   void start(identity);
 } else {
   void win.hide();
@@ -62,16 +63,28 @@ if (identity) {
 async function start(id: platform.Identity) {
   let mouseDown = false;
 
+  let askedForToken = false;
   const net = createSession(
     { type: 'hello', teamCode: id.teamCode, clientId: id.clientId, name: id.name },
     {
       onTeam: (team, you) => widget.setTeam(team, you),
       onError: (message) => widget.showToast(message),
-      onFatal: async () => {
-        // The team is gone (e.g. the server lost it): send them back to onboarding.
-        platform.leaveTeam();
+      onFatal: async (_message, forget) => {
+        // The team is gone (bad code, or we were removed): back to onboarding.
+        // Otherwise (e.g. the server address is refused) the settings window
+        // explains and keeps the team.
+        if (forget) platform.leaveTeam();
         await win.hide();
         await invoke('show_panel');
+      },
+      onRetrying: (message, code) => {
+        // Keep the team and let the session back off; just say why the pack is quiet.
+        widget.showToast(message, 6000);
+        if (code === 'unauthorized' && !askedForToken) {
+          // Only someone typing in the right token fixes this; the settings window asks for it.
+          askedForToken = true;
+          void invoke('show_panel');
+        }
       },
     },
   );
@@ -88,7 +101,15 @@ async function start(id: platform.Identity) {
         mouseDown = false;
         void win.startDragging();
       },
-      openUrl: (url) => void openUrl(url),
+      // The Rust side checks the link again (https, exact Zoom host) and opens
+      // only its own re-serialized copy; JS has no general "open a URL" permission.
+      openUrl: (url) => {
+        const link = normalizeMeetingLink(url);
+        if (!link) return widget.showToast("That meeting link doesn't look right, so it wasn't opened", 5000);
+        invoke('open_meeting', { url: link }).catch(() =>
+          widget.showToast("Couldn't open the meeting link", 5000),
+        );
+      },
       onDndChange: (on) => void invoke('set_dnd', { on }),
     },
   });

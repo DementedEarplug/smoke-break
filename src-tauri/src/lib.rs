@@ -1,6 +1,9 @@
 // Smoke Break desktop shell: a transparent always-on-top overlay window (the
 // pack), a "Team & settings" window, and a tray menu. All app logic lives in
-// the web frontend; this file only wires up windows, the tray, and autostart.
+// the web frontend; this file only wires up windows, the tray, autostart, and
+// opening meeting links.
+
+mod meeting;
 
 use tauri::{
     image::Image,
@@ -30,14 +33,23 @@ fn show_panel(app: AppHandle) {
     }
 }
 
+/// Opens a team's meeting link in the browser / Zoom app. The link comes from
+/// the hub, so it is checked here again (see `meeting::check`) and only the
+/// re-serialized URL is handed to the OS; the webview has no general way to
+/// open URLs.
+#[tauri::command]
+fn open_meeting(url: String) -> Result<(), String> {
+    let url = meeting::check(&url, meeting::PINNED_HOST)?;
+    tauri_plugin_opener::open_url(url.as_str(), None::<&str>).map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         // A second launch just opens the settings window of the running one.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_panel(app.clone())))
-        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))
-        .invoke_handler(tauri::generate_handler![set_dnd, show_panel])
+        .invoke_handler(tauri::generate_handler![set_dnd, show_panel, open_meeting])
         .setup(|app| {
             // Menu-bar app: no Dock icon or app switcher entry.
             #[cfg(target_os = "macos")]

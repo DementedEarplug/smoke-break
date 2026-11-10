@@ -14,29 +14,6 @@
     "core:window:allow-set-size",
     "core:window:allow-start-dragging",
     "core:window:allow-set-ignore-cursor-events",
-    "core:window:allow-cursor-position",
-    {
-      "identifier": "opener:allow-open-url",
-      "allow": [
-        {
-          "url": "https://zoom.us/*"
-        },
-        {
-          "url": "https://*.zoom.us/*"
-        },
-        {
-          "url": "https://zoom.com/*"
-        },
-        {
-          "url": "https://*.zoom.com/*"
-        },
-        {
-          "url": "https://zoomgov.com/*"
-        },
-        {
-          "url": "https://*.zoomgov.com/*"
-        }
-      ]
-    }
+    "core:window:allow-cursor-position"
   ]
 }

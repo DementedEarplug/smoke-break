@@ -3,9 +3,11 @@
 
 import {
   type ClientMsg,
+  INVITE_CODE,
   MAX_LENGTH_MIN,
   MIN_LENGTH_MIN,
   type TeamView,
+  normalizeMeetingLink,
 } from '../shared/protocol.ts';
 import { SIZES, loadAppearance, onAppearanceChange, saveAppearance } from './appearance.ts';
 import type { Net, NetStatus } from './net.ts';
@@ -41,30 +43,70 @@ export type JoinMsg = Extract<ClientMsg, { type: 'create' } | { type: 'hello' }>
 
 // ── Onboarding ──────────────────────────────────────────────────────────────
 
+/**
+ * Where the browser version lives. Links are built from this, never from
+ * `location.pathname`: a crafted path like `//evil.example/` would otherwise
+ * turn them into links to another site.
+ */
+export const APP_PATH = import.meta.env.BASE_URL;
+
+/** A link to the browser version, optionally for a team. */
+export function appLink(params: Record<string, string> = {}): string {
+  const url = new URL(APP_PATH, location.origin);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  return url.href;
+}
+
+/** Invite codes are 6 (older teams) to 10 characters; people may paste them with spaces or dashes. */
+export const cleanInviteCode = (s: string) => s.replace(/[\s-]/g, '').toUpperCase();
+const INVITE_CODE_INPUT_MAX = 16;
+
 export function showOnboarding(
   container: HTMLElement,
   opts: {
-    /** Pre-filled invite code (e.g. from an invite link). */
+    /** Pre-filled invite code (e.g. from an invite link, or the saved team). */
     teamCode?: string;
     prefillName?: string;
     error?: string;
+    /** Show the access token field even where the server isn't configurable (e.g. the hub refused the token). */
+    askToken?: boolean;
+    /** Replaces the "different team" link (the desktop app has no page to link to). */
+    onOtherTeam?(): void;
     onSubmit(first: JoinMsg): void;
   },
 ) {
-  const teamCode = opts.teamCode?.toUpperCase() ?? '';
+  const cleaned = cleanInviteCode(opts.teamCode ?? '');
+  const teamCode = INVITE_CODE.test(cleaned) ? cleaned : '';
   const name = h('input', { placeholder: 'Your name', maxLength: 24, value: opts.prefillName ?? '' });
   const errorEl = h('p', { class: 'sb-error', textContent: opts.error ?? '' });
-  const server = h('input', { value: platform.serverUrl(), placeholder: 'ws://localhost:8787/ws' });
+  const server = h('input', { value: platform.serverUrl(), placeholder: 'wss://breaks.example.com/ws' });
+  // The built-in token (if any) isn't shown; a value here overrides it.
+  const token = h('input', {
+    value: platform.savedHubToken(),
+    placeholder: 'If your server needs one',
+    type: 'password',
+    autocomplete: 'off',
+  });
+  const showToken = platform.serverIsConfigurable || !!opts.askToken;
 
-  const requireName = () => {
+  /** Checks and saves the name and connection settings; false if something needs fixing. */
+  const saveFields = () => {
     const n = name.value.trim();
     if (!n) {
       errorEl.textContent = 'Tell your team who you are first.';
       name.focus();
       return null;
     }
+    if (platform.serverIsConfigurable) {
+      const problem = platform.saveServerUrl(server.value);
+      if (problem) {
+        errorEl.textContent = problem;
+        server.focus();
+        return null;
+      }
+    }
+    if (showToken) platform.saveHubToken(token.value);
     platform.saveName(n);
-    if (platform.serverIsConfigurable) platform.saveServerUrl(server.value);
     return n;
   };
 
@@ -75,24 +117,36 @@ export function showOnboarding(
   if (teamCode) {
     const join = h('button', { type: 'submit', textContent: `Join team ${teamCode}` });
     join.onclick = () => {
-      const n = requireName();
+      const n = saveFields();
       if (n) opts.onSubmit({ type: 'hello', teamCode, clientId: platform.clientId(), name: n });
     };
-    const other = h('a', { href: location.pathname, textContent: 'Start or join a different team' });
+    const label = 'Start or join a different team';
+    let other: HTMLElement;
+    if (opts.onOtherTeam) {
+      other = h('button', { type: 'button', className: 'secondary', textContent: label });
+      other.onclick = () => opts.onOtherTeam!();
+    } else {
+      other = h('a', { href: appLink(), textContent: label });
+    }
     card.append(join, other);
   } else {
     const teamName = h('input', { placeholder: 'Team name', maxLength: 24 });
     const create = h('button', { type: 'submit', textContent: 'Start a team' });
     create.onclick = () => {
-      const n = requireName();
+      const n = saveFields();
       if (n) opts.onSubmit({ type: 'create', teamName: teamName.value, clientId: platform.clientId(), name: n });
     };
-    const code = h('input', { placeholder: 'Invite code', maxLength: 6, className: 'sb-code' });
+    const code = h('input', { placeholder: 'Invite code', maxLength: INVITE_CODE_INPUT_MAX, className: 'sb-code' });
     const join = h('button', { type: 'button', textContent: 'Join' });
     join.onclick = () => {
-      const n = requireName();
-      const c = code.value.trim().toUpperCase();
-      if (n && c) opts.onSubmit({ type: 'hello', teamCode: c, clientId: platform.clientId(), name: n });
+      const c = cleanInviteCode(code.value);
+      if (!c) return code.focus();
+      if (!INVITE_CODE.test(c)) {
+        errorEl.textContent = "That doesn't look like an invite code. Check it with whoever sent it.";
+        return code.focus();
+      }
+      const n = saveFields();
+      if (n) opts.onSubmit({ type: 'hello', teamCode: c, clientId: platform.clientId(), name: n });
     };
     card.append(
       h('fieldset', {}, h('legend', { textContent: 'New team' }), teamName, create),
@@ -100,6 +154,7 @@ export function showOnboarding(
     );
   }
   if (platform.serverIsConfigurable) card.append(h('label', {}, 'Server', server));
+  if (showToken) card.append(h('label', {}, 'Access token', token));
   card.append(errorEl);
   container.replaceChildren(h('div', { class: 'sb-center' }, card));
   name.focus();
@@ -107,10 +162,14 @@ export function showOnboarding(
 
 // ── Team panel ──────────────────────────────────────────────────────────────
 
+const ERROR_SHOW_MS = 8000;
+
 export interface TeamPanel {
   setTeam(team: TeamView, you: string): void;
   setStatus(status: NetStatus): void;
   setError(message: string): void;
+  /** A connection problem to show until the next team update ('' clears it). */
+  setNotice(message: string): void;
 }
 
 export function createTeamPanel(
@@ -127,15 +186,45 @@ export function createTeamPanel(
   let status: NetStatus = 'connecting';
   let settingsOpen = false;
   let panelError = '';
+  let errorTimer: ReturnType<typeof setTimeout> | undefined;
+  let notice = '';
+  /** Owner actions waiting for a second click: 'rotate', or the id of a member to remove. */
+  let confirming: string | null = null;
 
-  const inviteLink = () => `${location.origin}${location.pathname}?team=${team!.code}`;
+  const inviteLink = () => appLink({ team: team!.code });
+
+  /** A button that asks again inline before doing something that can't be undone. */
+  const confirmable = (key: string, label: string, question: string, yes: string, act: () => void) => {
+    if (confirming !== key) {
+      const b = h('button', { textContent: label, className: 'secondary' });
+      b.onclick = () => {
+        confirming = key;
+        render();
+      };
+      return b;
+    }
+    const ok = h('button', { textContent: yes });
+    ok.onclick = () => {
+      confirming = null;
+      act();
+      render();
+    };
+    const no = h('button', { textContent: 'Cancel', className: 'secondary' });
+    no.onclick = () => {
+      confirming = null;
+      render();
+    };
+    return h('div', { class: 'sb-confirm' }, h('p', { textContent: question }), h('div', { class: 'sb-row' }, ok, no));
+  };
 
   function render() {
     if (settingsOpen) return;
+    const problems = [notice, panelError].filter(Boolean).map((m) => h('p', { class: 'sb-error', textContent: m }));
     if (!team) {
       panel.replaceChildren(
         h('h2', { textContent: appTitle() }),
         h('p', { textContent: status === 'open' ? 'Joining…' : 'Connecting…' }),
+        ...problems,
       );
       return;
     }
@@ -160,13 +249,33 @@ export function createTeamPanel(
       renderSettings();
     };
 
+    const net = opts.net;
     const members = h(
       'ul',
       { class: 'sb-members' },
-      ...team.members.map((m) =>
-        h('li', { class: m.online ? 'online' : '' }, m.name + (m.id === you ? ' (you)' : '')),
-      ),
+      ...team.members.map((m) => {
+        const li = h('li', { class: m.online ? 'online' : '' }, m.name + (m.id === you ? ' (you)' : ''));
+        // Removing also keeps them from rejoining with the code they have.
+        if (isOwner && m.id !== you) {
+          li.append(
+            ' ',
+            confirmable(`remove:${m.id}`, 'Remove', `Remove ${m.name} from the team?`, 'Remove', () =>
+              net.send({ type: 'removeMember', id: m.id }),
+            ),
+          );
+        }
+        return li;
+      }),
     );
+    const rotate = isOwner
+      ? confirmable(
+          'rotate',
+          'New invite code',
+          'Make a new invite code? The current one stops working, also for teammates who are offline right now: they’ll need the new one.',
+          'New code',
+          () => net.send({ type: 'rotateCode' }),
+        )
+      : '';
 
     panel.replaceChildren(
       h('h2', { textContent: team.name }),
@@ -177,9 +286,12 @@ export function createTeamPanel(
         h('code', { textContent: team.code }),
         status === 'open' ? '' : h('span', { class: 'sb-status', textContent: ` · ${status}…` }),
       ),
+      ...problems,
       h('div', { class: 'sb-row' }, copy, isOwner ? settings : '', ...(opts.actions?.() ?? [])),
+      rotate,
       members,
-      team.zoomLink
+      // Only the owner receives the link itself; everyone gets `hasZoomLink`.
+      team.hasZoomLink
         ? ''
         : h('p', {
             class: 'sb-warn',
@@ -219,11 +331,17 @@ export function createTeamPanel(
     };
     const save = h('button', { textContent: 'Save' });
     save.onclick = () => {
+      // Send only the canonical form; the hub checks again.
+      const link = normalizeMeetingLink(zoom.value.trim());
+      if (link === null) {
+        err.textContent = 'That isn’t a Zoom link. Paste the https://…zoom.us/j/… link from your meeting.';
+        return zoom.focus();
+      }
       panelError = '';
       opts.net.send({
         type: 'settings',
         teamName: name.value,
-        zoomLink: zoom.value.trim(),
+        zoomLink: link,
         defaultLengthMin: Number(length.value),
       });
       close();
@@ -247,6 +365,7 @@ export function createTeamPanel(
     setTeam(t, me) {
       team = t;
       you = me;
+      notice = '';
       render();
     },
     setStatus(s) {
@@ -255,6 +374,16 @@ export function createTeamPanel(
     },
     setError(message) {
       panelError = message;
+      render();
+      // Errors are about something just done; don't leave them up for good.
+      clearTimeout(errorTimer);
+      errorTimer = setTimeout(() => {
+        panelError = '';
+        render();
+      }, ERROR_SHOW_MS);
+    },
+    setNotice(message) {
+      notice = message;
       render();
     },
   };

@@ -246,6 +246,29 @@ body {
   background: #3ac06a;
 }
 
+.sb-card .sb-members button,
+.sb-card .sb-members button:active {
+  font-size: 10px;
+  padding: 1px 6px 3px;
+  margin-left: 6px;
+}
+
+.sb-confirm {
+  font-size: 12px;
+}
+
+.sb-confirm p {
+  margin: 8px 0 0;
+}
+
+.sb-confirm .sb-row {
+  margin: 6px 0 12px;
+}
+
+.sb-members .sb-confirm {
+  margin-left: 16px;
+}
+
 .sb-radio {
   flex-direction: row !important;
   align-items: center;

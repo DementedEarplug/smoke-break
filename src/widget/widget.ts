@@ -7,7 +7,7 @@ import {
   type ClientMsg,
   type TeamView,
   clampLength,
-  isValidMeetingLink,
+  normalizeMeetingLink,
 } from '../../shared/protocol.ts';
 import { drawText, textWidth, wrap } from './font.ts';
 import { type Hit, Scene, type SceneInput } from './scene.ts';
@@ -54,10 +54,12 @@ const fmtClock = (ms: number) => {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 };
 
-/** The break's meeting link, if it's one we're willing to open (the hub checks too). */
+/**
+ * The break's meeting link in canonical form, if it's one we're willing to
+ * open. Only this output is ever opened, never the hub's raw string.
+ */
 function safeMeetingUrl(team: TeamView): string | null {
-  const url = team.brk?.meetingUrl;
-  return url && isValidMeetingLink(url) ? url : null;
+  return normalizeMeetingLink(team.brk?.meetingUrl) || null;
 }
 
 function joinNames(names: string[]): string {
@@ -100,6 +102,8 @@ export class Widget {
   private lastWake = performance.now();
   /** Set while waiting on a slow quiet-mode frame instead of requestAnimationFrame. */
   private quietTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Logged the first failed frame already (don't flood the console at 60 fps). */
+  private frameFailed = false;
   private readonly input: SceneInput = {
     brk: null,
     me: '',
@@ -155,8 +159,20 @@ export class Widget {
   private frame = (t: number) => {
     const dt = Math.min(QUIET_FRAME_MS / 1000, (t - this.lastFrame) / 1000);
     this.lastFrame = t;
-    this.tick(dt);
-    if (this.quiet) {
+    try {
+      this.tick(dt);
+    } catch (e) {
+      // One bad frame (e.g. odd data from the hub) mustn't stop the pack for good.
+      if (!this.frameFailed) console.error('Smoke Break: frame failed', e);
+      this.frameFailed = true;
+    }
+    let quiet = true;
+    try {
+      quiet = this.quiet;
+    } catch {
+      // Fall back to the slow timer.
+    }
+    if (quiet) {
       this.quietTimer = setTimeout(() => {
         this.quietTimer = null;
         this.frame(performance.now());
@@ -473,17 +489,23 @@ export class Widget {
     const team = this.team;
     const url = team && safeMeetingUrl(team);
     const host = this.opts.host;
+    // Only the owner receives the link itself, so ask `hasZoomLink`.
+    const noLink = team?.meetingProvider === 'fixed-link' && !team.hasZoomLink;
+    const noLinkToast = () =>
+      this.showToast(
+        team?.ownerId === this.me ? 'No Zoom link yet. Add one in settings' : 'No Zoom link yet. Ask the team owner',
+        4000,
+      );
     if (host) {
       if (url) host.openUrl(url);
-      else if (team?.meetingProvider === 'fixed-link' && !team.zoomLink) {
-        this.showToast('No Zoom link yet. Add one in settings', 4000);
-      } else this.pendingMeetingOpen = true;
+      else if (noLink) noLinkToast();
+      else this.pendingMeetingOpen = true;
     } else if (url) {
       const w = window.open(url, '_blank');
       if (w) w.opener = null;
       else this.popupBlocked();
-    } else if (team?.meetingProvider === 'fixed-link' && !team.zoomLink) {
-      this.showToast('No Zoom link yet. Add one in settings', 4000);
+    } else if (noLink) {
+      noLinkToast();
     } else {
       // The link is still being created: open a tab now and point it there when it arrives.
       const w = window.open('about:blank', '_blank');
