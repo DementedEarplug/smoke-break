@@ -8,9 +8,10 @@ import { packPreview } from '../../src/widget/preview.ts';
 import { Scene } from '../../src/widget/scene.ts';
 import { LIGHTER_SKINS, PACK_SKINS, lighterSkin, packSkin } from '../../src/widget/skins.ts';
 import * as S from '../../src/widget/sprites.ts';
+import { type Theme, packSkinsFor } from '../../src/widget/theme.ts';
 
 const FPS = 30;
-export const TOTAL = 600;
+export const TOTAL = 36 * FPS;
 const DT = 1 / FPS;
 const VW = 1920;
 const VH = 1080;
@@ -179,6 +180,7 @@ class Actor {
     readonly script: (t: number) => Frame,
     readonly pack = 'classic',
     readonly lighter = 'classic',
+    readonly theme: Theme = 'smoke',
   ) {}
 
   step(dt: number) {
@@ -194,6 +196,7 @@ class Actor {
       flickAt: f.flickAt ?? null,
       packSkin: packSkin(this.pack),
       lighterSkin: lighterSkin(this.lighter),
+      theme: this.theme,
     };
     this.scene.update(input, dt);
     this.scene.draw(input);
@@ -222,7 +225,7 @@ class Actor {
     const b = bubbleCanvas(text);
     const anchor = Math.min(this.scene.contentTop - 3, S.H - 30);
     const cx = x + (S.PACK_X + S.PACK_W / 2) * s;
-    const bx = Math.round(cx - (b.width * s) / 2);
+    const bx = Math.round(clamp(cx - (b.width * s) / 2, 40, VW - 40 - b.width * s));
     const by = Math.round(y + anchor * s - b.height * s);
     ctx.save();
     ctx.shadowColor = 'rgba(0,0,0,0.3)';
@@ -327,30 +330,31 @@ const lit = (litAt: number, participants: Participant[], extra: Partial<Break> =
 
 // 1. Hook: the pack on Maya's screen. She clicks it.
 const HOOK = { cx: 1420, bottom: 900, s: 13 };
+const HOOK_CLICK = 2.0;
 const hook: Shot<{ a: Actor }> = {
   start: 0,
-  end: 3,
+  end: 4,
   make: () => ({
     a: new Actor('maya', (t) => ({
-      brk: t < 1.0 ? null : brk({ participants: [MAYA()] }),
-      bubble: t < 0.45 ? null : t < 1.0 ? 'Click for a smoke break' : 'Waiting for takers...',
+      brk: t < HOOK_CLICK ? null : brk({ participants: [MAYA()] }),
+      bubble: t < 0.5 ? null : t < HOOK_CLICK ? 'Click for a smoke break' : 'Waiting for takers...',
     })),
   }),
   tick: (st) => st.a.step(DT),
   draw: (ctx, st, lt) => {
-    typedLines(ctx, ['A cigarette pack', 'that floats on', 'your screen.'], 150, 360, 11, lt, 0.05, { cps: 110 });
+    typedLines(ctx, ['A cigarette pack', 'that floats on', 'your screen.'], 150, 360, 11, lt, 0.1, { cps: 40 });
     st.a.drawAt(ctx, HOOK.cx, HOOK.bottom, HOOK.s);
     const px = HOOK.cx + 30;
     const py = HOOK.bottom - 7 * HOOK.s;
     drawCursor(
       ctx,
       [
-        [0, 1900, 1040],
-        [0.85, px, py],
-        [1.6, px + 6, py + 6],
-        [2.4, px + 200, py + 160],
+        [0.4, 1900, 1040],
+        [1.7, px, py],
+        [2.6, px + 6, py + 6],
+        [3.6, px + 200, py + 160],
       ],
-      [1.0],
+      [HOOK_CLICK],
       lt,
     );
   },
@@ -384,78 +388,90 @@ function drawPanel(ctx: CanvasRenderingContext2D, x: number, label: string) {
   pixelText(ctx, label, x + PANEL_W - 24 - textWidth(label.toUpperCase()) * 4, PANEL_Y + 18, 4, INK, false);
 }
 
+/** A screen with a pack on it, clipped to the screen. */
+function drawScreen(ctx: CanvasRenderingContext2D, x: number, label: string, a: Actor) {
+  drawPanel(ctx, x, label);
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x + 6, PANEL_Y + 60, PANEL_W - 12, PANEL_H - 66);
+  ctx.clip();
+  a.drawAt(ctx, x + PANEL_W / 2, INVITE_BOTTOM, 7);
+  ctx.restore();
+}
+
+const INVITE_LAND = 0.5;
+const THEO_JOIN = 2.5;
+const SAM_JOIN = 5.0;
 const invite: Shot<{ actors: Actor[] }> = {
-  start: 3,
-  end: 6,
+  start: 4,
+  end: 10,
   make: () => {
     const phase = (n: number) =>
       n === 1 ? brk({ participants: [MAYA()] }) : brk({ phase: 'lighter', meetingRequested: true, participants: n === 2 ? [MAYA(), THEO()] : [MAYA(), THEO(), SAM()] });
-    const count = (t: number) => (t < 1.0 ? 1 : t < 1.5 ? 2 : 3);
+    const count = (t: number) => (t < THEO_JOIN ? 1 : t < SAM_JOIN ? 2 : 3);
     return {
       actors: [
         new Actor('maya', (t) => ({ brk: phase(count(t)), bubble: count(t) === 1 ? 'Waiting for takers...' : 'Light up?' })),
         new Actor('theo', (t) => ({
-          brk: t < 0.25 ? null : phase(count(t)),
-          bubble: t < 0.25 ? null : count(t) === 1 ? 'Maya wants a 12-min smoke break' : 'Light up?',
+          brk: t < INVITE_LAND ? null : phase(count(t)),
+          bubble: t < INVITE_LAND ? null : count(t) === 1 ? 'Maya wants a 12-min smoke break' : 'Light up?',
         })),
         new Actor('sam', (t) => ({
-          brk: t < 0.25 ? null : phase(count(t)),
+          brk: t < INVITE_LAND ? null : phase(count(t)),
           bubble:
-            t < 0.25 ? null : count(t) === 1 ? 'Maya wants a 12-min smoke break' : count(t) === 2 ? 'Maya & Theo are heading out. Click to join' : 'Light up?',
+            t < INVITE_LAND ? null : count(t) === 1 ? 'Maya wants a 12-min smoke break' : count(t) === 2 ? 'Maya & Theo are heading out. Click to join' : 'Light up?',
         })),
       ],
     };
   },
   tick: (st) => st.actors.forEach((a) => a.step(DT)),
   draw: (ctx, st, lt) => {
-    typedLines(ctx, ['Click it. Your whole team gets the invite.'], VW / 2, 130, 7, lt, 0.05, { center: true, cps: 120 });
+    typedLines(ctx, ['Click it. Your whole team gets the invite.'], VW / 2, 130, 7, lt, 0.1, { center: true, cps: 45 });
     const labels = ["Maya's screen", "Theo's screen", "Sam's screen"];
-    st.actors.forEach((a, i) => {
-      const x = panelX(i);
-      drawPanel(ctx, x, labels[i]);
-      ctx.save();
-      ctx.beginPath();
-      ctx.rect(x + 6, PANEL_Y + 60, PANEL_W - 12, PANEL_H - 66);
-      ctx.clip();
-      a.drawAt(ctx, x + PANEL_W / 2, INVITE_BOTTOM, 7);
-      ctx.restore();
-    });
+    st.actors.forEach((a, i) => drawScreen(ctx, panelX(i), labels[i], a));
     const packY = INVITE_BOTTOM - 8 * 7;
-    drawCursor(ctx, [[0.3, panelX(1) + 470, PANEL_Y + 700], [0.9, panelX(1) + 285, packY]], [1.0], lt, 4);
-    drawCursor(ctx, [[0.6, panelX(2) + 90, PANEL_Y + 690], [1.4, panelX(2) + 285, packY]], [1.5], lt, 4);
+    drawCursor(ctx, [[1.0, panelX(1) + 470, PANEL_Y + 700], [2.2, panelX(1) + 285, packY], [3.0, panelX(1) + 300, packY + 20], [4.0, panelX(1) + 470, PANEL_Y + 720]], [THEO_JOIN], lt, 4);
+    drawCursor(ctx, [[3.4, panelX(2) + 90, PANEL_Y + 690], [4.7, panelX(2) + 285, packY]], [SAM_JOIN], lt, 4);
   },
 };
 
-// 3. Light up: Theo's screen, and Zoom opens.
-const LIGHT_PACK = { cx: 400, bottom: 940, s: 10 };
+// 3. Light up: Theo's screen. His cigarette comes out, is held sideways in the
+// lighter's flame, catches and stands beside the pack; then Zoom opens.
+const LIGHT_PACK = { cx: 420, bottom: 990, s: 15 };
+const FLICK = 1.5;
+/** Theo's cigarette catches FLICK + ~1.5s (the Scene's own timing); Zoom opens a beat after. */
+const ZOOM_AT = 4.0;
+const SAM_LIGHTS = 4.6;
 const lightUp: Shot<{ a: Actor }> = {
-  start: 6,
-  end: 10,
-  make: () => ({
-    a: new Actor('theo', (t) => ({
-      brk: lit(-2000, [MAYA(-2000), THEO(t >= 1.15 ? 1150 : null), SAM(t >= 1.75 ? 1750 : null)]),
-      bubble: t < 1.0 ? 'Light up?' : null,
-      flickAt: t >= 1.0 ? 1000 : null,
-    })),
-  }),
+  start: 10,
+  end: 18,
+  make: () => {
+    const a = new Actor('theo', (t) => ({
+      brk: lit(-2000, [MAYA(-2000), THEO(t >= FLICK ? FLICK * 1000 : null), SAM(t >= SAM_LIGHTS ? SAM_LIGHTS * 1000 : null)]),
+      bubble: t < FLICK ? 'Light up?' : t >= ZOOM_AT - 0.3 && t < ZOOM_AT + 1.4 ? 'Opening Zoom' : null,
+      flickAt: t >= FLICK ? FLICK * 1000 : null,
+    }));
+    a.preroll(1.5);
+    return { a };
+  },
   tick: (st) => st.a.step(DT),
   draw: (ctx, st, lt) => {
-    typedLines(ctx, ['Two join. A lighter appears.', 'Light up and Zoom opens.'], 170, 110, 7, lt, 0.05, { cps: 120 });
+    typedLines(ctx, ['Two join. A lighter appears.', 'Light up and Zoom opens.'], 960, 170, 7, lt, 0.1, { cps: 45 });
     const { cx, bottom, s } = LIGHT_PACK;
     st.a.drawAt(ctx, cx, bottom, s);
     drawZoom(ctx, lt);
     const lx = cx + (S.LIGHTER_X + 5 - 25) * s;
     const ly = bottom - (S.MOUTH_Y + S.BODY_H - S.LIGHTER_BASE_Y + 8) * s;
-    drawCursor(ctx, [[0, 760, 1000], [0.85, lx, ly], [1.4, lx + 10, ly + 10], [2.2, 700, 1100]], [1.0], lt);
+    drawCursor(ctx, [[0.2, 860, 1060], [1.2, lx, ly], [1.7, lx + 10, ly + 10], [2.6, 900, 1120]], [FLICK], lt);
   },
 };
 
 function drawZoom(ctx: CanvasRenderingContext2D, lt: number) {
-  const k = easeOut(clamp((lt - 1.3) / 0.4));
+  const k = easeOut(clamp((lt - ZOOM_AT) / 0.45));
   if (k <= 0) return;
   const w = 900;
   const h = 560;
-  const x = Math.round(lerp(VW + 40, 860, k));
+  const x = Math.round(lerp(VW + 40, 960, k));
   const y = 330;
   ctx.fillStyle = 'rgba(0,0,0,0.35)';
   ctx.fillRect(x + 12, y + 12, w, h);
@@ -467,9 +483,9 @@ function drawZoom(ctx: CanvasRenderingContext2D, lt: number) {
   ctx.fillStyle = '#17151f';
   ctx.fillRect(x + 6, y + 62, w - 12, h - 68);
   const tiles: [string, string, number][] = [
-    ['Maya', '#a82a35', 1.45],
-    ['Theo', '#244a9a', 1.6],
-    ['Sam', '#1f6b45', 1.95],
+    ['Maya', '#a82a35', ZOOM_AT + 0.5],
+    ['Theo', '#244a9a', ZOOM_AT + 1.0],
+    ['Sam', '#1f6b45', SAM_LIGHTS + 0.9],
   ];
   const tw = 270;
   const th = 300;
@@ -496,58 +512,116 @@ function drawZoom(ctx: CanvasRenderingContext2D, lt: number) {
 
 // 4. The cigarette is the timer.
 const TIMER_PACK = { cx: 480, bottom: 950, s: 11 };
-const timer: Shot<{ a: Actor; rem: (t: number) => number }> = {
-  start: 10,
-  end: 14,
+const BURN_FROM = 0.3;
+/** The last minute burns slower so "Last drag!" can be read. */
+const LAST_MIN = 2.3;
+const BURN_TO = 2.9;
+const OUT = 3.0;
+const timer: Shot<{ a: Actor }> = {
+  start: 18,
+  end: 23,
   make: () => {
     const total = 12 * 60_000;
     const start = 11.5 * 60_000;
-    const rem = (t: number) => Math.max(0, lerp(start, 0, clamp((t - 0.15) / 1.9)));
+    const rem = (t: number) =>
+      t < LAST_MIN
+        ? lerp(start, 60_000, clamp((t - BURN_FROM) / (LAST_MIN - BURN_FROM)))
+        : Math.max(0, lerp(60_000, 0, clamp((t - LAST_MIN) / (BURN_TO - LAST_MIN))));
     const litAt = 1;
     const endsAt = litAt + total;
     const ps = [MAYA(1), THEO(1), SAM(1)];
-    const OUT = 2.25;
     const a = new Actor('theo', (t) => {
       const r = rem(t);
-      const b =
-        t < OUT
-          ? lit(litAt, ps)
-          : lit(litAt, ps, { phase: 'out', outReason: 'burned', outAt: endsAt });
+      const b = t < OUT ? lit(litAt, ps) : lit(litAt, ps, { phase: 'out', outReason: 'burned', outAt: endsAt });
       const clock = `${Math.floor(r / 60_000)}:${String(Math.floor((r % 60_000) / 1000)).padStart(2, '0')}`;
       return {
         brk: b,
         now: endsAt - r,
-        bubble: t >= OUT ? "Break's over. Time to hop off Zoom" : t < 1.75 ? `${clock} left. Click to stub out` : r < 60_000 ? 'Last drag!' : null,
+        bubble: t >= OUT ? "Break's over. Time to hop off Zoom" : r >= 60_000 ? `${clock} left. Click to stub out` : 'Last drag!',
       };
     });
     a.preroll(2.5);
-    return { a, rem };
+    return { a };
   },
   tick: (st) => st.a.step(DT),
   draw: (ctx, st, lt) => {
-    typedLines(ctx, ['The cigarette', 'is the timer.'], 960, 400, 12, lt, 0.05, { cps: 100 });
-    if (lt > 0.4) monoText(ctx, '10 to 15 minutes. Your team picks.', 966, 640, 40, SOFT, clamp((lt - 0.4) / 0.25));
+    typedLines(ctx, ['The cigarette', 'is the timer.'], 960, 400, 12, lt, 0.1, { cps: 40 });
+    if (lt > 0.8) monoText(ctx, '10 to 15 minutes. Your team picks.', 966, 640, 40, SOFT, clamp((lt - 0.8) / 0.3));
     const { cx: px, bottom, s } = TIMER_PACK;
     st.a.drawAt(ctx, px, bottom, s);
-    const cx = px + 0.5 * s;
-    const cy = bottom - 23 * s;
-    drawCursor(ctx, [[0, cx + 40, cy + 160], [0.15, cx, cy], [1.75, cx, cy + 4], [2.3, cx + 260, cy + 300]], [], lt);
+    // Hovering Theo's cigarette, the second one standing beside the pack.
+    const cx = px + (S.PACK_X + S.PACK_W + 2 + 4 + 1 - (S.PACK_X + S.PACK_W / 2)) * s;
+    const cy = bottom - 6 * s;
+    drawCursor(ctx, [[0, cx + 60, cy + 200], [0.3, cx, cy], [2.8, cx, cy + 4], [3.5, cx + 260, cy + 300]], [], lt);
   },
 };
 
-// 5. Skins.
-const PACK_TILES = PACK_SKINS.map((s) => packPreview(s, 1));
+// 5. Water: same break, Sam's screen shows a water cooler instead.
+const WATER_X = [330, 1050];
+const SAM_DRINKS = 1.0;
+const water: Shot<{ actors: Actor[] }> = {
+  start: 23,
+  end: 27,
+  make: () => {
+    const b = (t: number) =>
+      lit(-30_000, [MAYA(-30_000), THEO(-30_000), SAM(t >= SAM_DRINKS ? SAM_DRINKS * 1000 : null)]);
+    const now = (t: number) => 2.5 * 60_000 + t * 1000;
+    const theo = new Actor('theo', (t) => ({ brk: b(t), now: now(t), bubble: null }));
+    const sam = new Actor(
+      'sam',
+      (t) => ({
+        brk: b(t),
+        now: now(t),
+        bubble: t < SAM_DRINKS ? 'Drink up?' : null,
+        flickAt: t >= SAM_DRINKS ? SAM_DRINKS * 1000 : null,
+      }),
+      'classic',
+      'classic',
+      'water',
+    );
+    theo.preroll(2);
+    sam.preroll(2);
+    return { actors: [theo, sam] };
+  },
+  tick: (st) => st.actors.forEach((a) => a.step(DT)),
+  draw: (ctx, st, lt) => {
+    typedLines(ctx, ['Not a smoker? Switch to water.'], VW / 2, 110, 7, lt, 0.1, { center: true, cps: 45 });
+    if (lt > 0.9) {
+      const line = 'Same break. Everyone picks their own style.';
+      ctx.save();
+      ctx.font = `600 36px ${MONO}`;
+      const w = ctx.measureText(line).width;
+      ctx.restore();
+      monoText(ctx, line, VW / 2 - w / 2, 190, 36, SOFT, clamp((lt - 0.9) / 0.3));
+    }
+    drawScreen(ctx, WATER_X[0], "Theo's screen", st.actors[0]);
+    drawScreen(ctx, WATER_X[1], "Sam's screen", st.actors[1]);
+    // Sam fills a cup from the cooler.
+    const ox = WATER_X[1] + PANEL_W / 2 - (S.PACK_X + S.PACK_W / 2) * 7;
+    const oy = INVITE_BOTTOM - (S.MOUTH_Y + S.BODY_H) * 7;
+    const cx = ox + (S.LIGHTER_X + 5) * 7;
+    const cy = oy + (S.LIGHTER_BASE_Y - 8) * 7;
+    drawCursor(ctx, [[0, WATER_X[1] + 500, PANEL_Y + 720], [0.75, cx, cy], [1.6, cx + 10, cy + 10], [2.4, WATER_X[1] + 520, PANEL_Y + 740]], [SAM_DRINKS], lt, 4);
+  },
+};
+
+// 6. Skins: packs on the beat, lighters on the eighths.
+const PACK_TILES = packSkinsFor('smoke').map((s) => packPreview(s, 1));
+const PACKS_AT = 0.5;
+const PACK_STEP = 0.5;
+const LIGHTERS_AT = 3.75;
+const LIGHTER_STEP = 0.25;
 const skins: Shot<null> = {
-  start: 14,
-  end: 17,
+  start: 27,
+  end: 33,
   make: () => null,
   tick: () => {},
   draw: (ctx, _st, lt) => {
-    typedLines(ctx, ['Pick your pack. And your lighter.'], VW / 2, 120, 7, lt, 0.05, { center: true, cps: 120 });
+    typedLines(ctx, ['Pick your pack. And your lighter.'], VW / 2, 120, 7, lt, 0.1, { center: true, cps: 45 });
     ctx.imageSmoothingEnabled = false;
     const ps = 8;
-    PACK_SKINS.forEach((skin, i) => {
-      const at = 0.25 + i * 0.25;
+    packSkinsFor('smoke').forEach((skin, i) => {
+      const at = PACKS_AT + i * PACK_STEP;
       const k = clamp((lt - at) / 0.3);
       if (k <= 0) return;
       const sc = easeOutBack(k);
@@ -564,7 +638,7 @@ const skins: Shot<null> = {
     });
     const ls = 8;
     LIGHTER_SKINS.forEach((skin, i) => {
-      const at = 1.75 + i * 0.125;
+      const at = LIGHTERS_AT + i * LIGHTER_STEP;
       const k = clamp((lt - at) / 0.3);
       if (k <= 0) return;
       const c = lighterTile;
@@ -583,10 +657,10 @@ const skins: Shot<null> = {
 };
 const lighterTile = offscreen(8, 21);
 
-// 6. Outro.
+// 7. Outro.
 const outro: Shot<{ a: Actor }> = {
-  start: 17,
-  end: 20,
+  start: 33,
+  end: 36,
   make: () => {
     const a = new Actor('viewer', () => ({
       brk: lit(1, [MAYA(1), THEO(1), SAM(1)]),
@@ -598,19 +672,19 @@ const outro: Shot<{ a: Actor }> = {
   },
   tick: (st) => st.a.step(DT),
   draw: (ctx, st, lt) => {
-    st.a.drawAt(ctx, 500, 900, 12);
+    st.a.drawAt(ctx, 440, 900, 12);
     const k = clamp(lt / 0.35);
     const s = 18;
     ctx.save();
     ctx.globalAlpha *= k;
-    pixelText(ctx, 'Smoke Break', 880, 450 + Math.round((1 - easeOut(k)) * 20), s, RED);
+    pixelText(ctx, 'Smoke Break', 900, 450 + Math.round((1 - easeOut(k)) * 20), s, RED);
     ctx.restore();
-    if (lt > 0.35) monoText(ctx, 'Lives in your menu bar.', 886, 590, 46, PAPER, clamp((lt - 0.35) / 0.25));
-    if (lt > 0.6) monoText(ctx, 'A Mac desktop app for teams.', 886, 660, 46, SOFT, clamp((lt - 0.6) / 0.25));
+    if (lt > 0.4) monoText(ctx, 'Lives in your menu bar.', 906, 590, 46, PAPER, clamp((lt - 0.4) / 0.3));
+    if (lt > 0.8) monoText(ctx, 'A Mac desktop app for teams.', 906, 660, 46, SOFT, clamp((lt - 0.8) / 0.3));
   },
 };
 
-const SHOTS: Shot[] = [hook, invite, lightUp, timer, skins, outro];
+const SHOTS: Shot[] = [hook, invite, lightUp, timer, water, skins, outro];
 
 // ── Engine ──────────────────────────────────────────────────────────────────
 

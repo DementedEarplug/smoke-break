@@ -4,9 +4,15 @@ A little pixel-art pack that floats on your desktop and gets your team on a brea
 
 Click the pack to invite your team. When a second person joins, a lighter appears; light up and everyone's Zoom call opens. The cigarette then burns down as the break timer (10–15 minutes).
 
-Not a smoker? Switch to the **Water** style: a water cooler whose jug drains as the timer, with a cup to fill instead of a lighter. Styles and skins are personal, so smokers and non-smokers can share the same break and each see their own.
+Not a smoker? Pick another **break style**:
 
-[![Smoke Break in action (20-second video)](brag-output/brag.jpg)](brag-output/brag.mp4)
+- **Water:** a water cooler whose jug drains as the timer, with a cup to fill instead of a lighter.
+- **Coffee:** a coffee maker that pours everyone a mug; the pot drains as the timer.
+- **Donut:** a bakery box of donuts. Yours gets sprinkles, then gets eaten bite by bite as the timer.
+
+Styles and skins are personal, so teammates can share the same break and each see their own.
+
+[![Smoke Break in action (36-second video)](brag-output/brag.jpg)](brag-output/brag.mp4)
 
 > **Status:** a working prototype. The desktop app has only been built and tested on macOS so far; Windows and Linux are tracked in [#1](https://github.com/DementedEarplug/smoke-break/issues/1).
 
@@ -68,7 +74,7 @@ Everyone must connect to the same hub. On a single computer that happens automat
 - **Drag** the pack to move it. **Right-click** it to turn do-not-disturb on or off.
 - **Pinch** (or ⌃-scroll) on the pack to resize it.
 
-In the **My pack** panel (in the Settings window on desktop, beside the team panel in the browser) you can change the size, the pack and lighter skins, and the **Break style** (Smoke or Water). These settings stay on your device and never change what teammates see.
+In the **My pack** panel (in the Settings window on desktop, beside the team panel in the browser) you can change the size, the pack and lighter skins, and the **Break style** (Smoke, Water, Coffee or Donut). These settings stay on your device and never change what teammates see.
 
 ## Running a shared hub
 
@@ -133,7 +139,8 @@ npm run build       # browser build into dist/
 | `server/main.ts` | Standalone hub (`npm run server`) |
 | `src/widget/` | The floating pack: sprites, animation scene, speech bubble, input |
 | `src/widget/skins.ts` | Pack and lighter skins |
-| `src/widget/theme.ts` | Break styles (smoke / water) and their wording |
+| `src/widget/theme.ts` | Break style names and their wording |
+| `src/widget/styles/` | Each break style's look and animation (smoke, water, coffee, donut) |
 | `src/appearance.ts` | Your size, style and skin choices, synced across your windows |
 | `src/overlay.ts` | Desktop overlay window: click-through, dragging, tray sync |
 | `src/panel.ts` | Desktop Settings window |

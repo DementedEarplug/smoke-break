@@ -1,3 +1,5 @@
+import type { Theme } from './theme.ts';
+
 // Cosmetic skins for your own pack and lighter. Personal: they change how the
 // pack looks on your screen only.
 
@@ -26,7 +28,28 @@ export interface PackSkin {
   label: string;
   /** Two letters on the front. */
   monogram: string;
+  /** Only offered for these break styles (others fall back to Classic). */
+  only?: Theme[];
+  /** What's in the cooler, if not plain water. */
+  drink?: Drink;
 }
+
+export interface Liquid {
+  main: string;
+  light: string;
+  dark: string;
+  surface: string;
+}
+
+export interface Drink {
+  liquid: Liquid;
+  /** Bits floating in the jug: [color, highlight]. */
+  fruit: [string, string][];
+  /** The team's cups: light, body, shade. */
+  cup: [string, string, string];
+}
+
+export const WATER: Liquid = { main: '#4aa8e8', light: '#9ad8ff', dark: '#2a78c0', surface: '#c8eeff' };
 
 export interface FlamePalette {
   outer: string;
@@ -159,6 +182,32 @@ export const PACK_SKINS: PackSkin[] = [
     baseBottom: '#e0f050',
     label: '#1a1020',
     monogram: 'TX',
+  },
+  {
+    // Party punch for when the water needs some kick (but isn't Toxic).
+    id: 'jungle',
+    name: 'Jungle Juice',
+    style: 'solid',
+    main: '#2f8a3a',
+    mainLight: '#5fc05a',
+    mainDark: '#1f5a28',
+    crease: '#174a20',
+    trim: '#ffb040',
+    base: '#fff2d8',
+    baseShade: '#e8d4b0',
+    baseBottom: '#f2e2c0',
+    label: '#e8307a',
+    monogram: 'JJ',
+    only: ['water'],
+    drink: {
+      liquid: { main: '#e8307a', light: '#ff7aa8', dark: '#a81850', surface: '#ffb0c8' },
+      fruit: [
+        ['#ffa020', '#ffd070'],
+        ['#7ad83a', '#c8f890'],
+        ['#c81830', '#ff5a6a'],
+      ],
+      cup: ['#ff6a6a', '#d23a3a', '#8f1f2e'],
+    },
   },
 ];
 

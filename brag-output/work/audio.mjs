@@ -1,9 +1,9 @@
 // Soundtrack + effects for the Smoke Break video, written as one piece.
-// 120 BPM (beat 0.5s), A minor, 20s. Everything sits on the 16th-note grid from t=0.
+// 120 BPM (beat 0.5s), A minor, 36s. Everything sits on the 16th-note grid from t=0.
 import fs from 'node:fs';
 
 const SR = 44100;
-const DUR = 20;
+const DUR = 36;
 const N = SR * DUR;
 const L = new Float32Array(N);
 const R = new Float32Array(N);
@@ -148,13 +148,18 @@ const CHORDS = {
   C: { root: 48, tones: [55, 60, 64] },
   G: { root: 43, tones: [55, 59, 62] },
 };
-const BARS = ['Am', 'F', 'C', 'G', 'Am', 'F', 'C', 'G', 'F', 'Am'];
+const CYCLE = ['Am', 'F', 'C', 'G'];
+const BARS = [...CYCLE, ...CYCLE, ...CYCLE, ...CYCLE, 'F', 'Am'];
+const LAST = BARS.length - 1;
 const ARP = [0, 1, 2, 1, 2, 3, 2, 1]; // index into tones + octave
+const ARP_B = [0, 2, 1, 3, 2, 1, 2, 3]; // variation for the middle section
+/** The lead drops out under the skins pops and the ending. */
+const LEAD_UNTIL = 27;
 
 BARS.forEach((name, bar) => {
   const c = CHORDS[name];
   const t0 = bar * 4 * BEAT;
-  const final = bar === 9;
+  const final = bar === LAST;
   // Drums.
   for (let b = 0; b < 4; b++) {
     const t = t0 + b * BEAT;
@@ -163,7 +168,7 @@ BARS.forEach((name, bar) => {
     if (bar > 0 && b % 2 === 1) clap(t);
     if (bar > 0 || b >= 2) {
       hat(t + BEAT / 2, 0.045);
-      if (bar >= 1 && bar <= 7) hat(t, 0.025, 0.3);
+      if (bar >= 1 && bar < LAST - 1) hat(t, 0.025, 0.3);
     }
   }
   // Bass: pulsing 8ths with an octave hop.
@@ -177,37 +182,43 @@ BARS.forEach((name, bar) => {
   }
   // Pad under everything.
   pad(t0, c.tones, final ? 1.7 : 4 * BEAT - 0.05, final ? 0.045 : 0.035);
-  // Lead arpeggio from bar 1; drops out under the skins pops (bar 7) and the ending.
-  if (bar >= 1 && bar <= 6) {
+  // Lead arpeggio from bar 1.
+  if (bar >= 1) {
+    const arp = bar >= 9 && bar <= 12 ? ARP_B : ARP;
     for (let e = 0; e < 8; e++) {
-      const i = ARP[e];
+      const t = t0 + e * (BEAT / 2);
+      if (t >= LEAD_UNTIL) break;
+      const i = arp[e];
       const m = (i === 3 ? c.tones[0] + 12 : c.tones[i]) + 12;
-      lead(t0 + e * (BEAT / 2), m, BEAT / 2 - 0.06, bar >= 3 ? 0.075 : 0.06);
+      lead(t, m, BEAT / 2 - 0.06, bar >= 3 ? 0.075 : 0.06);
     }
   }
 });
 // Outro melody: a short rising figure into the title, ending on A.
 [
-  [16.0, 72], [16.5, 74], [17.0, 76],
-  [17.5, 72], [18.0, 69],
+  [32.0, 72], [32.5, 74], [33.0, 76],
+  [33.5, 72], [34.0, 69],
 ].forEach(([t, m], i) => lead(t, m, i === 4 ? 1.6 : 0.4, 0.08, 0));
 
 // Effects on the grid.
-click(1.0); pop(1.0, 76);
-pop(3.25, 81, 0.1, -0.4); pop(3.25, 76, 0.08, 0.4);
-click(4.0); pop(4.0, 72, 0.12, 0);
-click(4.5); pop(4.5, 76, 0.12, 0.4);
-pop(4.625, 69, 0.07, 0.3); // lighters pop up
-click(7.0); flick(7.0, 0.22);
-whoosh(7.5, 0.3, 0.05); // Zoom slides in
-pop(7.5, 69, 0.06); pop(7.625, 72, 0.06); pop(8.0, 76, 0.06); // tiles
-flick(7.75, 0.12);
-hiss(12.25, 0.6, 0.12); // stub out
+click(2.0); pop(2.0, 76); // Maya clicks the pack
+pop(4.5, 81, 0.1, -0.4); pop(4.5, 76, 0.08, 0.4); // invite lands
+click(6.5); pop(6.5, 72, 0.12, 0); // Theo joins
+pop(6.625, 69, 0.07, 0.3); // lighters pop up
+click(9.0); pop(9.0, 76, 0.12, 0.4); // Sam joins
+pop(9.125, 69, 0.07, 0.3);
+click(11.5); pop(11.5, 64, 0.05, 0.3); // click the lighter
+flick(12.25, 0.22); // flame licks the tip
+pop(12.875, 69, 0.08, 0.2); hiss(12.875, 0.35, 0.05); // it catches
+whoosh(14.0, 0.35, 0.05); // Zoom slides in
+pop(14.5, 69, 0.06); pop(15.0, 72, 0.06); pop(15.5, 76, 0.06); // tiles
+hiss(21.0, 0.6, 0.12); // stub out
+click(24.0); [64, 69, 72, 76].forEach((m, i) => pop(24.0 + i * 0.125, m, 0.07, 0.4)); // cup fills
 const PENTA = [69, 72, 74, 76, 79, 81, 84, 86];
-for (let i = 0; i < 7; i++) pop(14.25 + i * 0.25, PENTA[i % PENTA.length], 0.12, -0.6 + i * 0.2);
-for (let i = 0; i < 8; i++) pop(15.75 + i * 0.125, PENTA[i] + 12, 0.08, -0.6 + i * 0.17);
-[3, 6, 10, 14, 17].forEach((t) => whoosh(t, 0.3, 0.045));
-kick(17.0, 0.7);
+for (let i = 0; i < 7; i++) pop(27.5 + i * 0.5, PENTA[i % PENTA.length], 0.12, -0.6 + i * 0.2);
+for (let i = 0; i < 8; i++) pop(30.75 + i * 0.25, PENTA[i] + 12, 0.08, -0.6 + i * 0.17);
+[4, 10, 18, 23, 27, 33].forEach((t) => whoosh(t, 0.3, 0.045));
+kick(33.0, 0.7);
 
 // ── Space: a small stereo echo/room ─────────────────────────────────────────
 

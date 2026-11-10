@@ -26,17 +26,20 @@
 
 **Names on screen** are fictional (Maya, Theo, Sam). No real teams, codes, or links are shown.
 
-**Music:** 120 BPM (beat 0.5s, bar 2s), A minor, soft chiptune with a triangle bass, a mellow square lead, a soft kick and hats. Sound effects sit on the beat grid: pops on cigarette appearances, a lighter flick, and a stub-out.
+**Music:** 120 BPM (beat 0.5s, bar 2s), A minor, soft chiptune with a triangle bass, a mellow square lead, a soft kick and hats. Sound effects sit on the beat grid: pops on cigarette appearances, a lighter click and flame, the catch, a stub-out, the cup filling, and the skin pops.
 
-## Storyboard (20.0s = 40 beats)
+**v2 (slower cut):** same music, tempo, effects and skins-on-the-beat ending, stretched from 20s to 36s so every bubble and line has time to be read. It adds the new light-up (the cigarette is held sideways in the flame, then stands beside the pack, and Zoom opens a beat later) and the water style.
 
-| # | Time | Beats | Scene |
-|---|---|---|---|
-| 1 | 0.0–3.0 | 0–6 | **Hook.** A big pack bobs on the desktop. The cursor clicks on beat 2: lid opens, a cigarette pops, and the bubble reads "Maya wants a 12-min smoke break." Text: "A cigarette pack that floats on your screen." |
-| 2 | 3.0–6.0 | 6–12 | **Invite.** Three screens: Maya, Theo, Sam. The bubble lands on all three, then Theo (beat 8) and Sam (beat 9) join and their cigarettes pop in every pack. Text: "Click it. Your whole team gets the invite." |
-| 3 | 6.0–10.0 | 12–20 | **Light up.** Close-up of Theo's pack. The lighter rises, the cursor clicks it on beat 14, then flame, the cigarettes rise and light, smoke, and the bubble "Opening Zoom". Text: "Two join. A lighter appears. Light up and Zoom opens." |
-| 4 | 10.0–14.0 | 20–28 | **Timer.** Fast-forward burn: the ember flickers and ash drops, the bubble counts minutes down, then cigarettes stub out on beat 26 and the bubble reads "Break's over. Time to hop off Zoom". Text: "The cigarette is the timer." Sub: "10–15 minutes. Your team picks." |
-| 5 | 14.0–17.0 | 28–34 | **Skins.** Seven packs, then eight lighters (lit) pop in on half-beats. Text: "Pick your pack. And your lighter." |
-| 6 | 17.0–20.0 | 34–40 | **Outro.** Lit pack with three smoking cigarettes, the title SMOKE BREAK in the pixel font. Sub: "Lives in your menu bar. Mac desktop app for teams." |
+## Storyboard (36.0s = 72 beats)
 
-Cuts dip through the background (old content out, new content in) on bar lines.
+| # | Time | Scene |
+|---|---|---|
+| 1 | 0–4 | **Hook.** The pack bobs on the desktop with "Click for a smoke break". The cursor clicks on 2.0: a cigarette pops and the bubble reads "Waiting for takers...". Text: "A cigarette pack that floats on your screen." |
+| 2 | 4–10 | **Invite.** Three screens: Maya, Theo, Sam. The invite lands at 4.5, Theo joins at 6.5 (lighters appear), Sam joins at 9.0. Text: "Click it. Your whole team gets the invite." |
+| 3 | 10–18 | **Light up.** Close-up of Theo's pack. He clicks the lighter at 11.5, his cigarette comes out, tips sideways, the lighter rises, the flame licks it at 12.25, and it catches at 12.9 and hops beside the pack. Zoom slides in at 14.0, and tiles land on 14.5, 15.0 and 15.5 (Sam lights up). Text: "Two join. A lighter appears. Light up and Zoom opens." |
+| 4 | 18–23 | **Timer.** The cigarettes beside the pack burn down; the last minute slows for "Last drag!", and they stub out at 21.0 with "Break's over. Time to hop off Zoom". Text: "The cigarette is the timer." Sub: "10–15 minutes. Your team picks." |
+| 5 | 23–27 | **Water.** The same break on Theo's screen (smoke) and Sam's screen (water cooler). Sam fills a cup at 24.0. Text: "Not a smoker? Switch to water." Sub: "Same break. Everyone picks their own style." |
+| 6 | 27–33 | **Skins.** Seven packs pop on the beat, then eight lighters on the eighths, with the outro melody rising under the last of them. Text: "Pick your pack. And your lighter." |
+| 7 | 33–36 | **Outro.** Lit pack with three cigarettes smoking beside it, and the title on the melody's peak. "Lives in your menu bar. A Mac desktop app for teams." |
+
+Cuts dip through the background (old content out, new content in) on beats.

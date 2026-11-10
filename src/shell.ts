@@ -11,8 +11,8 @@ import { SIZES, loadAppearance, onAppearanceChange, saveAppearance } from './app
 import type { Net, NetStatus } from './net.ts';
 import * as platform from './platform.ts';
 import { lighterPreview, packPreview } from './widget/preview.ts';
-import { LIGHTER_SKINS, PACK_SKINS } from './widget/skins.ts';
-import { COPY, THEMES } from './widget/theme.ts';
+import { LIGHTER_SKINS, packSkin } from './widget/skins.ts';
+import { COPY, THEMES, packSkinsFor } from './widget/theme.ts';
 
 /** App name for the current break style ("Smoke Break" or "Water Break"). */
 const appTitle = () => COPY[loadAppearance().theme].title;
@@ -322,12 +322,12 @@ export function createAppearancePanel(panel: HTMLElement) {
       h('p', { class: 'sb-field-label', textContent: 'Size' }),
       sizes,
       h('p', { class: 'sb-field-label', textContent: copy.packLabel }),
-      tiles(PACK_SKINS, look.pack, (s) => packPreview(s, 2, look.theme), (pack) => saveAppearance({ pack })),
+      tiles(packSkinsFor(look.theme), look.pack, (s) => packPreview(s, 2, look.theme), (pack) => saveAppearance({ pack })),
       h('p', { class: 'sb-field-label', textContent: copy.lighterLabel }),
       tiles(
         LIGHTER_SKINS,
         look.lighter,
-        (s) => lighterPreview(s, 2, look.theme),
+        (s) => lighterPreview(s, 2, look.theme, packSkin(look.pack)),
         (lighter) => saveAppearance({ lighter }),
       ),
       h('p', {
