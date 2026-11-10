@@ -546,6 +546,20 @@ export function createTeamPanel(
     );
   }
 
+  /**
+   * Updates from the hub redraw the panel at most once a frame: a team can
+   * have hundreds of rows, and a hub may send updates as fast as it likes.
+   */
+  let redrawQueued = false;
+  const redraw = () => {
+    if (redrawQueued) return;
+    redrawQueued = true;
+    requestAnimationFrame(() => {
+      redrawQueued = false;
+      render();
+    });
+  };
+
   render();
   return {
     setTeam(t, me) {
@@ -556,31 +570,31 @@ export function createTeamPanel(
       waitingFor = '';
       // Ownership can move to someone else while their settings are open.
       if (settingsOpen && t.ownerId !== me) settingsOpen = false;
-      render();
+      redraw();
     },
     setWaiting(teamCode) {
       waitingFor = teamCode;
       settingsOpen = false;
-      render();
+      redraw();
     },
     setStatus(s) {
       status = s;
-      render();
+      redraw();
     },
     setError(message) {
       panelError = message;
-      render();
+      redraw();
       // Errors are about something just done; don't leave them up for good.
       clearTimeout(errorTimer);
       errorTimer = setTimeout(() => {
         panelError = '';
-        render();
+        redraw();
       }, ERROR_SHOW_MS);
     },
     setNotice(message, action) {
       notice = message;
       noticeAction = message ? action : undefined;
-      render();
+      redraw();
     },
   };
 }

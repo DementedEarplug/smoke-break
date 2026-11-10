@@ -54,7 +54,7 @@ describe('no-op messages send nothing (item 1)', () => {
 
 describe('broadcast coalescing (item 1)', () => {
   it('sends at most one state per interval per team, and always the last one', async () => {
-    h.start({ limits: { broadcastIntervalMs: 200, messageBurst: 1e9, messagesPerSecond: 1e9 } });
+    h.start({ limits: { broadcastIntervalMs: 200, messageBurst: 1e9, messagesPerSecond: 1e9, joinLeavePerWindow: 1e9 } });
     const { alex, sam } = await h.team();
     await sleep(300);
     const s0 = sam.msgs.length;
@@ -127,6 +127,8 @@ describe('hub-wide buffer cap (item 1)', () => {
         maxBufferedBytes: 10 * 1024 * 1024,
         maxTotalBufferedBytes: 64 * 1024,
         bufferCheckMs: 20,
+        // Owners' settings changes are limited too; this is about what comes after.
+        joinLeavePerWindow: 1e9,
         broadcastIntervalMs: 0,
         messageBurst: 1e9,
         messagesPerSecond: 1e9,

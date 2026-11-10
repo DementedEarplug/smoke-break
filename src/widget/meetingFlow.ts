@@ -5,6 +5,7 @@
 // not before. Every path that opens the call waits for that.
 
 import { type TeamView, normalizeMeetingLink } from '../../shared/protocol.ts';
+import { LINK_WAIT_MS } from './limits.ts';
 
 /** How long the freshly lit cigarette shows before the call opens. */
 export const LIT_PAUSE_MS = 700;
@@ -69,11 +70,12 @@ export function meetingTarget(team: TeamView | null): { url: string } | 'no-link
 
 /**
  * The call was promised but its link hadn't arrived. On each new state: open
- * it now, keep waiting, or drop the promise (we're no longer in this break, so
- * a link that turns up later must not pop a call open).
+ * it now, keep waiting, or drop the promise (we're no longer in this break, or
+ * it's been `LINK_WAIT_MS` since: a link that turns up later must not pop a
+ * call open). `waitedMs` is how long ago the call was promised.
  */
-export function pendingLinkStep(team: TeamView, me: string): { url: string } | 'wait' | 'drop' {
-  if (!isParticipant(team, me)) return 'drop';
+export function pendingLinkStep(team: TeamView, me: string, waitedMs = 0): { url: string } | 'wait' | 'drop' {
+  if (!isParticipant(team, me) || !(waitedMs < LINK_WAIT_MS)) return 'drop';
   const url = safeMeetingUrl(team);
   return url ? { url } : 'wait';
 }

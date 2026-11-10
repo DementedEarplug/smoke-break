@@ -34,6 +34,20 @@ A plain `npm run desktop:build` gives an app that can talk to any `wss:` hub.
 - On macOS, access tokens, the device secret and any client id pinned to a hub
   are kept in the user's login Keychain, and the device secret never leaves
   the app's native code (see [Where secrets are stored](#where-secrets-are-stored)).
+- In a locked build (the enterprise one) the native side is locked too: every
+  command that takes a hub address (reading or saving a token, asking for this
+  device's id) refuses any hub but the built-in one (`src-tauri/src/lock.rs`).
+- Each window may call only what it needs. `src-tauri/capabilities/overlay.json`
+  (the pack: show, hide, move and size its window, let clicks through, read
+  the cursor position and the screens, open a meeting, ask for the settings
+  window, set the tray's do-not-disturb, read the token and its id) and
+  `capabilities/panel.json` (settings: read and save the token, read its id)
+  list every permission; both may send and listen to events, and move an
+  older version's identity into the Keychain. Nothing else of Tauri's (menus,
+  tray, paths, creating windows or webviews, opening URLs) is granted, the
+  settings window has no window permissions at all, and each command checks
+  the calling window again. Release builds have no web inspector (Tauri's
+  `devtools` feature is off) and `withGlobalTauri` is off.
 - One running app per user: a second launch asks the first to open its
   settings window and quits. The lock and the socket for that live in the
   app's data folder (`~/Library/Application Support/<bundle id>`, made
@@ -66,7 +80,7 @@ from the environment and bakes them into the app:
 | `VITE_SERVER_URL` | `wss://breaks.acme.internal/ws` | **Required.** Your hub. Must be `wss://` with a host name. |
 | `SMOKE_BREAK_MEETING_HOST` | `acme.zoom.us` | **Required.** The app opens only meeting links on exactly this host (it must be a Zoom host). |
 | `APPLE_SIGNING_IDENTITY` | `Developer ID Application: Acme Inc (TEAMID1234)` | Passed to `tauri build` as the signing identity (or use `APPLE_CERTIFICATE`, section 3). Without either the app is unsigned and the script says so. |
-| `VITE_LOCK_SERVER` | *(set by the script)* | Always `1`: the app talks only to `VITE_SERVER_URL`. The Server field is hidden and any address saved earlier is ignored, so nobody can be talked into pointing the app at another server. |
+| `VITE_LOCK_SERVER` | *(set by the script)* | Always `1`: the app talks only to `VITE_SERVER_URL`. The Server field is hidden and any address saved earlier is ignored, so nobody can be talked into pointing the app at another server; the native commands answer for that hub only. |
 | `VITE_HUB_TOKEN` | *(must be unset)* | The script refuses to build with a shared token. Each person enters their own (see [Access tokens](#access-tokens)). |
 
 What the script does:
@@ -152,8 +166,8 @@ service = the bundle identifier, one generic-password item each:
 - The app opens the login keychain by its path. It never writes to "the
   default keychain" or searches the keychain list, which another process
   running as the user could point at a keychain whose password it knows.
-  If the login keychain can't be opened, the app says so and writes nothing
-  to disk.
+  If the login keychain can't be opened, the app says so and puts these
+  secrets nowhere else (a token is kept in memory until the app quits).
 - The app always creates these items itself: it deletes any existing item and
   adds a new one instead of updating it, so another process can't pre-create
   an item with a lax access list and read what the app later stores. Each new
@@ -162,28 +176,54 @@ service = the bundle identifier, one generic-password item each:
 - The webview reaches them only through narrow commands: fixed service, the
   account a checked hub address (or `client-id@` plus one, or the one fixed
   name), bounded and checked values. It can't read or write any other item,
-  and has no command that returns the device secret.
+  and has no command that returns the device secret. Only the settings window
+  may save a token, and in a locked build only for the built-in hub.
 - An existing install moves what older versions kept in web storage (the
   device secret, pinned ids, access tokens) into the Keychain on its first
-  start with this version. Each piece is deleted from web storage only after
+  start with this version (tokens are moved by the settings window, which
+  starts with the app). Each piece is deleted from web storage only after
   the Keychain confirmed it, and every id stays the same, so nobody loses
-  their place or ownership.
+  their place or ownership. A locked build drops ids and tokens an older,
+  unlocked version kept for other hubs: it can never use them. Older versions
+  also kept do-not-disturb under a key named after the client id; at startup
+  every such key is deleted, and the setting moves to a key named after the
+  hub (if the identity loads; otherwise it is just off).
 - **If the Keychain refuses** (locked, or the person clicked Deny), the app
   does not fall back to web storage. A token is used until the app quits and
   the app says it will have to be entered again. For the identity, it shows
   the error and a Try again button; it never makes up a new identity, which
   would silently lose team ownership. Whatever an older version left in web
   storage stays there until the Keychain takes it: the identity when the
-  person presses Try again, a leftover token on the next start (it is used
-  from memory meanwhile).
+  person presses Try again, a leftover token on the next start (it is still
+  used meanwhile).
 
-**Still in web storage** (WebKit's storage for the app, under
-`~/Library/WebKit/`, readable by any process running as the user): the name
-someone typed, the hub address (unless locked), the **invite code** of their
-team on each hub, appearance settings, the pack's position, and two
-bookkeeping entries (that the device secret is in the Keychain, and for which
-hubs a pinned id is). Once the move above is done, no token, device secret
-or client id.
+#### What is stored where on the Mac
+
+Exactly this, once the move above is done (`src/webStorage.test.ts` runs
+onboarding, joining, rotating the code, do-not-disturb and the look through
+both windows and fails if anything else is written, or if a token, the
+device secret or a client id reaches web storage or an event):
+
+| Where | What | Proves who you are? |
+|---|---|---|
+| Login keychain, service = bundle id | `<hub address>`: that hub's access token | **yes** |
+| Login keychain | `device-secret`: the secret every client id is derived from; never leaves the native code | **yes** |
+| Login keychain | `client-id@<hub address>`: an id pinned to that hub (only installs upgraded from before per-hub ids) | **yes** |
+| The app's memory, until it quits | the device secret (loaded once per run), and a token the Keychain refused to store | **yes** |
+| Web storage: `localStorage` in `~/Library/WebKit/` (readable by any process running as the user) | `sb:name`, `sb:lastName`: the name typed in | no |
+| Web storage | `sb:server`: the hub address typed in (unlocked builds only) | no |
+| Web storage | `sb:team@<hub address>`: the invite code of the team on that hub | no, but it lets someone ask to join the team |
+| Web storage | `sb:dnd@<hub address>`: do-not-disturb on or off | no |
+| Web storage | `sb:appearance`: size, break style, skins | no |
+| Web storage | `sb:overlayPos`: where the pack sits on the screen | no |
+| Web storage | `sb:deviceSecretInKeychain`, `sb:pinnedIdsInKeychain`: that the device secret is in the Keychain, and for which hub addresses a pinned id is | no |
+| `sessionStorage` | nothing (the desktop app doesn't use it) | |
+| Events between the two windows | `identity-changed`, `identity-ready` (no payload), `appearance-changed` (size, style, skins), `dnd` (on or off, from the tray to the pack) | no |
+| `~/Library/Application Support/<bundle id>/` (user only, 0700) | `instance.lock`, `instance.sock`: the single-instance lock | no |
+
+Until the move has worked, web storage can still hold what an older version
+put there: `sb:token@<hub>`, `sb:deviceSecret`, `sb:clientId@<hub>` (and
+`sb:clientId`, renamed to it at the first start), `sb:dnd:<client id>`.
 
 **Without a Keychain** (the browser version, and desktop builds for other
 platforms) tokens, the device secret and pinned ids stay in web storage, and
@@ -223,8 +263,24 @@ the token field says so. Don't use such builds where that matters.
 - **Script running in the webview** (if a bug ever let a hub inject some):
   it can read the token for a hub and ask for this device's id for a hub,
   because the app itself needs both. It can't get the device secret, so it
-  can't derive ids later, elsewhere. In a locked build the CSP only lets it
-  talk to your hub.
+  can't derive ids later, elsewhere. In a locked build it can do either only
+  for your hub (the native commands refuse any other), and the CSP only lets
+  it talk to your hub. In the pack's window it can't save a token at all. It
+  could replace this device's pinned id for your hub (the once-only move from
+  older versions needs that command), which loses the person's place but
+  tells it nothing it couldn't already read.
+
+#### Limits
+
+The access token is a password-like secret: whoever has it (and the invite
+code) can connect as that person. The login Keychain protects it from other
+accounts on the Mac and from someone who has the disk of a locked or switched
+off laptop; against malware running as the same user it only slows things
+down (a prompt, which a user may click through). There is no single sign-on:
+the app doesn't know your directory, and leaving the company doesn't log
+anyone out by itself. When a laptop is lost unlocked (or someone leaves),
+delete that person's line in the hub's tokens file; that is what cuts the
+laptop off.
 
 Trade-offs and checks:
 
@@ -243,8 +299,11 @@ Trade-offs and checks:
   login keychain: the person enters their token again, and gets a new device
   secret, so a team they owned needs `server/admin.ts set-owner`.
 - `cd src-tauri && cargo test` checks the derivation against the cases in
-  `shared/client-id-vectors.json` (the TypeScript tests check the same ones)
-  and the single-instance lock. `cargo test -- --ignored temp_keychain_round_trip`
+  `shared/client-id-vectors.json` (the TypeScript tests check the same ones),
+  the single-instance lock, which window may call which command (the real
+  capability files, on Tauri's mock runtime) and the hub lock (run it with
+  `VITE_LOCK_SERVER=1 VITE_SERVER_URL=wss://…` to check a locked build). Unit
+  tests never open the login keychain. `cargo test -- --ignored temp_keychain_round_trip`
   exercises the Keychain code against a throwaway keychain file it creates
   and deletes (macOS adds it to the keychain list while the test runs).
 
@@ -268,9 +327,21 @@ straight into the next one, e.g. `wss://breaks.acme.internaldefault-src`):
 grep -a -o "http://ipc.localhost [^ ;']*" "$APP"/Contents/MacOS/* | sort -u
 ```
 
-If `cargo` builds the app without the Tauri CLI, the same override goes in the
-`TAURI_CONFIG` environment variable:
-`TAURI_CONFIG="$(cat src-tauri/target/enterprise-build/tauri.override.json)" cargo build --release`.
+If `cargo` builds the app without the Tauri CLI, the same override (the file
+`desktop:build:enterprise` writes) goes in the `TAURI_CONFIG` environment
+variable, and the same build settings must be set
+for both the frontend and `cargo` (the build record, the native hub lock and
+the meeting host pin come from them):
+
+```sh
+export VITE_SERVER_URL=wss://breaks.acme.internal/ws VITE_LOCK_SERVER=1 SMOKE_BREAK_MEETING_HOST=acme.zoom.us
+npm run build    # the frontend in dist/, which cargo embeds
+cd src-tauri && TAURI_CONFIG="$(cat target/enterprise-build/tauri.override.json)" cargo build --release
+```
+
+That gives a bare executable (`target/release/smoke-break`), not a bundle;
+`--check` needs it inside an `.app` (`Contents/MacOS/`), which `tauri build`
+makes.
 
 ### A stolen laptop or a departed employee
 
@@ -320,7 +391,8 @@ npm run desktop:build:enterprise -- --target universal-apple-darwin
 
 With those variables set, `tauri build` (run by the script) signs the app with
 the hardened runtime, submits it to Apple's notary service, waits, and staples
-the ticket. The script then checks the pinned CSP and prints a summary.
+the ticket. The script then checks the built app (the same checks as
+`--check`, below) and prints a summary.
 Output: `src-tauri/target/universal-apple-darwin/release/bundle/macos/Smoke Break.app`
 and `…/bundle/dmg/Smoke Break_<version>_universal.dmg`.
 
@@ -341,10 +413,10 @@ It prints a table and exits non-zero if any line says FAIL:
 |---|---|
 | Build record | the executable carries the record `src-tauri/build.rs` writes at build time (hub, server lock, whether a shared token was set, meeting host; never the token itself) |
 | Hub address | it is a `wss://` hub, and the one in `VITE_SERVER_URL` if you set it |
-| Server lock | the app was built with `VITE_LOCK_SERVER=1` |
+| Server lock | the app was built with `VITE_LOCK_SERVER=1`, and the hub address is in the native code that refuses other hubs (not only in the record: an app built from older sources fails) |
 | Shared access token | `VITE_HUB_TOKEN` was empty |
-| Meeting host pinned | a Zoom host is pinned and is in the executable (and matches `SMOKE_BREAK_MEETING_HOST` if set) |
-| CSP connect-src | every `connect-src` compiled into the executable is exactly `'self' ipc: http://ipc.localhost <your hub origin>`, with nothing of the wide default left |
+| Meeting host pinned | a Zoom host is pinned, is in the code that checks links (not only in the record), and matches `SMOKE_BREAK_MEETING_HOST` if set |
+| CSP connect-src | every `connect-src` compiled into the executable is exactly `'self' ipc: http://ipc.localhost <your hub origin>`, with nothing of the wide default left (checked against `VITE_SERVER_URL` when the record has no usable hub) |
 | Signed | signed with a real identity (not unsigned or ad-hoc; `--allow-unsigned` turns this into a warning, for test builds only) |
 | `codesign --verify --deep --strict` | the signature is valid for everything in the bundle |
 | Hardened runtime | the code directory flags include `runtime` |

@@ -8,6 +8,10 @@ import { readFileSync, statSync } from 'node:fs';
 const LABEL = /^[A-Za-z0-9][A-Za-z0-9._@+-]{0,63}$/;
 /** Printable ASCII without spaces. */
 const TOKEN = /^[\x21-\x7e]{16,512}$/;
+/** Most lines (comments and blank ones included) a tokens file may have: one per person, with room to spare. */
+export const MAX_TOKEN_LINES = 50_000;
+/** Largest tokens file read: MAX_TOKEN_LINES of the longest label and token. */
+const MAX_TOKENS_FILE_BYTES = MAX_TOKEN_LINES * (64 + 1 + 512 + 2);
 
 export interface TokenEntry {
   label: string;
@@ -24,13 +28,16 @@ const digestOf = (token: string) => createHash('sha256').update(token).digest();
 export function parseTokensFile(text: string): TokenEntry[] {
   const out: TokenEntry[] = [];
   const seen = new Set<string>();
-  text.split(/\r?\n/).forEach((raw, i) => {
+  const lines = text.split(/\r?\n/);
+  if (lines.at(-1) === '') lines.pop(); // the newline ending the last line
+  if (lines.length > MAX_TOKEN_LINES) throw new Error(`it has ${lines.length} lines; at most ${MAX_TOKEN_LINES} are allowed (one per person)`);
+  lines.forEach((raw, i) => {
     const line = raw.trim();
     if (!line || line.startsWith('#')) return;
     const at = line.indexOf(':');
     const label = at < 0 ? '' : line.slice(0, at).trim();
     const token = at < 0 ? '' : line.slice(at + 1).trim();
-    if (!LABEL.test(label)) throw new Error(`line ${i + 1}: expected "label:token" with a label of letters, digits and . _ @ + -`);
+    if (!LABEL.test(label)) throw new Error(`line ${i + 1}: expected "label:token" with a label of 1-64 letters, digits and . _ @ + - (starting with a letter or digit)`);
     if (!TOKEN.test(token)) throw new Error(`line ${i + 1}: the token for "${label}" must be 16-512 printable characters without spaces`);
     const digest = digestOf(token);
     const hex = digest.toString('hex');
@@ -48,6 +55,7 @@ export function readTokensFile(path: string): TokenEntry[] {
   if (st.mode & 0o077) {
     throw new Error(`${path} can be read or written by other users (mode ${(st.mode & 0o777).toString(8)}); run: chmod 600 ${path}`);
   }
+  if (st.size > MAX_TOKENS_FILE_BYTES) throw new Error(`${path} is ${st.size} bytes; at most ${MAX_TOKENS_FILE_BYTES} are allowed`);
   return parseTokensFile(readFileSync(path, 'utf8'));
 }
 
@@ -84,6 +92,8 @@ export class AccessTokens {
   private entries: TokenEntry[];
   /** The entries by label, so checking every open connection after a reload stays cheap. */
   private byLabel = new Map<string, Buffer[]>();
+  /** The entries by the hex of their token's digest, so checking a token costs the same however many there are. */
+  private byDigest = new Map<string, TokenEntry>();
   private readonly sharedDigest: Buffer | null;
   private readonly opts: AccessTokensOptions;
   private stamp: string;
@@ -125,7 +135,11 @@ export class AccessTokens {
   private setEntries(entries: TokenEntry[]) {
     this.entries = entries;
     this.byLabel = new Map();
-    for (const e of entries) this.byLabel.set(e.label, [...(this.byLabel.get(e.label) ?? []), e.digest]);
+    this.byDigest = new Map();
+    for (const e of entries) {
+      this.byLabel.set(e.label, [...(this.byLabel.get(e.label) ?? []), e.digest]);
+      this.byDigest.set(e.digest.toString('hex'), e);
+    }
   }
 
   /** True when every connection must carry a token. */
@@ -152,15 +166,20 @@ export class AccessTokens {
     return this.opts.file && !this.brokenReason ? new Set(this.entries.map((e) => e.label)) : null;
   }
 
-  /** Who a token belongs to, or null if it isn't valid. Compares against every token in constant time. */
+  /**
+   * Who a token belongs to, or null if it isn't valid. The token's SHA-256
+   * digest is looked up in a map (so a wrong token costs the same however many
+   * people there are), and a hit is confirmed by comparing the whole digest in
+   * constant time. Lookup timing can only tell about the digest of what the
+   * caller sent, never about a stored token.
+   */
   check(given: unknown): Access | null {
     if (!this.required) return { label: null, digest: null };
     if (typeof given !== 'string' || given.length > 1024) return null;
     const d = digestOf(given);
     if (this.sharedDigest) return timingSafeEqual(d, this.sharedDigest) ? { label: null, digest: this.sharedDigest } : null;
-    let match: TokenEntry | null = null;
-    for (const e of this.entries) if (timingSafeEqual(d, e.digest) && !match) match = e;
-    return match ? { label: match.label, digest: match.digest } : null;
+    const match = this.byDigest.get(d.toString('hex'));
+    return match && timingSafeEqual(d, match.digest) ? { label: match.label, digest: match.digest } : null;
   }
 
   /** True if `given` is the very token whose digest is `digest`. */

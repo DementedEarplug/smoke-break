@@ -13,6 +13,7 @@ import {
   connectSrc,
   failed,
   formatTable,
+  inCodeOutsideRecord,
   isMeetingHost,
   makeOverride,
   parseCodesignDisplay,
@@ -194,7 +195,7 @@ const record = (fields: string) => `smoke-break-build-info:v1 ${fields} :end`;
 const GOOD_RECORD = record(`server=${HUB} lock=on token=none meeting-host=acme.zoom.us`);
 /** An executable as the linker lays it out: string literals back to back, among other bytes. */
 const exe = (...strings: string[]) => [{ name: 'Contents/MacOS/smoke-break', data: Buffer.from(`\xcf\xfa\xed\xfe…${strings.join('')}…`, 'latin1') }];
-const GOOD_EXE = () => exe(connectSrc(ORIGIN), "object-src'none'", connectSrc(ORIGIN), 'acme.zoom.us', GOOD_RECORD);
+const GOOD_EXE = () => exe(connectSrc(ORIGIN), "object-src'none'", connectSrc(ORIGIN), 'acme.zoom.us', HUB, GOOD_RECORD);
 const ok = (output: string) => ({ status: 0, output });
 
 /** A notarized Developer ID build of the right config; each test changes one thing. */
@@ -282,10 +283,28 @@ describe('checkApp', () => {
     ['no hub', record('server= lock=on token=none meeting-host=acme.zoom.us'), 'Hub address'],
     ['a plain ws hub', record('server=ws://breaks.acme.internal/ws lock=on token=none meeting-host=acme.zoom.us'), 'Hub address'],
   ])('fails an app built %s', (_what, rec, check) => {
-    const facts = { ...goodFacts(), binaries: exe(connectSrc(ORIGIN), 'acme.zoom.us', 'evil.example', rec) };
+    const facts = { ...goodFacts(), binaries: exe(connectSrc(ORIGIN), 'acme.zoom.us', 'evil.example', HUB, rec) };
     const rows = checkApp(facts);
     expect(verdicts(rows)[check]).toBe('fail');
     expect(failed(rows)).toBe(true);
+  });
+
+  it('fails a locked app whose native commands are not locked to the hub (built from older sources)', () => {
+    const old = { ...goodFacts(), binaries: exe(connectSrc(ORIGIN), 'acme.zoom.us', GOOD_RECORD) };
+    const rows = checkApp(old);
+    expect(verdicts(rows)['Server lock']).toBe('fail');
+    expect(rows.find((r) => r.check === 'Server lock')?.detail).toMatch(/older sources/);
+  });
+
+  it('fails an app whose meeting host is only named in the build record', () => {
+    // What a real build looks like: the record, then the pinned host among other literals.
+    expect(inCodeOutsideRecord(Buffer.from(`${GOOD_RECORD}panelacme.zoom.userror`), 'acme.zoom.us')).toBe(true);
+    expect(inCodeOutsideRecord(Buffer.from(`x${GOOD_RECORD}y`), 'acme.zoom.us')).toBe(false);
+    expect(inCodeOutsideRecord(Buffer.from(`${GOOD_RECORD}${GOOD_RECORD}`), 'acme.zoom.us')).toBe(false);
+    const recordOnly = { ...goodFacts(), binaries: exe(connectSrc(ORIGIN), "object-src'none'", GOOD_RECORD) };
+    const rows = checkApp(recordOnly);
+    expect(verdicts(rows)['Meeting host pinned']).toBe('fail');
+    expect(rows.find((r) => r.check === 'Meeting host pinned')?.detail).toMatch(/only in the build record/);
   });
 
   it('fails an app built for another hub or meeting host than expected', () => {
@@ -300,6 +319,14 @@ describe('checkApp', () => {
     expect(verdicts(checkApp(unpinned))['CSP connect-src']).toBe('fail');
     const old = { ...goodFacts(), binaries: exe(connectSrc(ORIGIN), 'acme.zoom.us') };
     expect(verdicts(checkApp(old))).toMatchObject({ 'Build record': 'fail', 'CSP connect-src': 'fail' });
+    // Built without a hub: the CSP is still checked against the expected one, and says what's wrong.
+    const plain = { ...goodFacts(), binaries: exe(DEFAULT_CSP, record('server= lock=off token=none meeting-host=')) };
+    const row = checkApp(plain, { serverUrl: HUB }).find((r) => r.check === 'CSP connect-src')!;
+    expect(row.verdict).toBe('fail');
+    expect(row.detail).toMatch(/still allows ws:\/\/localhost:\*/);
+    // And it passes a pinned CSP against the expected hub even when the record's hub is missing.
+    const noHub = { ...goodFacts(), binaries: exe(connectSrc(ORIGIN), record('server= lock=on token=none meeting-host=acme.zoom.us')) };
+    expect(verdicts(checkApp(noHub, { serverUrl: HUB }))).toMatchObject({ 'Hub address': 'fail', 'CSP connect-src': 'pass' });
   });
 
   it('fails an unsigned or ad-hoc app unless asked to allow it, and skips the signature checks', () => {

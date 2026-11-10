@@ -115,7 +115,7 @@ function start(first: JoinMsg) {
 
   const look = loadAppearance();
   const widget = new Widget(desktop, {
-    storageKey: first.clientId,
+    doNotDisturb: platform.doNotDisturbStore(hub),
     now: () => net.now(),
     send: (m) => net.send(m),
     scale: look.scale,
@@ -163,6 +163,8 @@ if (window.top !== window.self) {
       (e: unknown) => onboard(e instanceof Error ? e.message : String(e)),
     );
   } else {
+    // Older versions named a do-not-disturb key after the client id; that goes too.
+    platform.dropLegacyDnd();
     onboard();
   }
 }

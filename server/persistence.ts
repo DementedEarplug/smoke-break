@@ -1,8 +1,23 @@
 // The saved team file: its format, migration from older formats, and safe writes.
 
-import { randomBytes } from 'node:crypto';
-import { closeSync, constants as fsConstants, fchmodSync, fsyncSync, mkdirSync, openSync, renameSync, rmSync, statSync, writeSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { createHash, randomBytes } from 'node:crypto';
+import {
+  chmodSync,
+  closeSync,
+  constants as fsConstants,
+  copyFileSync,
+  fchmodSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeSync,
+} from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
 import { DEFAULT_LENGTH_MIN, type MeetingProviderKind, clampLength, normalizeMeetingLink } from '../shared/protocol.ts';
 import { cleanName } from './names.ts';
 
@@ -76,6 +91,12 @@ export interface SavedTeam {
   pending: SavedPending[];
   /** A break with two or more people has happened: the team is really used. */
   hadGroupBreak: boolean;
+  /**
+   * The token label of whoever made the team (null: made without one). It
+   * keeps counting against that label's team quota after the team is handed
+   * over. Files from before it was kept: the owner's label.
+   */
+  createdBy: string | null;
 }
 
 export const randomRef = () => randomBytes(4).toString('hex');
@@ -190,6 +211,7 @@ export function parseSavedTeam(t: unknown, now: number): SavedTeam | null {
   const roster = parseRoster(r).filter((m) => !bannedIds.has(m.id));
   if (ownerId && !roster.some((m) => m.id === ownerId)) roster.unshift({ id: ownerId, name: '' });
   const rosterIds = new Set(roster.map((m) => m.id));
+  const ownerLabel = roster.find((m) => m.id === ownerId)?.label;
   const aliases = Array.isArray(r.aliases)
     ? [...new Set(r.aliases.filter((a): a is string => typeof a === 'string' && SAVED_CODE.test(a) && a !== code))].slice(-MAX_ALIASES)
     : [];
@@ -208,10 +230,11 @@ export function parseSavedTeam(t: unknown, now: number): SavedTeam | null {
     requireApproval: typeof r.requireApproval === 'boolean' ? r.requireApproval : true,
     roster,
     banned,
-    bannedLabels: parseLabelBans(r, banned, roster.find((m) => m.id === ownerId)?.label),
+    bannedLabels: parseLabelBans(r, banned, ownerLabel),
     pending: parsePending(r, now).filter((p) => !rosterIds.has(p.id) && !bannedIds.has(p.id)),
     // Teams from before this was kept: assume one several people belong to is really used.
     hadGroupBreak: typeof r.hadGroupBreak === 'boolean' ? r.hadGroupBreak : roster.length >= 2,
+    createdBy: 'createdBy' in r ? (labelOf(r.createdBy) ?? null) : (ownerLabel ?? null),
   };
 }
 
@@ -232,6 +255,55 @@ export function checkDataDir(dir: string) {
       `${dir} can be written by other users (mode ${(st.mode & 0o777).toString(8)}), so they could replace the team file. Run: chmod 700 ${dir}`,
     );
   }
+}
+
+/** Copies of the data file kept per kind (`corrupt`, `partial`, `pre-roster`); older ones are deleted. */
+export const MAX_COPIES = 5;
+
+const fileDigest = (path: string) => createHash('sha256').update(readFileSync(path)).digest('hex');
+
+/**
+ * Keeps a private (0600) copy of the data file as `<file>.<tag>-<ms>`, and
+ * returns its path. If a copy of any kind with the same size and SHA-256
+ * already exists, that one's path is returned and nothing is written (a hub
+ * restarted over and over on the same bad file doesn't fill the disk). Beyond
+ * MAX_COPIES copies of this kind, the oldest are deleted. Throws if the copy
+ * can't be made.
+ */
+export function keepCopy(file: string, tag: string, now = Date.now()): { path: string; existed: boolean } {
+  const dir = dirname(file);
+  const base = basename(file);
+  const copyOf = /^(corrupt|partial|pre-roster)-(\d+)$/;
+  const copies: { name: string; kind: string; at: number }[] = [];
+  for (const name of readdirSync(dir)) {
+    if (!name.startsWith(`${base}.`)) continue;
+    const m = copyOf.exec(name.slice(base.length + 1));
+    if (m) copies.push({ name, kind: m[1], at: Number(m[2]) });
+  }
+  const size = statSync(file).size;
+  let digest: string | null = null;
+  for (const c of copies) {
+    const path = join(dir, c.name);
+    try {
+      if (statSync(path).size !== size) continue;
+      digest ??= fileDigest(file);
+      if (fileDigest(path) === digest) return { path, existed: true };
+    } catch {
+      // A copy that went away or can't be read is just not a match.
+    }
+  }
+  const path = `${file}.${tag}-${now}`;
+  copyFileSync(file, path, fsConstants.COPYFILE_EXCL);
+  chmodSync(path, 0o600);
+  const same = copies.filter((c) => c.kind === tag).sort((a, b) => a.at - b.at);
+  for (const c of same.slice(0, Math.max(0, same.length + 1 - MAX_COPIES))) {
+    try {
+      rmSync(join(dir, c.name), { force: true });
+    } catch (err) {
+      console.warn(`[smoke-break] Couldn't delete the old copy ${join(dir, c.name)} (${(err as Error).message}).`);
+    }
+  }
+  return { path, existed: false };
 }
 
 /**

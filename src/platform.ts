@@ -6,13 +6,16 @@
 // hands that server something that works on the real one.
 
 import { invoke } from '@tauri-apps/api/core';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import {
   type IdentityVault,
   type KeyValue,
   LEGACY_ID_KEY,
   SECRET_KEY,
   clientIdFor,
+  dndKey,
   isHubKey,
+  migrateDnd,
   migrateLegacyId,
   moveToKeychain,
   vaultClientId,
@@ -20,6 +23,20 @@ import {
 import { checkServerUrl, hubKey } from './serverUrl.ts';
 
 export const isDesktop = '__TAURI_INTERNALS__' in window;
+
+/**
+ * The desktop overlay (the pack). It reads the access token but never saves
+ * one: its capability (`src-tauri/capabilities/overlay.json`) doesn't allow
+ * `token_set`, so moving tokens into the Keychain is the settings window's job.
+ */
+const isOverlay = (() => {
+  if (!isDesktop) return false;
+  try {
+    return getCurrentWindow().label === 'overlay';
+  } catch {
+    return false;
+  }
+})();
 
 /** Served over http(s), e.g. the Vite dev server, which hosts the hub on /ws. */
 const servedOverHttp = location.protocol === 'http:' || location.protocol === 'https:';
@@ -117,6 +134,31 @@ export function leaveTeam(hub = currentHub()) {
   store.removeItem(teamKey(hub));
 }
 
+// ── Do not disturb ──────────────────────────────────────────────────────────
+
+/**
+ * Do-not-disturb for a hub: per hub on the desktop, per tab (and hub) in the
+ * browser, like the identity. Filed under the hub address, never the client id.
+ */
+export function doNotDisturbStore(hub: string): { load(): boolean; save(on: boolean): void } {
+  return {
+    load: () => store.getItem(dndKey(hub)) === '1',
+    save: (on) => store.setItem(dndKey(hub), on ? '1' : '0'),
+  };
+}
+
+/** Older versions' `sb:dnd:<client id>` keys: carry the setting over for `hub` if the id is known, and delete them all. */
+function forgetLegacyDnd(hub: string, clientId: string | null) {
+  try {
+    migrateDnd(localStorage, store, hub, clientId);
+  } catch (e) {
+    console.error('Smoke Break: couldn’t tidy up old do-not-disturb settings', e);
+  }
+}
+
+/** Deletes older versions' do-not-disturb keys (named after a client id) without carrying any over. */
+export const dropLegacyDnd = () => forgetLegacyDnd('', null);
+
 // ── Keychain ────────────────────────────────────────────────────────────────
 
 /**
@@ -173,8 +215,14 @@ const keychainIdentity: IdentityVault = {
 /** The move into the Keychain, while it runs or once it worked; null after a failure, so the next call tries again. */
 let identityMoved: Promise<void> | null = null;
 
+/**
+ * A hub this build may talk to. A locked build talks to its built-in hub only,
+ * and its Keychain side refuses any other (`src-tauri/src/lock.rs`).
+ */
+const usableHub = (hub: string) => !serverLocked || hub === currentHub();
+
 function keychainIdentityReady(): Promise<void> {
-  identityMoved ??= moveToKeychain(store, keychainIdentity).catch((e) => {
+  identityMoved ??= moveToKeychain(store, keychainIdentity, usableHub).catch((e) => {
     identityMoved = null;
     throw new IdentityUnavailable(reason(e));
   });
@@ -187,12 +235,18 @@ function keychainIdentityReady(): Promise<void> {
  */
 export async function clientId(hub = currentHub()): Promise<string> {
   await ready;
-  if (!keychain) return clientIdFor(store, hub);
-  await keychainIdentityReady();
+  let id: string | null = null;
   try {
-    return await vaultClientId(store, keychainIdentity, hub);
-  } catch (e) {
-    throw new IdentityUnavailable(reason(e));
+    if (!keychain) return (id = await clientIdFor(store, hub));
+    await keychainIdentityReady();
+    try {
+      return (id = await vaultClientId(store, keychainIdentity, hub));
+    } catch (e) {
+      throw new IdentityUnavailable(reason(e));
+    }
+  } finally {
+    // Whatever happened, no older do-not-disturb key (named after an id) stays behind.
+    forgetLegacyDnd(hub, id);
   }
 }
 
@@ -202,7 +256,9 @@ export async function loadIdentity(): Promise<Identity | null> {
   const hub = currentHub();
   const name = savedName();
   const teamCode = savedTeam(hub);
-  return name && teamCode ? { hub, clientId: await clientId(hub), name, teamCode } : null;
+  if (name && teamCode) return { hub, clientId: await clientId(hub), name, teamCode };
+  dropLegacyDnd();
+  return null;
 }
 
 /** Drop this tab's identity so it acts as a new teammate (browser testing). */
@@ -210,7 +266,13 @@ export function resetTabIdentity() {
   const keys: string[] = [];
   for (let i = 0; i < store.length; i++) keys.push(store.key(i) ?? '');
   for (const k of keys) {
-    if (k === 'sb:name' || k === SECRET_KEY || k.startsWith(LEGACY_ID_KEY) || k.startsWith(LEGACY_TEAM_KEY)) {
+    if (
+      k === 'sb:name' ||
+      k === SECRET_KEY ||
+      k.startsWith(LEGACY_ID_KEY) ||
+      k.startsWith(LEGACY_TEAM_KEY) ||
+      k.startsWith(dndKey(''))
+    ) {
       store.removeItem(k);
     }
   }
@@ -265,17 +327,20 @@ async function keychainSet(hub: string, token: string): Promise<string | null> {
 }
 
 async function readToken(hub: string): Promise<string> {
-  if (!keychain) return localStorage.getItem(tokenKey(hub)) || '';
+  // macOS: only one an older version left behind, until the settings window
+  // has moved it into the Keychain (the overlay may start first).
+  const leftBehind = localStorage.getItem(tokenKey(hub)) || '';
+  if (!keychain) return leftBehind;
   try {
     const t = await invoke<string | null>('token_get', { hub });
     if (tokenProblems.get(hub)?.reading) tokenProblems.delete(hub);
-    return t || '';
+    return t || leftBehind;
   } catch (e) {
     tokenProblems.set(hub, {
       reading: true,
       message: `Couldn’t read your saved access token from the Keychain (${reason(e)}). Allow access when macOS asks, or enter the token again.`,
     });
-    return '';
+    return leftBehind;
   }
 }
 
@@ -331,7 +396,8 @@ async function moveTokensToKeychain() {
     const hub = k.slice(TOKEN_KEY_PREFIX.length);
     const token = localStorage.getItem(k);
     if (token === null) continue;
-    if (!token || !isHubKey(hub)) {
+    // Nothing to keep, or for a hub a locked build never talks to (and won't file a token for).
+    if (!token || !isHubKey(hub) || !usableHub(hub)) {
       localStorage.removeItem(k);
       continue;
     }
@@ -365,7 +431,8 @@ async function migrate(kv: KeyValue) {
   // The browser version keeps one teammate per tab in session storage.
   keychain = await keychainAvailable();
   if (!keychain) return;
-  await moveTokensToKeychain();
+  // The overlay can't save tokens; the settings window (always started with it) moves them.
+  if (!isOverlay) await moveTokensToKeychain();
   // Started here so it's under way early; `clientId` waits for it (and retries it).
   keychainIdentityReady().catch(() => {});
 }

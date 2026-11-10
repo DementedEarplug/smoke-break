@@ -10,6 +10,7 @@ import {
   pendingLinkStep,
   startLightWait,
 } from './meetingFlow.ts';
+import { LINK_WAIT_MS } from './limits.ts';
 
 const LINK = 'https://zoom.us/j/123?pwd=x';
 
@@ -138,6 +139,13 @@ describe('pendingLinkStep (the call was promised before its link arrived)', () =
 
   it("doesn't open a link an older hub sends to people outside the break", () => {
     expect(pendingLinkStep(team(brk({ meetingUrl: LINK })), 'me')).toBe('drop');
+  });
+
+  it('gives up on a link that takes longer than LINK_WAIT_MS, so a late one pops nothing open', () => {
+    expect(pendingLinkStep(joined(), 'me', LINK_WAIT_MS - 1)).toEqual({ url: LINK });
+    expect(pendingLinkStep(joined(), 'me', LINK_WAIT_MS)).toBe('drop');
+    expect(pendingLinkStep(joined(null), 'me', LINK_WAIT_MS)).toBe('drop');
+    expect(pendingLinkStep(joined(), 'me', Number.NaN)).toBe('drop');
   });
 });
 

@@ -5,7 +5,8 @@
 //
 //   node server/admin.ts list                              teams (by ref), rosters and people waiting
 //   node server/admin.ts codes <team-ref>                  a team's current invite code
-//   node server/admin.ts set-owner <team-ref> <id>         hand a team to someone on its roster (or waiting)
+//   node server/admin.ts set-owner <team-ref> <id>         hand a team to someone on its roster (or waiting);
+//                                                          not held to the hub's teams-per-label cap (it says so)
 //   node server/admin.ts unban <team-ref> <id|label>       lift a removal or denial
 //   node server/admin.ts delete-team <team-ref> --yes      delete a team (its members' apps forget it)
 //
@@ -83,8 +84,9 @@ export function runAdmin(argv: string[], out: (line: string) => void = console.l
       }
       const ownerLabel = team.roster.find((m) => m.id === team.ownerId)?.label;
       const used = new Date(team.lastActive).toISOString().slice(0, 10);
+      const madeBy = team.createdBy && team.createdBy !== ownerLabel ? `  made by [${team.createdBy}]` : '';
       out(
-        `team ${team.ref}  "${team.name}"  owner ${team.ownerId ?? '(none)'}${ownerLabel ? ` [${ownerLabel}]` : ''}  approval ${team.requireApproval ? 'on' : 'off'}` +
+        `team ${team.ref}  "${team.name}"  owner ${team.ownerId ?? '(none)'}${ownerLabel ? ` [${ownerLabel}]` : ''}${madeBy}  approval ${team.requireApproval ? 'on' : 'off'}` +
           `  waiting ${team.pending.length}  last used ${used}${team.hadGroupBreak ? '' : '  (never had a group break)'}`,
       );
       for (const m of team.roster) {
@@ -128,20 +130,32 @@ export function runAdmin(argv: string[], out: (line: string) => void = console.l
 
   if (cmd === 'set-owner') {
     const waiting = team.pending.find((p) => p.id === target);
-    if (!team.roster.some((m) => m.id === target) && !waiting) {
+    const member = team.roster.find((m) => m.id === target) ?? waiting;
+    if (!member) {
       out(`${target} is not on team ${ref}'s roster or waiting to join it.`);
       return 1;
     }
     // Only these fields change; everything else stays exactly as saved.
     if (waiting) {
       // Someone who asked to join a team without an owner: they join it, as its owner.
-      const { at: _at, ...member } = waiting;
-      found.raw.roster = [...team.roster, member];
+      const { at: _at, ...entry } = waiting;
+      found.raw.roster = [...team.roster, entry];
       found.raw.pending = team.pending.filter((p) => p.id !== target);
     }
     found.raw.ownerId = target;
+    // Whoever made it keeps it on their count (files from before this was kept: the owner until now).
+    found.raw.createdBy = team.createdBy;
     write();
     out(`Team ${ref} is now owned by ${target}. Start the hub again.`);
+    // The hub's teams-per-label cap doesn't apply to an admin: say where that leaves the new owner.
+    if (member.label) {
+      const held = teams.filter(
+        (t) => t.team && (t.team === team || t.team.createdBy === member.label || t.team.roster.find((m) => m.id === t.team!.ownerId)?.label === member.label),
+      ).length;
+      out(
+        `Note: set-owner isn't held to the hub's limit of teams per label (SMOKE_BREAK_TEAMS_PER_LABEL, default 5). Label ${member.label} now holds ${held} team(s) (owned, or made by them); at or over the limit, they can't make or be handed another.`,
+      );
+    }
     return 0;
   }
 

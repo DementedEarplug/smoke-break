@@ -134,7 +134,7 @@ async function start(id: platform.Identity) {
 
   let look = loadAppearance();
   const widget = new Widget(document.getElementById('app')!, {
-    storageKey: id.clientId,
+    doNotDisturb: platform.doNotDisturbStore(id.hub),
     now: () => net.now(),
     send: (m) => net.send(m),
     scale: look.scale,

@@ -193,6 +193,12 @@ pub mod keychain {
     /// keychain or the search list, which another process running as the
     /// user can change. Refuses unless it is a plain file the user owns.
     pub fn login_keychain() -> Result<SecKeychain, String> {
+        // Unit tests never touch the person's real Keychain, whatever a test
+        // (or a bug in a check meant to stop a call earlier) asks for. The
+        // round-trip test below uses a throwaway keychain file of its own.
+        if cfg!(test) {
+            return Err("unit tests don't open the login keychain".into());
+        }
         let path = login_keychain_path()?;
         let refuse = |why: &str| Err(format!("Can't use your login keychain ({}): {why}", path.display()));
         match std::fs::symlink_metadata(&path) {

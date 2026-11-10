@@ -12,8 +12,10 @@ import {
   SECRET_KEY,
   clientIdFor,
   deriveClientId,
+  dndKey,
   idKey,
   isHubKey,
+  migrateDnd,
   migrateLegacyId,
   moveToKeychain,
   pinnedHubs,
@@ -321,5 +323,51 @@ describe('isHubKey', () => {
     expect(isHubKey('https://breaks.example.com/')).toBe(false);
     expect(isHubKey(`wss://${'a'.repeat(600)}.example/`)).toBe(false);
     expect(isHubKey('device-secret')).toBe(false);
+  });
+});
+
+describe('migrateDnd', () => {
+  const ID = 'abcdef0123456789abcdef01';
+  const OTHER_ID = 'Zyxwvu9876543210Zyxwvu98';
+
+  it('carries the setting over to the hub and deletes every key named after an id', () => {
+    const legacy = new MemoryStore();
+    const store = new MemoryStore();
+    legacy.setItem(`sb:dnd:${ID}`, '1');
+    legacy.setItem(`sb:dnd:${OTHER_ID}`, '0');
+    legacy.setItem('sb:appearance', '{}');
+    migrateDnd(legacy, store, HUB_A, ID);
+    expect(store.getItem(dndKey(HUB_A))).toBe('1');
+    expect([...legacy.map.keys()]).toEqual(['sb:appearance']);
+  });
+
+  it('keeps a setting already made for the hub', () => {
+    const legacy = new MemoryStore();
+    const store = new MemoryStore();
+    legacy.setItem(`sb:dnd:${ID}`, '1');
+    store.setItem(dndKey(HUB_A), '0');
+    migrateDnd(legacy, store, HUB_A, ID);
+    expect(store.getItem(dndKey(HUB_A))).toBe('0');
+    expect(legacy.length).toBe(0);
+  });
+
+  it('deletes the old keys even when the id is not known, carrying nothing over', () => {
+    const legacy = new MemoryStore();
+    const store = new MemoryStore();
+    legacy.setItem(`sb:dnd:${ID}`, '1');
+    migrateDnd(legacy, store, HUB_A, null);
+    expect(legacy.length).toBe(0);
+    expect(store.length).toBe(0);
+  });
+
+  it('leaves keys alone that are not named after an id', () => {
+    const legacy = new MemoryStore();
+    legacy.setItem('sb:dnd:short', '1');
+    legacy.setItem(dndKey(HUB_A), '1');
+    migrateDnd(legacy, legacy, HUB_A, ID);
+    expect(legacy.getItem('sb:dnd:short')).toBe('1');
+    expect(legacy.getItem(dndKey(HUB_A))).toBe('1');
+    // The new key is the hub address, which isn't secret.
+    expect(dndKey(HUB_A)).toBe(`sb:dnd@${HUB_A}`);
   });
 });

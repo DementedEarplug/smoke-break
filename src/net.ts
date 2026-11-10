@@ -2,10 +2,17 @@
 
 import { type ClientMsg, type ServerMsg, WS_PROTOCOL, parseServerMsg, tokenProtocol } from '../shared/protocol.ts';
 import { serverProblem } from './platform.ts';
+import { clockOffset } from './widget/limits.ts';
 
 export type NetStatus = 'connecting' | 'open' | 'closed';
 
 const CLOCK_SAMPLES = 20;
+/**
+ * The largest message a real hub sends (a full team of 500 with a waiting
+ * list as long, at the protocol's limits) is well under half of this; anything
+ * bigger isn't even parsed.
+ */
+export const MAX_MESSAGE_CHARS = 2_000_000;
 /** Reconnect delays after a dropped connection. */
 const RETRY_MIN_MS = 500;
 const RETRY_MAX_MS = 5000;
@@ -130,6 +137,7 @@ export class Net {
       ws.send(JSON.stringify(token ? { ...hello, token } : hello));
     };
     ws.onmessage = (e) => {
+      if (typeof e.data === 'string' && e.data.length > MAX_MESSAGE_CHARS) return;
       const msg = parseServerMsg(e.data);
       if (!msg) return;
       if (msg.type === 'state') {
@@ -199,12 +207,13 @@ export class Net {
    * Each message reaches us some time after `serverNow` was stamped, so every
    * sample underestimates the offset by that delay. The largest recent sample
    * came through fastest and is the best estimate; keeping only recent ones
-   * lets the estimate follow clock drift.
+   * lets the estimate follow clock drift. A hub can't move it more than a
+   * week (`clockOffset`).
    */
   private syncClock(serverNow: number) {
     this.samples.push(serverNow - Date.now());
     if (this.samples.length > CLOCK_SAMPLES) this.samples.shift();
-    this.offset = Math.max(...this.samples);
+    this.offset = clockOffset(this.samples);
   }
 
   /** Disconnect and stop reconnecting (until `connect()` or `retryLater()`). */

@@ -46,7 +46,7 @@ describe('standalone hub startup (item 6)', () => {
     const port = (blocker.address() as AddressInfo).port;
     try {
       const { code, out } = await run({ PORT: String(port) });
-      expect(code).toBe(1);
+      expect(code).toBe(1); // may pass: a supervisor should retry
       expect(out).toMatch(/already in use/);
       expect(out).not.toMatch(/kept running/);
     } finally {
@@ -58,11 +58,11 @@ describe('standalone hub startup (item 6)', () => {
     const file = join(tempDir(), 'tokens');
     writeFileSync(file, 'alice:short');
     chmodSync(file, 0o600);
-    const bad = await run({ PORT: '19603', SMOKE_BREAK_ACCESS_TOKENS_FILE: file });
-    expect(bad.code).toBe(1);
+    const bad = await run({ PORT: '20340', SMOKE_BREAK_ACCESS_TOKENS_FILE: file });
+    expect(bad.code).toBe(78); // only an admin can fix it: a supervisor shouldn't restart
     expect(bad.out).toMatch(/SMOKE_BREAK_ACCESS_TOKENS_FILE: line 1/);
-    const proxy = await run({ PORT: '19603', SMOKE_BREAK_TRUST_PROXY: 'everyone' });
-    expect(proxy.code).toBe(1);
+    const proxy = await run({ PORT: '20340', SMOKE_BREAK_TRUST_PROXY: 'everyone' });
+    expect(proxy.code).toBe(78);
     expect(proxy.out).toMatch(/SMOKE_BREAK_TRUST_PROXY/);
   });
 
@@ -70,8 +70,8 @@ describe('standalone hub startup (item 6)', () => {
     const file = join(tempDir(), 'tokens');
     writeFileSync(file, 'alice:alice-token-0123456789abcdef\n');
     chmodSync(file, 0o600);
-    const { code, out } = await run({ PORT: '19603', SMOKE_BREAK_ACCESS_TOKENS_FILE: file, SMOKE_BREAK_ACCESS_TOKEN: 'shared-token-0123456789abcdef' });
-    expect(code).toBe(1);
+    const { code, out } = await run({ PORT: '20340', SMOKE_BREAK_ACCESS_TOKENS_FILE: file, SMOKE_BREAK_ACCESS_TOKEN: 'shared-token-0123456789abcdef' });
+    expect(code).toBe(78);
     expect(out).toMatch(/both set\. Use one/);
   });
 
@@ -79,8 +79,8 @@ describe('standalone hub startup (item 6)', () => {
     const dir = tempDir();
     const file = join(dir, 'teams.json');
     writeFileSync(file, '[{"code": "ABCDEF", "na');
-    const { code, out } = await run({ PORT: '19603', SMOKE_BREAK_DATA_DIR: dir });
-    expect(code).toBe(1);
+    const { code, out } = await run({ PORT: '20340', SMOKE_BREAK_DATA_DIR: dir });
+    expect(code).toBe(78);
     const copy = readdirSync(dir).find((f) => f.startsWith('teams.json.corrupt-'))!;
     expect(out).toContain(`${file} is not a valid team list`);
     expect(out).toContain(join(dir, copy));
@@ -122,7 +122,7 @@ describe('standalone hub startup (item 6)', () => {
     const file = join(dir, 'not-a-socket');
     writeFileSync(file, 'keep me');
     const notSocket = await run({ SMOKE_BREAK_SOCKET: file });
-    expect(notSocket.code).toBe(1);
+    expect(notSocket.code).toBe(78);
     expect(notSocket.out).toMatch(/not a socket/);
     expect(readFileSync(file, 'utf8')).toBe('keep me');
     const path = join(dir, 'live.sock');
@@ -138,21 +138,48 @@ describe('standalone hub startup (item 6)', () => {
   });
 
   it('warns at startup when it runs with a shared token or none at all (review 3, item 4)', async () => {
-    const open = await run({ PORT: '19904' }, /data file:/);
+    const open = await run({ PORT: '20341' }, /data file:/);
     expect(open.out).toMatch(/WARNING: no access token required/);
-    const shared = await run({ PORT: '19905', SMOKE_BREAK_ACCESS_TOKEN: 'shared-token-0123456789abcdef' }, /data file:/);
+    const shared = await run({ PORT: '20342', SMOKE_BREAK_ACCESS_TOKEN: 'shared-token-0123456789abcdef' }, /data file:/);
     expect(shared.out).toMatch(/WARNING: one shared access token.*block new teams hub-wide/);
     const file = join(tempDir(), 'tokens');
     writeFileSync(file, 'alice:alice-token-0123456789abcdef\n');
     chmodSync(file, 0o600);
-    const perPerson = await run({ PORT: '19906', SMOKE_BREAK_ACCESS_TOKENS_FILE: file }, /data file:/);
+    const perPerson = await run({ PORT: '20343', SMOKE_BREAK_ACCESS_TOKENS_FILE: file, SMOKE_BREAK_PUBLIC_HOST: 'breaks.example.com' }, /data file:/);
     expect(perPerson.out).toMatch(/per-person tokens \(1 labels\)/);
     expect(perPerson.out).not.toMatch(/WARNING/);
   });
 
+  it('in strict mode (SMOKE_BREAK_ENTERPRISE=1) refuses to start with exit status 78, listing everything missing (review 4, item 5)', async () => {
+    const { code, out } = await run({ PORT: '20345', HOST: '0.0.0.0', SMOKE_BREAK_ENTERPRISE: '1', SMOKE_BREAK_ACCESS_TOKEN: 'shared-token-0123456789abcdef' });
+    expect(code).toBe(78);
+    expect(out).toMatch(/SMOKE_BREAK_ENTERPRISE=1, but this hub is missing/);
+    for (const what of [/instead of the shared SMOKE_BREAK_ACCESS_TOKEN/, /SMOKE_BREAK_PUBLIC_HOST/, /SMOKE_BREAK_PROXY_SECRET or SMOKE_BREAK_SOCKET/, /HOST=0\.0\.0\.0 is not a loopback/]) {
+      expect(out).toMatch(what);
+    }
+    const file = join(tempDir(), 'tokens');
+    writeFileSync(file, 'alice:alice-token-0123456789abcdef\n');
+    chmodSync(file, 0o600);
+    const ok = await run(
+      { PORT: '20346', SMOKE_BREAK_ENTERPRISE: '1', SMOKE_BREAK_ACCESS_TOKENS_FILE: file, SMOKE_BREAK_PUBLIC_HOST: 'breaks.example.com', SMOKE_BREAK_PROXY_SECRET: 'proxy-secret-0123456789abcdef' },
+      /data file:/,
+    );
+    expect(ok.out).toMatch(/strict mode: on/);
+    expect(ok.out).not.toMatch(/WARNING/);
+    expect(ok.code).toBe(0);
+  });
+
+  it('warns once per missing protection without strict mode (review 4, item 5)', async () => {
+    const { out } = await run({ PORT: '20347', SMOKE_BREAK_TRUST_PROXY: '127.0.0.1' }, /data file:/);
+    expect(out.match(/WARNING/g)).toHaveLength(3);
+    expect(out).toMatch(/WARNING: SMOKE_BREAK_PUBLIC_HOST is not set/);
+    expect(out).toMatch(/WARNING: SMOKE_BREAK_TRUST_PROXY is set without SMOKE_BREAK_PROXY_SECRET or SMOKE_BREAK_SOCKET/);
+    expect(out).toMatch(/WARNING: no access token required/);
+  });
+
   it('listens on 127.0.0.1 by default and stops cleanly', async () => {
-    const { code, out } = await run({ PORT: '19601' }, /data file:/);
-    expect(out).toMatch(/ws:\/\/127\.0\.0\.1:19601/);
+    const { code, out } = await run({ PORT: '20344' }, /data file:/);
+    expect(out).toMatch(/ws:\/\/127\.0\.0\.1:20344/);
     expect(out).toMatch(/SIGTERM: saving/);
     expect(code).toBe(0);
   });

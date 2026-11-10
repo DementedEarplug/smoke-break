@@ -323,6 +323,8 @@ describe('hub limits', () => {
       limits: {
         maxBufferedBytes: 4096,
         broadcastIntervalMs: 0,
+        // Owners' settings changes are limited too; this is about what comes after.
+        joinLeavePerWindow: 1e9,
         messageBurst: 1e9,
         messagesPerSecond: 1e9,
         addressMessageBurst: 1e9,

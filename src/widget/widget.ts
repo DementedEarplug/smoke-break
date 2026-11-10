@@ -3,7 +3,8 @@
 // the whole content of the transparent desktop overlay window.
 
 import { type Break, type ClientMsg, type TeamView, clampLength } from '../../shared/protocol.ts';
-import { drawText, textWidth, wrap } from './font.ts';
+import { drawText, textWidth } from './font.ts';
+import { LINK_WAIT_MS, bubbleLines, timeLeft } from './limits.ts';
 import {
   type LightWait,
   isParticipant,
@@ -17,7 +18,6 @@ import { type LighterSkin, type PackSkin, LIGHTER_SKINS, PACK_SKINS } from './sk
 import { COPY, type Theme } from './theme.ts';
 import { H, MOUTH_Y, PACK_W, PACK_X, W } from './sprites.ts';
 
-const BUBBLE_MAX_CHARS = 15;
 /** Gap (art pixels) between the bubble's tail and whatever is tallest in the scene. */
 const BUBBLE_GAP = 3;
 const DRAG_THRESHOLD = 4;
@@ -27,8 +27,11 @@ const QUIET_FRAME_MS = 250;
 const WAKE_MS = 1000;
 
 export interface WidgetOptions {
-  /** Private per-identity key for local storage (so teammate tabs don't share settings). */
-  storageKey: string;
+  /**
+   * Where do-not-disturb is kept (`platform.doNotDisturbStore`: per hub on the
+   * desktop, per tab in the browser). Never keyed by the client id.
+   */
+  doNotDisturb: { load(): boolean; save(on: boolean): void };
   now(): number;
   send(msg: ClientMsg): void;
   /** Set when the widget is the whole overlay window rather than an element on a page. */
@@ -83,6 +86,8 @@ export class Widget {
   private pendingMeetingWindow: Window | null = null;
   /** Desktop: open the meeting as soon as its link arrives. */
   private pendingMeetingOpen = false;
+  /** performance.now() when the call was promised; given up after `LINK_WAIT_MS`. */
+  private pendingMeetingSince = 0;
   private lastBubbleText: string | null = null;
   private drag: { id: number; x: number; y: number; left: number; top: number; moved: boolean; hit: Hit } | null =
     null;
@@ -112,7 +117,7 @@ export class Widget {
     parent: HTMLElement,
     private readonly opts: WidgetOptions,
   ) {
-    this.dnd = localStorage.getItem(this.dndKey) === '1';
+    this.dnd = opts.doNotDisturb.load();
     this.scale = opts.scale ?? 3;
     this.root = document.createElement('div');
     this.root.className = opts.host ? 'sb-widget sb-widget--overlay' : 'sb-widget';
@@ -203,7 +208,7 @@ export class Widget {
     // The link reaches participants only, so it can turn up a state or two after we joined.
     if (!isParticipant(team, you)) this.meetingBlocked = false;
     if (!this.pendingMeetingOpen && !this.pendingMeetingWindow) return;
-    const next = pendingLinkStep(team, you);
+    const next = pendingLinkStep(team, you, performance.now() - this.pendingMeetingSince);
     if (next === 'wait') return;
     const tab = this.pendingMeetingWindow;
     const open = this.pendingMeetingOpen;
@@ -255,7 +260,7 @@ export class Widget {
   setDnd(on: boolean) {
     if (on === this.dnd) return;
     this.dnd = on;
-    localStorage.setItem(this.dndKey, on ? '1' : '0');
+    this.opts.doNotDisturb.save(on);
     this.showToast(on ? 'Do not disturb on' : 'Do not disturb off', 1500);
     this.opts.host?.onDndChange(on);
   }
@@ -321,6 +326,7 @@ export class Widget {
     this.scene.update(input, dt);
     this.scene.draw(input);
     this.maybeOpenMeeting();
+    this.expirePendingMeeting();
 
     if (this.toast && performance.now() > this.toast.until) this.toast = null;
     this.renderBubble(this.bubbleText());
@@ -359,7 +365,7 @@ export class Widget {
         if (mine) return hover?.target === 'myCig' ? 'Click to put it back' : this.copy.lightUp;
         return `${names} ${plural ? 'are' : 'is'} heading out. Click to join`;
       case 'lit': {
-        const left = b.endsAt === null ? 0 : b.endsAt - this.opts.now();
+        const left = timeLeft(b, this.opts.now());
         if (mine && mine.litAt === null) return this.copy.lightUp;
         if (mine) {
           if (hover?.target === 'myCig') return `${fmtClock((left / b.minuteMs) * 60_000)} left. ${this.copy.leaveLit}`;
@@ -385,8 +391,9 @@ export class Widget {
     this.bubble.hidden = text === null;
     if (text === null) return;
 
-    const lines = wrap(text, BUBBLE_MAX_CHARS);
-    const textW = Math.max(...lines.map(textWidth));
+    // At most a few short lines, whatever the hub sent (names, error messages).
+    const lines = bubbleLines(text);
+    const textW = Math.max(0, ...lines.map(textWidth));
     const w = textW + 8;
     const bodyH = lines.length * 7 + 5;
     const h = bodyH + 2;
@@ -493,8 +500,10 @@ export class Widget {
         4000,
       );
     } else if (host) {
-      if (target === 'later') this.pendingMeetingOpen = true;
-      else host.openUrl(target.url);
+      if (target === 'later') {
+        this.pendingMeetingOpen = true;
+        this.pendingMeetingSince = performance.now();
+      } else host.openUrl(target.url);
     } else if (target !== 'later') {
       const w = window.open(target.url, '_blank');
       if (w) w.opener = null;
@@ -506,7 +515,21 @@ export class Widget {
       if (w) w.opener = null;
       else this.popupBlocked();
       this.pendingMeetingWindow = w;
+      this.pendingMeetingSince = performance.now();
     }
+  }
+
+  /**
+   * A call promised before its link came, and it still hasn't: give up, so a
+   * link the hub sends much later doesn't pop a call open out of nowhere (and
+   * don't leave a blank tab behind).
+   */
+  private expirePendingMeeting() {
+    if (!this.pendingMeetingOpen && !this.pendingMeetingWindow) return;
+    if (performance.now() - this.pendingMeetingSince < LINK_WAIT_MS) return;
+    this.pendingMeetingOpen = false;
+    this.pendingMeetingWindow?.close();
+    this.pendingMeetingWindow = null;
   }
 
   private popupBlocked() {
@@ -518,11 +541,6 @@ export class Widget {
     if (!this.canAdjustLength) return;
     const next = clampLength(this.brk!.lengthMin + delta);
     if (next !== this.brk!.lengthMin) this.opts.send({ type: 'setLength', lengthMin: next });
-  }
-
-  /** Per identity, so teammate tabs in one browser don't share it. */
-  private get dndKey() {
-    return `sb:dnd:${this.opts.storageKey}`;
   }
 
   private toggleDnd() {

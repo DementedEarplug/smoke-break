@@ -40,6 +40,8 @@ let refusing: boolean;
 let run: { secret: string | null; tokens: Map<string, string> };
 /** Every value the commands handed to the webview. */
 let handedOut: unknown[];
+/** A locked build's Rust side answers for its built-in hub only (src-tauri/src/lock.rs). */
+let lockedTo: string | null;
 const SECRET_ITEM = 'device-secret';
 const REFUSED = 'Keychain error -25293';
 
@@ -55,6 +57,7 @@ type Args = { hub: string; token?: string; id?: string; pinned?: boolean; legacy
 function command(cmd: string, a: Args): unknown {
   if (cmd === 'keychain_available') return keychain !== null;
   if (!keychain) throw new Error('no Keychain on this platform');
+  if (lockedTo && 'hub' in a && a.hub !== lockedTo) throw 'this build only talks to its built-in hub';
   switch (cmd) {
     case 'token_get':
       if (run.tokens.has(a.hub)) return run.tokens.get(a.hub) || null;
@@ -116,6 +119,7 @@ beforeEach(() => {
   keychain = new Map();
   refusing = false;
   handedOut = [];
+  lockedTo = null;
   restart();
 });
 
@@ -278,6 +282,23 @@ describe('VITE_LOCK_SERVER', () => {
     expect(p.serverUrl()).toBe(REAL);
     expect(p.saveServerUrl('wss://elsewhere.example/ws')).toBeNull();
     expect(p.serverUrl()).toBe(REAL);
+  });
+
+  it('drops what an unlocked version kept for other hubs, which the Keychain side would refuse', async () => {
+    local.setItem(`sb:clientId@${EVIL}`, LEGACY_ID);
+    local.setItem(`sb:token@${EVIL}`, 'evil-token');
+    local.setItem(`sb:token@${REAL}`, 'real-token');
+    lockedTo = REAL;
+    const p = await loadPlatform({ VITE_SERVER_URL: REAL, VITE_LOCK_SERVER: '1' });
+    // The identity still works (nothing is asked of the Keychain for the other hub)...
+    expect(await p.clientId()).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(keychain!.has(`client-id@${EVIL}`)).toBe(false);
+    expect(keychain!.has(EVIL)).toBe(false);
+    // ...and nothing for it is left in web storage.
+    expect(local.getItem(`sb:clientId@${EVIL}`)).toBeNull();
+    expect(local.getItem(`sb:token@${EVIL}`)).toBeNull();
+    expect(await p.hubToken(REAL)).toBe('real-token');
+    expect(keychain!.get(REAL)).toBe('real-token');
   });
 
   it('is off unless set', async () => {

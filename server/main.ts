@@ -15,17 +15,29 @@ const socketPath = process.env.SMOKE_BREAK_SOCKET?.trim() || '';
 const where = socketPath ? `unix:${socketPath}` : `${host}:${port}`;
 const dataFile = dataFileFromEnv();
 
-/** Startup problems end the process with a non-zero status, so a supervisor notices and nothing half-works. */
-function die(message: string): never {
+/**
+ * Exit status for "won't start until an admin fixes something": a bad data
+ * file, tokens file or setting (EX_CONFIG). A supervisor shouldn't restart on
+ * it (systemd: RestartPreventExitStatus=78); restarting changes nothing.
+ */
+const EXIT_NEEDS_ADMIN = 78;
+
+/**
+ * Startup problems end the process with a non-zero status, so a supervisor
+ * notices and nothing half-works: EXIT_NEEDS_ADMIN for what only an admin can
+ * fix, 1 for what may pass (say, the port is still taken by a hub shutting down).
+ */
+function die(message: string, status = 1): never {
   console.error(`[smoke-break] !!! ${message}`);
-  process.exit(1);
+  process.exit(status);
 }
 
 let hub: ReturnType<typeof createHub>;
 try {
-  hub = createHub({ dataFile, unixSocket: !!socketPath });
+  // Everything createHub refuses is a setting or a file an admin has to fix.
+  hub = createHub({ dataFile, unixSocket: !!socketPath, listenHost: socketPath ? undefined : host });
 } catch (err) {
-  die(`Can't start the hub: ${(err as Error).message}`);
+  die(`Can't start the hub: ${(err as Error).message}`, EXIT_NEEDS_ADMIN);
 }
 
 /**
@@ -61,7 +73,7 @@ server.on('upgrade', (req, socket, head) => {
 server.on('error', (err: NodeJS.ErrnoException) => {
   hub.close();
   if (err.code === 'EADDRINUSE') die(`${where} is already in use (is another hub running?). Not starting.`);
-  if (err.code === 'EACCES') die(`Not allowed to listen on ${where}.`);
+  if (err.code === 'EACCES') die(`Not allowed to listen on ${where}.`, EXIT_NEEDS_ADMIN);
   die(`The server failed: ${err.message}`);
 });
 
@@ -77,17 +89,11 @@ function started() {
     `[smoke-break] data file: ${dataFile} | access token: ${access}` +
       ` | proxy secret: ${s.proxySecret ? 'required' : 'not set'}` +
       ` | trusted proxies: ${socketPath ? 'the socket' : process.env.SMOKE_BREAK_TRUST_PROXY?.trim() || 'none'}` +
-      ` | public host: ${process.env.SMOKE_BREAK_PUBLIC_HOST || 'not set'}`,
+      ` | public host: ${process.env.SMOKE_BREAK_PUBLIC_HOST || 'not set'}` +
+      ` | strict mode: ${s.enterprise ? 'on' : 'off'}`,
   );
-  if (s.tokenMode === 'shared') {
-    console.warn(
-      '[smoke-break] WARNING: one shared access token (SMOKE_BREAK_ACCESS_TOKEN): it can\'t be revoked for one person, limits are per address instead of per person, and anyone holding it can block new teams hub-wide. Use SMOKE_BREAK_ACCESS_TOKENS_FILE for a company deployment.',
-    );
-  } else if (s.tokenMode === 'none') {
-    console.warn(
-      '[smoke-break] WARNING: no access token required: anyone who can reach this hub can connect, make teams and ask to join them. Set SMOKE_BREAK_ACCESS_TOKENS_FILE for anything but local use.',
-    );
-  }
+  // One line per recommended protection this hub runs without (SMOKE_BREAK_ENTERPRISE=1 refuses to start instead).
+  for (const w of s.warnings) console.warn(`[smoke-break] WARNING: ${w}`);
 }
 
 if (socketPath) {
@@ -108,7 +114,7 @@ if (socketPath) {
     },
     (err: Error) => {
       hub.close();
-      die(`Can't listen on ${socketPath}: ${err.message}`);
+      die(`Can't listen on ${socketPath}: ${err.message}`, /not a socket/.test(err.message) ? EXIT_NEEDS_ADMIN : 1);
     },
   );
 } else {

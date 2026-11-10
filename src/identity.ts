@@ -43,6 +43,34 @@ const ID_KEY_PREFIX = idKey('');
 /** What the hub accepts as a client id. */
 export const CLIENT_ID = /^[A-Za-z0-9_-]{16,64}$/;
 
+/**
+ * Do-not-disturb, per hub. Keyed by the hub address, which isn't secret:
+ * nothing in web storage is keyed by (or holds) a client id.
+ */
+export const dndKey = (hub: string) => `sb:dnd@${hub}`;
+/** Older versions kept do-not-disturb in localStorage under `sb:dnd:<client id>`, which put the id there too. */
+export const LEGACY_DND_PREFIX = 'sb:dnd:';
+
+/**
+ * Carries do-not-disturb from an older version's `sb:dnd:<clientId>` (in
+ * `legacy`, localStorage) over to `dndKey(hub)` in `store`, unless that is set
+ * already, then deletes every `sb:dnd:` key whose suffix looks like a client
+ * id, so none is left in web storage. With `clientId` null (not known, e.g. no
+ * team yet or the Keychain refused) nothing is carried over; the old keys go
+ * anyway.
+ */
+export function migrateDnd(legacy: ListableKeyValue, store: KeyValue, hub: string, clientId: string | null) {
+  const keys: string[] = [];
+  for (let i = 0; i < legacy.length; i++) {
+    const k = legacy.key(i);
+    if (k?.startsWith(LEGACY_DND_PREFIX) && CLIENT_ID.test(k.slice(LEGACY_DND_PREFIX.length))) keys.push(k);
+  }
+  if (!keys.length) return;
+  const old = clientId === null ? null : legacy.getItem(LEGACY_DND_PREFIX + clientId);
+  if (old !== null && store.getItem(dndKey(hub)) === null) store.setItem(dndKey(hub), old === '1' ? '1' : '0');
+  for (const k of keys) legacy.removeItem(k);
+}
+
 export const DERIVE_LABEL = 'smoke-break client id v1\n';
 
 export function base64url(bytes: Uint8Array): string {
@@ -132,10 +160,15 @@ function addPinnedHub(store: KeyValue, hub: string) {
  * Moves the identity out of web storage into the Keychain: the device secret
  * (or, on a fresh install, has one made there) and every id pinned to a hub.
  * Each piece leaves web storage only after the Keychain confirmed it, and the
- * ids stay exactly what they were. Throws if the Keychain refuses; nothing is
+ * ids stay exactly what they were (except ids for hubs this build can't use). Throws if the Keychain refuses; nothing is
  * made up meanwhile, and calling it again picks up where it stopped.
  */
-export async function moveToKeychain(store: ListableKeyValue, vault: IdentityVault): Promise<void> {
+export async function moveToKeychain(
+  store: ListableKeyValue,
+  vault: IdentityVault,
+  /** Hubs this build may talk to (a locked build: only its own). Ids pinned to any other are dropped. */
+  usable: (hub: string) => boolean = () => true,
+): Promise<void> {
   const storedBefore = store.getItem(SECRET_IN_VAULT_KEY) === '1';
   const local = store.getItem(SECRET_KEY);
   const legacy = !storedBefore && local && DEVICE_SECRET.test(local) ? local : null;
@@ -153,8 +186,9 @@ export async function moveToKeychain(store: ListableKeyValue, vault: IdentityVau
     const id = store.getItem(k);
     // The other window may have moved it meanwhile.
     if (id === null) continue;
-    // Not an id or a hub the app could ever use: nothing to keep.
-    if (!CLIENT_ID.test(id) || !isHubKey(hub)) {
+    // Not an id, or a hub this build could ever use (the Keychain side would
+    // refuse it too): nothing to keep.
+    if (!CLIENT_ID.test(id) || !isHubKey(hub) || !usable(hub)) {
       store.removeItem(k);
       continue;
     }

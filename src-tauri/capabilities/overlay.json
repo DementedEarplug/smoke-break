@@ -1,0 +1,30 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "overlay",
+  "description": "The pack: a transparent always-on-top window that shows the team's break and opens its meeting. It moves, resizes and shows itself, lets clicks through where it is empty, and reads (never saves) the hub token and this device's id for the hub.",
+  "windows": ["overlay"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-emit",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-size",
+    "core:window:allow-set-position",
+    "core:window:allow-outer-position",
+    "core:window:allow-outer-size",
+    "core:window:allow-scale-factor",
+    "core:window:allow-current-monitor",
+    "core:window:allow-available-monitors",
+    "core:window:allow-cursor-position",
+    "core:window:allow-set-ignore-cursor-events",
+    "core:window:allow-start-dragging",
+    "allow-show-panel",
+    "allow-set-dnd",
+    "allow-open-meeting",
+    "allow-keychain-available",
+    "allow-token-get",
+    "allow-identity-init",
+    "allow-client-id-pin",
+    "allow-client-id"
+  ]
+}

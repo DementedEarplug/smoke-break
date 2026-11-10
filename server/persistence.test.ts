@@ -74,7 +74,8 @@ describe('admin CLI (item 2: ownership recovery)', () => {
     expect(runAdmin(['--file', file, 'set-owner', 'ffffffff', member], () => {})).toBe(1);
     expect(runAdmin(['--file', file, 'set-owner', '0a0b0c0d', member], () => {})).toBe(0);
     const after = JSON.parse(readFileSync(file, 'utf8'));
-    expect(after).toEqual([{ ...before[0], ownerId: member }]);
+    // createdBy is pinned to whoever made it (files from before it was kept: the owner until now, here without a label).
+    expect(after).toEqual([{ ...before[0], ownerId: member, createdBy: null }]);
     expect(statSync(file).mode & 0o777).toBe(0o600);
     expect(runAdmin(['--file', file, 'oops'], () => {})).toBe(2);
     expect(existsSync(file)).toBe(true);

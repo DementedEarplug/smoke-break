@@ -2,8 +2,9 @@
 // The server owns the clock: every deadline is scheduled here.
 
 import { createHash, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
-import { chmodSync, constants as fsConstants, copyFileSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import type { IncomingMessage } from 'node:http';
+import { isIP } from 'node:net';
 import { dirname } from 'node:path';
 import type { Duplex } from 'node:stream';
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
@@ -41,6 +42,7 @@ import {
   type SavedTeam,
   checkDataDir,
   isLegacyEntry,
+  keepCopy,
   parseSavedTeam,
   randomRef,
   writeAtomic,
@@ -83,7 +85,11 @@ export interface HubLimits extends AuditLimits {
    * room: new teams are refused instead.
    */
   junkTeamIdleMs: number;
-  /** Teams one token label may own (made, or handed to them) before it can't make more. */
+  /**
+   * Teams one token label may hold: those it owns plus those it made that
+   * still exist (handing a team over doesn't free its slot). At this many it
+   * can't make another or be handed one.
+   */
   teamsPerLabel: number;
   createsPerIpPerHour: number;
   /** New teams per hour across the whole hub from connections without a per-person token. */
@@ -154,7 +160,15 @@ export interface HubLimits extends AuditLimits {
   disconnectGraceMs: number;
   /** One person (roster entry, and token label) can start a new break at most this often. */
   breakCooldownMs: number;
-  /** Joining or leaving a break: changes per person (roster entry, and token label) every `joinLeaveWindowMs`. */
+  /**
+   * Changes one person makes that send the whole team its state, per roster
+   * entry and per token label every `joinLeaveWindowMs`, in two budgets of
+   * this size: one for joining or leaving a break and changing a pending
+   * break's length, one for coming online or going offline, a new name, and
+   * an owner's settings. Over it, break and settings changes are refused, a
+   * new name isn't taken, and coming and going reach the team with its next
+   * update (at the latest when the window is up).
+   */
   joinLeavePerWindow: number;
   joinLeaveWindowMs: number;
   /** Owner actions per minute for each owner and team: remove, hand over, change the code. */
@@ -271,6 +285,72 @@ export interface HubOptions {
   allowLocalhostPages?: boolean;
   /** Where audit lines go. Default: stdout. */
   log?: (line: string) => void;
+  /**
+   * Strict mode: refuse to start without the recommended protections, and keep
+   * owner approval on for every team. Default: SMOKE_BREAK_ENTERPRISE=1.
+   */
+  enterprise?: boolean;
+  /** The TCP address the hub listens on (not with a Unix socket), checked in strict mode. */
+  listenHost?: string;
+}
+
+/** What `checkDeployment` looks at. */
+export interface Deployment {
+  enterprise: boolean;
+  tokenMode: 'file' | 'shared' | 'none';
+  publicHosts: readonly string[];
+  proxySecret: boolean;
+  unixSocket: boolean;
+  /** SMOKE_BREAK_TRUST_PROXY is set: X-Forwarded-For is believed from some peers. */
+  trustsProxy: boolean;
+  listenHost?: string;
+}
+
+const isLoopbackHost = (host: string) => {
+  const h = host.replace(/^\[|\]$/g, '').toLowerCase();
+  return h === 'localhost' || h === '::1' || (isIP(h) === 4 && h.startsWith('127.')) || h.startsWith('::ffff:127.');
+};
+
+/**
+ * The recommended protections a deployment lacks. In strict mode they're
+ * `missing` (the hub won't start); otherwise each is one startup `warning`.
+ */
+export function checkDeployment(d: Deployment): { missing: string[]; warnings: string[] } {
+  if (d.enterprise) {
+    const missing: string[] = [];
+    if (d.tokenMode !== 'file') {
+      missing.push(
+        d.tokenMode === 'shared'
+          ? 'per-person tokens: set SMOKE_BREAK_ACCESS_TOKENS_FILE instead of the shared SMOKE_BREAK_ACCESS_TOKEN'
+          : 'per-person tokens: set SMOKE_BREAK_ACCESS_TOKENS_FILE',
+      );
+    }
+    if (!d.publicHosts.length) missing.push("the hub's name: set SMOKE_BREAK_PUBLIC_HOST");
+    if (!d.proxySecret && !d.unixSocket) missing.push('a way to keep out connections around the proxy: set SMOKE_BREAK_PROXY_SECRET or SMOKE_BREAK_SOCKET');
+    if (d.listenHost !== undefined && !d.unixSocket && !isLoopbackHost(d.listenHost) && !d.proxySecret) {
+      missing.push(`HOST=${d.listenHost} is not a loopback address: set SMOKE_BREAK_PROXY_SECRET, or listen on 127.0.0.1 or SMOKE_BREAK_SOCKET`);
+    }
+    return { missing, warnings: [] };
+  }
+  const warnings: string[] = [];
+  if (!d.publicHosts.length) {
+    warnings.push('SMOKE_BREAK_PUBLIC_HOST is not set: connections for any Host name are accepted (no protection against DNS rebinding). Set it to the hub\'s name.');
+  }
+  if (d.trustsProxy && !d.unixSocket && !d.proxySecret) {
+    warnings.push(
+      'SMOKE_BREAK_TRUST_PROXY is set without SMOKE_BREAK_PROXY_SECRET or SMOKE_BREAK_SOCKET: any process that can reach the hub from a trusted address can connect around the proxy and write its own X-Forwarded-For.',
+    );
+  }
+  if (d.tokenMode === 'shared') {
+    warnings.push(
+      'one shared access token (SMOKE_BREAK_ACCESS_TOKEN): it can\'t be revoked for one person, limits are per address instead of per person, and anyone holding it can block new teams hub-wide. Use SMOKE_BREAK_ACCESS_TOKENS_FILE for a company deployment.',
+    );
+  } else if (d.tokenMode === 'none') {
+    warnings.push(
+      'no access token required: anyone who can reach this hub can connect, make teams and ask to join them. Set SMOKE_BREAK_ACCESS_TOKENS_FILE for anything but local use.',
+    );
+  }
+  return { missing: [], warnings };
 }
 
 /** One person online in a team (with one or more sockets). */
@@ -338,6 +418,8 @@ interface Team {
   labelBans: Map<string, LabelBan>;
   /** A break with two or more people has happened. */
   hadGroupBreak: boolean;
+  /** Token label of whoever made it: it counts against their quota of teams even after it's handed over. */
+  createdBy: string | null;
   /** People waiting for the owner to let them in. */
   pending: Map<string, PendingEntry>;
   /** Roster members with open sockets (or within the disconnect grace period), by public id. */
@@ -352,6 +434,8 @@ interface Team {
   lastBroadcastAt: number;
   /** Wait before the next broadcast: `broadcastIntervalMs`, or longer after a big one. */
   bcastGapMs: number;
+  /** A broadcast held back because someone was over their limit of changes (see `broadcastLater`). */
+  laterTimer: ReturnType<typeof setTimeout> | null;
 }
 
 /** One open socket. */
@@ -446,6 +530,21 @@ export function createHub(opts: HubOptions) {
     allowedOrigins: opts.allowedOrigins ?? envList(process.env.SMOKE_BREAK_ALLOWED_ORIGINS),
     allowLocalhostPages: opts.allowLocalhostPages ?? false,
   };
+  const enterprise = opts.enterprise ?? process.env.SMOKE_BREAK_ENTERPRISE?.trim() === '1';
+  const deployment = checkDeployment({
+    enterprise,
+    tokenMode: tokens.mode,
+    publicHosts: policy.publicHosts ?? [],
+    proxySecret: !!proxyDigest,
+    unixSocket: opts.unixSocket ?? false,
+    trustsProxy: trusted !== null,
+    listenHost: opts.listenHost,
+  });
+  if (deployment.missing.length) {
+    tokens.close();
+    auditLog.close();
+    throw new Error(`SMOKE_BREAK_ENTERPRISE=1, but this hub is missing:\n${deployment.missing.map((m) => `  - ${m}`).join('\n')}`);
+  }
 
   const teams = new Set<Team>();
   /** Current invite codes. */
@@ -473,8 +572,10 @@ export function createHub(opts: HubOptions) {
   const joinRequests = new WindowLimiter(limits.pendingRequestsPerIpPerHour, HOUR_MS);
   /** New breaks, per roster entry and per token label in a team: one per cooldown, across reconnects. */
   const breakStarts = new WindowLimiter(1, limits.breakCooldownMs);
-  /** Joining and leaving breaks, keyed like `breakStarts`: each one sends the whole team its state. */
-  const joinLeaves = new WindowLimiter(limits.joinLeavePerWindow, limits.joinLeaveWindowMs);
+  /** Changes to a break (join, leave, length) that send the whole team its state, keyed like `breakStarts`. */
+  const breakChanges = new WindowLimiter(limits.joinLeavePerWindow, limits.joinLeaveWindowMs);
+  /** The same for everything else that does: coming and going, new names, owners' settings. */
+  const otherChanges = new WindowLimiter(limits.joinLeavePerWindow, limits.joinLeaveWindowMs);
   const ownerActions = new WindowLimiter(limits.ownerActionsPerMinute, 60_000);
   const approvals = new WindowLimiter(limits.approvalsPerMinute, 60_000);
   /** Ownerless teams already reported in the log. */
@@ -551,6 +652,7 @@ export function createHub(opts: HubOptions) {
       bcastTimer: null,
       lastBroadcastAt: 0,
       bcastGapMs: 0,
+      laterTimer: null,
     };
   }
 
@@ -574,6 +676,7 @@ export function createHub(opts: HubOptions) {
       bannedLabels: [...t.labelBans.values()].map((b) => withUntil({ label: b.label, reason: b.reason }, b.until)),
       pending: [...t.pending.values()].map((p) => withLabel({ id: p.id, name: p.name, at: p.at }, p.label)),
       hadGroupBreak: t.hadGroupBreak,
+      createdBy: t.createdBy,
     };
   }
 
@@ -623,6 +726,7 @@ export function createHub(opts: HubOptions) {
     const invalidRefs: string[] = [];
     let expired = 0;
     let droppedLinks = 0;
+    let approvalOn = 0;
     for (const [i, raw] of data.entries()) {
       const t = parseSavedTeam(raw, now);
       if (!t || codes.has(t.code)) {
@@ -637,6 +741,8 @@ export function createHub(opts: HubOptions) {
       const rawLink = (raw as Record<string, unknown>).zoomLink;
       if (typeof rawLink === 'string' && rawLink !== '' && t.zoomLink === '') droppedLinks++;
       const team = fromSaved(t, now);
+      // Strict mode: every team needs the owner's OK for new people, including teams that had it off.
+      if (enterprise && !team.requireApproval) (team.requireApproval = true), approvalOn++;
       teams.add(team);
       codes.set(team.code, team);
     }
@@ -676,19 +782,28 @@ export function createHub(opts: HubOptions) {
       if (backup('pre-roster')) save();
       else persist = false;
     }
-    audit('load', { teams: teams.size, invalid, invalidRefs: invalid ? invalidRefs.slice(0, 50) : undefined, expired, droppedLinks, migrated, upgradedCodes: upgraded }, CRITICAL);
+    if (approvalOn) {
+      console.warn(`[smoke-break] SMOKE_BREAK_ENTERPRISE=1: switched owner approval back on for ${approvalOn} team(s).`);
+      save(); // (not if a copy the save would need couldn't be kept: see above)
+    }
+    audit(
+      'load',
+      { teams: teams.size, invalid, invalidRefs: invalid ? invalidRefs.slice(0, 50) : undefined, expired, droppedLinks, migrated, upgradedCodes: upgraded, enterprise, approvalSwitchedOn: approvalOn || undefined },
+      CRITICAL,
+    );
   }
 
-  /** Keeps a private copy of the data file. Its path, or null if that failed. */
+  /**
+   * Keeps a private copy of the data file (or finds an identical one already
+   * kept: see `keepCopy`). Its path, or null if that failed.
+   */
   function backup(tag: string): string | null {
-    const copy = `${opts.dataFile}.${tag}-${Date.now()}`;
     try {
-      copyFileSync(opts.dataFile, copy, fsConstants.COPYFILE_EXCL);
-      chmodSync(copy, 0o600);
-      console.warn(`[smoke-break] Kept a copy of the previous ${opts.dataFile} at ${copy}.`);
-      return copy;
+      const { path, existed } = keepCopy(opts.dataFile, tag);
+      console.warn(existed ? `[smoke-break] A copy of ${opts.dataFile} as it is now is already kept at ${path}.` : `[smoke-break] Kept a copy of the previous ${opts.dataFile} at ${path}.`);
+      return path;
     } catch (err) {
-      console.error(`[smoke-break] !!! Couldn't copy ${opts.dataFile} to ${copy} (${(err as Error).message}). Teams will NOT be saved until this is fixed.`);
+      console.error(`[smoke-break] !!! Couldn't keep a copy of ${opts.dataFile} (${(err as Error).message}). Teams will NOT be saved until this is fixed.`);
       return null;
     }
   }
@@ -721,6 +836,7 @@ export function createHub(opts: HubOptions) {
   function forget(team: Team) {
     if (team.timer) clearTimeout(team.timer);
     if (team.bcastTimer) clearTimeout(team.bcastTimer);
+    if (team.laterTimer) clearTimeout(team.laterTimer);
     for (const m of team.online.values()) if (m.leaveTimer) clearTimeout(m.leaveTimer);
     teams.delete(team);
     codes.delete(team.code);
@@ -765,10 +881,21 @@ export function createHub(opts: HubOptions) {
     return true;
   }
 
-  /** Teams whose owner has this token label. */
-  function teamsOwnedBy(label: string): number {
-    let n = 0;
-    for (const t of teams) if (ownerLabel(t) === label) n++;
+  /**
+   * Teams a token label holds, other than `except`: `owns` (its owner has the
+   * label), `created` (made under the label, still there, whoever owns it now)
+   * and `held` (either: what counts against `teamsPerLabel`).
+   */
+  function teamsOf(label: string, except?: Team): { owns: number; created: number; held: number } {
+    const n = { owns: 0, created: 0, held: 0 };
+    for (const t of teams) {
+      if (t === except) continue;
+      const owns = ownerLabel(t) === label;
+      const created = t.createdBy === label;
+      if (owns) n.owns++;
+      if (created) n.created++;
+      if (owns || created) n.held++;
+    }
     return n;
   }
 
@@ -901,6 +1028,38 @@ export function createHub(opts: HubOptions) {
     const wait = team.lastBroadcastAt + Math.max(limits.broadcastIntervalMs, team.bcastGapMs) - Date.now();
     if (wait <= 0) queueMicrotask(run);
     else team.bcastTimer = setTimeout(run, wait);
+  }
+
+  /**
+   * For a change made by someone over their limit of changes: the team gets it
+   * with the next update anyway, or at the latest once the limit's window is
+   * up. However often they do it, that's one update per window.
+   */
+  function broadcastLater(team: Team) {
+    if (team.bcastQueued || team.laterTimer || closed) return;
+    team.laterTimer = setTimeout(() => {
+      team.laterTimer = null;
+      guard(() => {
+        if (!closed && teams.has(team)) broadcast(team);
+      });
+    }, limits.joinLeaveWindowMs);
+  }
+
+  /**
+   * Counts one change that sends the whole team its state (see
+   * `joinLeavePerWindow`) against person `id` in `team` and, with a token, their
+   * label. False, with a `limit` line, if either is over.
+   */
+  function takeChange(team: Team, id: string, conn: Conn, kind: string, now = Date.now()): boolean {
+    const limiter = kind === 'join-leave' || kind === 'set-length' ? breakChanges : otherChanges;
+    const keys = [`id|${team.ref}|${id}`];
+    if (conn.label) keys.push(`label|${team.ref}|${conn.label}`);
+    if (keys.some((k) => limiter.blocked(k, now))) {
+      limitHit(kind, conn, keys.at(-1));
+      return false;
+    }
+    for (const k of keys) limiter.take(k, now);
+    return true;
   }
 
   function broadcastNow(team: Team) {
@@ -1062,7 +1221,7 @@ export function createHub(opts: HubOptions) {
       m = { id, sockets: new Set(), leaveTimer: null };
       team.online.set(id, m);
     }
-    let changed = m.sockets.size === 0;
+    const comesOnline = m.sockets.size === 0;
     // One person holds a few sockets (the desktop app uses two). More would let one member multiply every broadcast.
     while (m.sockets.size >= limits.maxSocketsPerMember) {
       const oldest: WebSocket = m.sockets.values().next().value!;
@@ -1077,7 +1236,16 @@ export function createHub(opts: HubOptions) {
     if (m.leaveTimer) clearTimeout(m.leaveTimer);
     m.leaveTimer = null;
     const unique = uniqueName(rosterNames(team, id), name);
-    if (unique !== entry.name) {
+    const renames = unique !== entry.name;
+    // Coming online and a new name are sent to the whole team: limited per person, like joining a break.
+    const allowed = comesOnline || renames ? takeChange(team, id, conn, renames && entry.name ? 'rename' : 'presence') : true;
+    let changed = comesOnline;
+    // Over the limit, the name stays as it was (unless there's none yet: someone from before the roster).
+    if (renames && (allowed || !entry.name)) {
+      // Owners let people in by name: a later change of name is on record.
+      if (entry.name) {
+        audit('rename', { ...who(conn), team: team.ref, member: id, from: entry.name, to: unique }, { key: `rename|${team.ref}|${conn.limitKey}` });
+      }
       entry.name = unique;
       changed = true;
       save();
@@ -1088,11 +1256,14 @@ export function createHub(opts: HubOptions) {
     }
     touch(team);
     sendState(team, ws, id);
-    if (changed) broadcast(team);
+    if (changed) {
+      if (allowed) broadcast(team);
+      else broadcastLater(team);
+    }
     return m;
   }
 
-  function detach(team: Team, m: Member, ws: WebSocket) {
+  function detach(team: Team, m: Member, ws: WebSocket, conn: Conn) {
     if (!m.sockets.delete(ws) || m.sockets.size > 0) return;
     // A team in use right up to now shouldn't look idle just because nobody reconnected since.
     touch(team);
@@ -1104,7 +1275,9 @@ export function createHub(opts: HubOptions) {
         apply(team, machine.leave(team.brk, m.id, Date.now()));
       });
     }, limits.disconnectGraceMs);
-    broadcast(team);
+    // Going offline is sent to the whole team: limited like coming online.
+    if (takeChange(team, m.id, conn, 'presence')) broadcast(team);
+    else broadcastLater(team);
   }
 
   /** Closes a member's sockets (they're out of the team), without telling the rest of the team yet. */
@@ -1162,10 +1335,16 @@ export function createHub(opts: HubOptions) {
   }
 
   function createTeam(conn: Conn, ws: WebSocket, clientId: string, name: string, teamName: unknown) {
-    // One person can only hold a few teams, so nobody can hoard the hub's room for teams.
-    if (conn.label && teamsOwnedBy(conn.label) >= limits.teamsPerLabel) {
+    // One person can only hold a few teams (owned, or made and handed over), so nobody can hoard the hub's room for teams.
+    if (conn.label && teamsOf(conn.label).held >= limits.teamsPerLabel) {
       limitHit('teams-per-label', conn, conn.limitKey);
-      return refuse(conn, ws, `You already own ${limits.teamsPerLabel} teams. Hand one over or ask whoever runs the hub to delete one.`, 'full', 'teams-per-label');
+      return refuse(
+        conn,
+        ws,
+        `You already have ${limits.teamsPerLabel} teams (ones you own, and ones you made and handed over). Ask whoever runs the hub to delete one you no longer need.`,
+        'full',
+        'teams-per-label',
+      );
     }
     // People with their own token have their own quota; the per-address and hub-wide ones are for everyone else.
     const why = conn.label
@@ -1196,6 +1375,7 @@ export function createHub(opts: HubOptions) {
       banned: new Map(),
       labelBans: new Map(),
       hadGroupBreak: false,
+      createdBy: conn.label,
       pending: new Map(),
       online: new Map(),
       lastActive: Date.now(),
@@ -1205,12 +1385,16 @@ export function createHub(opts: HubOptions) {
       bcastTimer: null,
       lastBroadcastAt: 0,
       bcastGapMs: 0,
+      laterTimer: null,
     };
     teams.add(team);
     codes.set(code, team);
     save();
-    // Per label: how many teams it owns now and has made in the last day, so hoarding shows in the log.
-    const totals = conn.label ? { labelTeams: teamsOwnedBy(conn.label), labelCreatesToday: createsPerLabel.count(conn.label) } : {};
+    // Per label: the teams it holds (owns, and made that still exist) and has made in the last day, so hoarding shows in the log.
+    const held = conn.label ? teamsOf(conn.label) : null;
+    const totals = held
+      ? { labelTeams: held.held, labelOwns: held.owns, labelCreated: held.created, labelCreatesToday: createsPerLabel.count(conn.label!) }
+      : {};
     audit('create', { ...who(conn), team: team.ref, member: ownerId, name, ...totals });
     join(conn, ws, team, ownerId, name);
   }
@@ -1379,30 +1563,31 @@ export function createHub(opts: HubOptions) {
     if (msg.requireApproval !== undefined && typeof msg.requireApproval !== 'boolean') {
       return sendError(ws, 'requireApproval must be true or false.');
     }
+    if (enterprise && msg.requireApproval === false) {
+      return sendError(ws, "This hub requires the owner's approval for new members on every team, so it can't be switched off.");
+    }
 
+    const len = typeof msg.defaultLengthMin === 'number' ? clampLength(msg.defaultLengthMin) : team.defaultLengthMin;
+    const name = typeof msg.teamName === 'string' ? cleanName(msg.teamName, team.name) : team.name;
+    const approval = typeof msg.requireApproval === 'boolean' ? msg.requireApproval : team.requireApproval;
     const changed: string[] = [];
+    if (link !== undefined && link !== team.zoomLink) changed.push('zoomLink');
+    if (len !== team.defaultLengthMin) changed.push('defaultLengthMin');
+    if (name !== team.name) changed.push('teamName');
+    if (approval !== team.requireApproval) changed.push('requireApproval');
+    // Nothing changed, nothing sent: a no-op must not cost a broadcast.
+    if (!changed.length) return;
+    if (!takeChange(team, me.id, conn, 'settings')) return sendError(ws, 'Slow down: wait a few seconds before changing settings again.');
     if (link !== undefined && link !== team.zoomLink) {
       team.zoomLink = link;
-      changed.push('zoomLink');
       // Fixed links are known up front, so an active break picks up the new one.
       if (team.meetingProvider === 'fixed-link' && team.brk?.meetingRequested) {
         team.brk = { ...team.brk, meetingUrl: link || null };
       }
     }
-    if (typeof msg.defaultLengthMin === 'number') {
-      const len = clampLength(msg.defaultLengthMin);
-      if (len !== team.defaultLengthMin) (team.defaultLengthMin = len), changed.push('defaultLengthMin');
-    }
-    if (typeof msg.teamName === 'string') {
-      const name = cleanName(msg.teamName, team.name);
-      if (name !== team.name) (team.name = name), changed.push('teamName');
-    }
-    if (typeof msg.requireApproval === 'boolean' && msg.requireApproval !== team.requireApproval) {
-      team.requireApproval = msg.requireApproval;
-      changed.push('requireApproval');
-    }
-    // Nothing changed, nothing sent: a no-op must not cost a broadcast.
-    if (!changed.length) return;
+    team.defaultLengthMin = len;
+    team.name = name;
+    team.requireApproval = approval;
     save();
     audit('settings', { ...who(conn), team: team.ref, member: me.id, changed }, settingsThrottle(team, me));
     broadcast(team);
@@ -1496,29 +1681,49 @@ export function createHub(opts: HubOptions) {
     if (me.id !== team.ownerId) return sendError(ws, 'Only the team owner can hand the team over.');
     const id = typeof msg.id === 'string' ? msg.id : '';
     if (id === me.id) return sendError(ws, 'You already own this team.');
-    if (!PUBLIC_ID.test(id) || !team.roster.has(id)) return sendError(ws, 'No such member.');
+    const target = PUBLIC_ID.test(id) ? team.roster.get(id) : undefined;
+    if (!target) return sendError(ws, 'No such member.');
+    // Handing a team over doesn't free a slot (it still counts for whoever made it), and can't push anyone over the cap.
+    const to = target.label ? teamsOf(target.label, team) : null;
+    if (to && to.held >= limits.teamsPerLabel) {
+      limitHit('teams-per-label', conn, `${team.ref}|${target.label}`);
+      return sendError(ws, `${target.name || 'That person'} already has ${limits.teamsPerLabel} teams, so they can't take on another.`);
+    }
     if (!ownerMay(ownerActions, team, me, ws, conn)) return;
     team.ownerId = id;
     save();
-    audit('transfer-owner', { ...who(conn), team: team.ref, member: me.id, to: id }, CRITICAL);
+    // Both labels' totals after the handover, so teams moving between people show in the log.
+    const from = conn.label ? teamsOf(conn.label) : null;
+    const after = target.label ? teamsOf(target.label) : null;
+    audit(
+      'transfer-owner',
+      {
+        ...who(conn),
+        team: team.ref,
+        member: me.id,
+        to: id,
+        toLabel: target.label ?? undefined,
+        createdBy: team.createdBy ?? undefined,
+        labelOwns: from?.owns,
+        labelCreated: from?.created,
+        toLabelOwns: after?.owns,
+        toLabelCreated: after?.created,
+      },
+      CRITICAL,
+    );
     broadcast(team);
   }
 
   /**
-   * Joins or leaves a break, if that changes anything: a handful of changes per
-   * person every `joinLeaveWindowMs`, since each one sends the whole team its
-   * state. Over that, they're told to slow down and nothing changes.
+   * Joins or leaves a break, or changes its length, if that changes anything:
+   * a handful of changes per person every `joinLeaveWindowMs`, since each one
+   * sends the whole team its state. Over that, they're told to slow down and
+   * nothing changes.
    */
-  function joinOrLeave(team: Team, me: Member, ws: WebSocket, conn: Conn, result: machine.Result, now: number) {
+  function changeBreak(team: Team, me: Member, ws: WebSocket, conn: Conn, result: machine.Result, now: number, kind = 'join-leave') {
     if (!result.error && !result.effects.length && sameBreak(result.brk, team.brk)) return;
-    if (!result.error) {
-      const keys = [`id|${team.ref}|${me.id}`];
-      if (conn.label) keys.push(`label|${team.ref}|${conn.label}`);
-      if (keys.some((k) => joinLeaves.blocked(k, now))) {
-        limitHit('join-leave', conn, keys.at(-1));
-        return sendError(ws, 'Slow down: wait a few seconds before joining or leaving again.');
-      }
-      for (const k of keys) joinLeaves.take(k, now);
+    if (!result.error && !takeChange(team, me.id, conn, kind, now)) {
+      return sendError(ws, kind === 'join-leave' ? 'Slow down: wait a few seconds before joining or leaving again.' : 'Slow down: wait a few seconds before changing that again.');
     }
     apply(team, result, ws);
   }
@@ -1531,7 +1736,7 @@ export function createHub(opts: HubOptions) {
     switch (msg.type) {
       case 'invite': {
         // During a break, inviting is joining it.
-        if (machine.isActive(team.brk)) return joinOrLeave(team, me, ws, conn, machine.join(team.brk, self, now), now);
+        if (machine.isActive(team.brk)) return changeBreak(team, me, ws, conn, machine.join(team.brk, self, now), now);
         // Per roster entry (so reconnecting doesn't reset it) and per label (so extra devices don't multiply it).
         const keys = [`id|${team.ref}|${me.id}`];
         if (conn.label) keys.push(`label|${team.ref}|${conn.label}`);
@@ -1544,13 +1749,13 @@ export function createHub(opts: HubOptions) {
       }
       case 'setLength':
         if (typeof msg.lengthMin !== 'number') return sendError(ws, 'The length must be a number of minutes.');
-        return apply(team, machine.setLength(team.brk, me.id, msg.lengthMin), ws);
+        return changeBreak(team, me, ws, conn, machine.setLength(team.brk, me.id, msg.lengthMin), now, 'set-length');
       case 'join':
-        return joinOrLeave(team, me, ws, conn, machine.join(team.brk, self, now, msg.light === true), now);
+        return changeBreak(team, me, ws, conn, machine.join(team.brk, self, now, msg.light === true), now);
       case 'light':
         return apply(team, machine.lightUp(team.brk, me.id, now), ws);
       case 'leave':
-        return joinOrLeave(team, me, ws, conn, machine.leave(team.brk, me.id, now), now);
+        return changeBreak(team, me, ws, conn, machine.leave(team.brk, me.id, now), now);
       case 'settings':
         return settings(team, me, ws, conn, msg);
       case 'rotateCode':
@@ -1705,7 +1910,7 @@ export function createHub(opts: HubOptions) {
         leavePool(conn);
         const { team, me } = conn;
         // Removed members were already taken out; don't touch whoever has their slot now.
-        if (team && me && team.online.get(me.id) === me) detach(team, me, ws);
+        if (team && me && team.online.get(me.id) === me) detach(team, me, ws, conn);
       }),
     );
   }
@@ -1771,6 +1976,9 @@ export function createHub(opts: HubOptions) {
       tokenMode: tokens.mode,
       tokensBroken: tokens.broken !== null,
       proxySecret: !!proxyDigest,
+      enterprise,
+      /** Recommended protections this hub runs without (never in strict mode): one startup warning each. */
+      warnings: deployment.warnings,
     }),
     /** Stops timers, closes every socket and writes any pending save. */
     close() {
@@ -1787,6 +1995,7 @@ export function createHub(opts: HubOptions) {
       for (const team of teams) {
         if (team.timer) clearTimeout(team.timer);
         if (team.bcastTimer) clearTimeout(team.bcastTimer);
+        if (team.laterTimer) clearTimeout(team.laterTimer);
         for (const m of team.online.values()) if (m.leaveTimer) clearTimeout(m.leaveTimer);
       }
       for (const [ws, conn] of conns) {

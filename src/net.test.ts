@@ -3,7 +3,8 @@ import { WS_PROTOCOL, tokenFromProtocols } from '../shared/protocol.ts';
 
 vi.mock('./platform.ts', () => ({ serverProblem: () => null }));
 
-const { Net, PENDING_RETRY_MS, protocolsFor } = await import('./net.ts');
+const { MAX_MESSAGE_CHARS, Net, PENDING_RETRY_MS, protocolsFor } = await import('./net.ts');
+const { MAX_CLOCK_OFFSET_MS } = await import('./widget/limits.ts');
 
 class FakeSocket {
   static OPEN = 1;
@@ -181,5 +182,59 @@ describe('Net', () => {
     const net = new Net('wss://hub.example/ws', hello, () => {}, () => {});
     const first = net.retryLater();
     expect(net.retryLater()).toBe(first * 2);
+  });
+
+  describe('against a hostile hub', () => {
+    const state = (serverNow: number, pad = '') =>
+      JSON.stringify({
+        type: 'state',
+        you: 'me',
+        serverNow,
+        team: {
+          code: 'ABCDE23456',
+          name: pad,
+          defaultLengthMin: 12,
+          zoomLink: '',
+          meetingProvider: 'fixed-link',
+          ownerId: null,
+          members: [],
+          brk: null,
+        },
+      });
+
+    async function connected() {
+      vi.stubGlobal('WebSocket', FakeSocket);
+      const got: unknown[] = [];
+      const net = new Net('wss://hub.example/ws', hello, (m) => got.push(m), () => {});
+      net.connect();
+      await flush();
+      FakeSocket.last.open();
+      return { net, got, deliver: (data: string) => FakeSocket.last.onmessage!({ data }) };
+    }
+
+    it("can't move the clock more than a week", async () => {
+      const { net, got, deliver } = await connected();
+      deliver(state(1e300));
+      expect(got).toHaveLength(1);
+      expect(net.now() - Date.now()).toBeLessThanOrEqual(MAX_CLOCK_OFFSET_MS + 1000);
+      expect(Number.isFinite(net.now())).toBe(true);
+      net.close();
+      const again = await connected();
+      again.deliver(state(0));
+      expect(Date.now() - again.net.now()).toBeLessThanOrEqual(MAX_CLOCK_OFFSET_MS + 1000);
+      again.net.close();
+    });
+
+    it("doesn't even parse a message bigger than any real one", async () => {
+      const { net, got, deliver } = await connected();
+      const parse = vi.spyOn(JSON, 'parse');
+      deliver(state(Date.now(), 'x'.repeat(MAX_MESSAGE_CHARS)));
+      expect(parse).not.toHaveBeenCalled();
+      expect(got).toEqual([]);
+      // A real-sized one still goes through.
+      deliver(state(Date.now()));
+      expect(got).toHaveLength(1);
+      net.close();
+    });
   });
 });

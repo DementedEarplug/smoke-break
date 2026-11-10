@@ -207,13 +207,8 @@ const RECORD_END = ' :end';
 export function readBuildRecord(binaries: { name: string; data: Buffer }[]): { record: BuildRecord } | { error: string } {
   const found = new Set<string>();
   for (const { data } of binaries) {
-    let at = data.indexOf(RECORD_START);
-    while (at >= 0) {
-      const end = data.indexOf(RECORD_END, at);
-      // Records are short; anything longer isn't one.
-      if (end < 0 || end - at > 2048) break;
-      found.add(data.subarray(at + RECORD_START.length, end).toString('latin1'));
-      at = data.indexOf(RECORD_START, end);
+    for (const [start, end] of recordSpans(data)) {
+      found.add(data.subarray(start + RECORD_START.length, end - RECORD_END.length).toString('latin1'));
     }
   }
   if (found.size === 0) return { error: 'no build record in the executable: built from older sources? Rebuild it' };
@@ -232,6 +227,33 @@ export function readBuildRecord(binaries: { name: string; data: Buffer }[]): { r
     return { error: `the build record is incomplete: ${JSON.stringify([...found][0])}` };
   }
   return { record: { server, lock, token, meetingHost } };
+}
+
+/** Where the build records are in an executable, as [start, end) byte ranges. */
+function recordSpans(data: Buffer): [number, number][] {
+  const spans: [number, number][] = [];
+  let at = data.indexOf(RECORD_START);
+  while (at >= 0) {
+    const end = data.indexOf(RECORD_END, at);
+    // Records are short; anything longer isn't one.
+    if (end < 0 || end - at > 2048) break;
+    spans.push([at, end + RECORD_END.length]);
+    at = data.indexOf(RECORD_START, end);
+  }
+  return spans;
+}
+
+/**
+ * Whether `needle` is in the executable somewhere other than the build record.
+ * The record names the meeting host too, so finding it there alone proves
+ * nothing about the code that checks links.
+ */
+export function inCodeOutsideRecord(data: Buffer, needle: string): boolean {
+  const spans = recordSpans(data);
+  for (let at = data.indexOf(needle); at >= 0; at = data.indexOf(needle, at + 1)) {
+    if (!spans.some(([start, end]) => at >= start && at < end)) return true;
+  }
+  return false;
 }
 
 /** A command's combined output and exit status (null: it couldn't be run). */
@@ -324,7 +346,12 @@ export function checkApp(facts: AppFacts, expected: Expected = {}): Row[] {
       hubOrigin = built.origin;
       row('Hub address', 'pass', built.url);
     }
-    row('Server lock', record.lock === 'on' ? 'pass' : 'fail', record.lock === 'on' ? 'on: the Server field is hidden' : 'off: built without VITE_LOCK_SERVER=1');
+    // The native side keeps the hub address in its code (src-tauri/src/lock.rs);
+    // an app built from older sources has it in the record only.
+    if (record.lock !== 'on') row('Server lock', 'fail', 'off: built without VITE_LOCK_SERVER=1');
+    else if (!record.server || !facts.binaries.some((b) => inCodeOutsideRecord(b.data, record.server))) {
+      row('Server lock', 'fail', 'on in the build record, but the native commands aren’t locked to the hub: built from older sources? Rebuild it');
+    } else row('Server lock', 'pass', 'on: the Server field is hidden and the native commands answer for this hub only');
     row(
       'Shared access token',
       record.token === 'none' ? 'pass' : 'fail',
@@ -334,13 +361,18 @@ export function checkApp(facts: AppFacts, expected: Expected = {}): Row[] {
     if (!host) row('Meeting host pinned', 'fail', 'not pinned: built without SMOKE_BREAK_MEETING_HOST');
     else if (!isMeetingHost(host)) row('Meeting host pinned', 'fail', `${JSON.stringify(host)} isn't a Zoom host`);
     else if (expected.meetingHost && expected.meetingHost !== host) row('Meeting host pinned', 'fail', `pinned to ${host}, expected ${expected.meetingHost}`);
-    else if (!facts.binaries.some((b) => b.data.includes(host))) row('Meeting host pinned', 'fail', `${host} isn't in the executable`);
+    else if (!facts.binaries.some((b) => inCodeOutsideRecord(b.data, host))) {
+      row('Meeting host pinned', 'fail', `${host} is only in the build record, not in the code that checks links`);
+    }
     else row('Meeting host pinned', 'pass', host);
   }
 
-  if (hubOrigin) {
-    const problems = checkEmbeddedCsp(facts.binaries, hubOrigin);
-    row('CSP connect-src', problems.length ? 'fail' : 'pass', problems.length ? problems.join('; ') : `only ${connectSrc(hubOrigin)}`);
+  // Without a usable hub in the record, still say what the CSP allows, against the expected hub.
+  const expectedHub = expected.serverUrl ? checkHubUrl(expected.serverUrl) : null;
+  const cspOrigin = hubOrigin ?? (expectedHub && 'origin' in expectedHub ? expectedHub.origin : null);
+  if (cspOrigin) {
+    const problems = checkEmbeddedCsp(facts.binaries, cspOrigin);
+    row('CSP connect-src', problems.length ? 'fail' : 'pass', problems.length ? problems.join('; ') : `only ${connectSrc(cspOrigin)}`);
   } else {
     row('CSP connect-src', 'fail', 'not checked: no usable hub address to check it against');
   }
