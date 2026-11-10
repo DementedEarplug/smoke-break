@@ -11,27 +11,36 @@ vi.mock('./platform.ts', () => ({
   savedTeam: (hub: string) => saved.get(hub) ?? '',
   saveTeam: (c: string, hub: string) => saved.set(hub, c),
   leaveTeam: (hub: string) => saved.delete(hub),
-  withToken: async <T extends object>(m: T, hub: string) => {
+  hubToken: async (hub: string) => {
     tokenHubs.push(hub);
-    return { ...m, token: `tok for ${hub}` };
+    return `tok for ${hub}`;
   },
 }));
 
 /** A stand-in for Net that lets the test play the hub. */
 const fake = vi.hoisted(() => ({
   url: '',
-  hello: null as null | (() => Promise<unknown>),
+  hello: null as null | (() => unknown),
   deliver: null as null | ((m: unknown) => void),
+  opts: null as null | { token?: () => Promise<string>; onConnectFailed?: (n: number, withToken: boolean) => void },
   closed: 0,
   retried: 0,
   pendingRetries: 0,
 }));
 vi.mock('./net.ts', () => ({
   Net: class {
-    constructor(url: string, hello: () => Promise<unknown>, onMessage: (m: unknown) => void) {
+    constructor(
+      url: string,
+      hello: () => unknown,
+      onMessage: (m: unknown) => void,
+      _onStatus: unknown,
+      _onBadServer: unknown,
+      opts: typeof fake.opts,
+    ) {
       fake.url = url;
       fake.hello = hello;
       fake.deliver = onMessage;
+      fake.opts = opts;
     }
     close() {
       fake.closed++;
@@ -47,7 +56,7 @@ vi.mock('./net.ts', () => ({
   },
 }));
 
-const { createSession } = await import('./session.ts');
+const { createSession, cantConnectMessage } = await import('./session.ts');
 
 const team = (code: string) => ({
   code,
@@ -64,7 +73,7 @@ const team = (code: string) => ({
 });
 
 function setup(first: ClientMsg = { type: 'hello', teamCode: 'OLDCODE234', clientId: 'c'.repeat(24), name: 'Sam' }) {
-  const h = { onTeam: vi.fn(), onError: vi.fn(), onFatal: vi.fn(), onRetrying: vi.fn(), onPending: vi.fn() };
+  const h = { onTeam: vi.fn(), onError: vi.fn(), onFatal: vi.fn(), onRetrying: vi.fn(), onPending: vi.fn(), onCantConnect: vi.fn() };
   createSession(first as never, h, HUB);
   const deliver = (m: ServerMsg) => fake.deliver!(m);
   return { h, deliver };
@@ -157,7 +166,9 @@ describe('session hello', () => {
   it('talks only to the hub its identity is for, with that hub\'s token', async () => {
     setup();
     expect(fake.url).toBe(HUB);
-    await expect(fake.hello!()).resolves.toMatchObject({ type: 'hello', teamCode: 'OLDCODE234', token: `tok for ${HUB}` });
+    expect(fake.hello!()).toMatchObject({ type: 'hello', teamCode: 'OLDCODE234' });
+    // Net adds the token to the hello and to the subprotocols.
+    await expect(fake.opts!.token!()).resolves.toBe(`tok for ${HUB}`);
     expect(tokenHubs).toEqual([HUB]);
   });
 
@@ -166,6 +177,28 @@ describe('session hello', () => {
     deliver({ type: 'state', team: team('NEWCODE234'), you: 'me', serverNow: 1 });
     expect(saved.get(HUB)).toBe('NEWCODE234');
     expect(saved.get('wss://other.example/ws')).toBe('OTHERTEAM2');
-    await expect(fake.hello!()).resolves.toMatchObject({ type: 'hello', teamCode: 'NEWCODE234' });
+    expect(fake.hello!()).toMatchObject({ type: 'hello', teamCode: 'NEWCODE234' });
+  });
+});
+
+describe('connections that never open', () => {
+  it('says the hub needs a valid token after repeated failures, without giving up', () => {
+    const { h } = setup();
+    fake.opts!.onConnectFailed!(1, true);
+    expect(h.onCantConnect).not.toHaveBeenCalled();
+    fake.opts!.onConnectFailed!(2, true);
+    expect(h.onCantConnect).toHaveBeenCalledWith(cantConnectMessage(true), true);
+    expect(cantConnectMessage(true)).toMatch(/needs a valid one/);
+    // Nothing is stopped or forgotten: Net keeps backing off by itself.
+    expect(fake.closed).toBe(0);
+    expect(h.onFatal).not.toHaveBeenCalled();
+    expect(saved.get(HUB)).toBe('OLDCODE234');
+  });
+
+  it('suggests entering a token when none was offered', () => {
+    const { h } = setup();
+    fake.opts!.onConnectFailed!(3, false);
+    expect(h.onCantConnect).toHaveBeenCalledWith(cantConnectMessage(false), false);
+    expect(cantConnectMessage(false)).toMatch(/needs an access token/);
   });
 });

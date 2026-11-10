@@ -1,7 +1,7 @@
 // Realtime hub: one shared break per team, broadcast to every connected pack.
 // The server owns the clock: every deadline is scheduled here.
 
-import { createHash, randomInt, randomUUID } from 'node:crypto';
+import { createHash, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
 import { chmodSync, constants as fsConstants, copyFileSync, readFileSync } from 'node:fs';
 import type { IncomingMessage } from 'node:http';
 import { dirname } from 'node:path';
@@ -14,10 +14,12 @@ import {
   type MeetingProviderKind,
   type MemberView,
   type TeamView,
+  WS_PROTOCOL,
   clampLength,
   normalizeMeetingLink,
+  tokenFromProtocols,
 } from '../shared/protocol.ts';
-import { AccessTokens } from './accessTokens.ts';
+import { AccessTokens, type TokensChange } from './accessTokens.ts';
 import {
   type OriginPolicy,
   type TrustedProxies,
@@ -83,13 +85,26 @@ export interface HubLimits extends AuditLimits {
   createsPerHour: number;
   /** New teams per day for each per-person token label (instead of the hub-wide limit). */
   createsPerLabelPerDay: number;
-  /** Wrong invite codes allowed per address every 10 minutes, so codes can't be guessed. */
+  /** Wrong invite codes allowed per address (or token label) every 10 minutes, so codes can't be guessed. */
   badCodesPerIp: number;
   /** Delay before saying a code is wrong. */
   badCodeDelayMs: number;
-  /** Each desktop app holds two connections, so this is about twice the people behind one address. */
+  /**
+   * Identified connections (past create/hello) per address, or per token label.
+   * Each desktop app holds two, so this is about twice the people behind one address.
+   */
   connectionsPerIp: number;
+  /** Identified connections in total. */
   maxConnections: number;
+  /**
+   * Connections that haven't said create/hello yet, per address (IPv6 by /56)
+   * or per token label. Kept apart from identified ones, so strangers can't use those up.
+   */
+  unidentifiedPerIp: number;
+  /** Connections that haven't said create/hello yet, in total. */
+  maxUnidentified: number;
+  /** Messages other than create/hello a new connection may send first; one more closes it. */
+  messagesBeforeHello: number;
   /** Roster size: people who belong to a team, online or not. */
   maxMembersPerTeam: number;
   /** Open sockets one person may hold in a team; one more closes their oldest. */
@@ -98,16 +113,18 @@ export interface HubLimits extends AuditLimits {
   identitiesPerLabel: number;
   /** Join requests waiting for the owner, per team. */
   maxPending: number;
-  /** Of those, how many may come from one address. */
+  /** Of those, how many may come from one address (or token label). */
   pendingPerIp: number;
-  /** New join requests one address may make per hour, across all teams. */
+  /** New join requests one address (or token label) may make per hour, across all teams. */
   pendingRequestsPerIpPerHour: number;
+  /** Someone the owner turned away can't ask that team again for this long. */
+  denyMs: number;
   /** Unanswered join requests are dropped after this long. */
   pendingTtlMs: number;
   /** Per-socket message rate: bursts of `messageBurst`, then `messagesPerSecond`. */
   messageBurst: number;
   messagesPerSecond: number;
-  /** Message budget shared by all sockets from one address. */
+  /** Message budget shared by all sockets from one address (or token label). */
   addressMessageBurst: number;
   addressMessagesPerSecond: number;
   /** A socket with more than this waiting to be sent has stopped reading and is dropped. */
@@ -124,8 +141,12 @@ export interface HubLimits extends AuditLimits {
   helloTimeoutMs: number;
   /** How long a closed tab keeps its spot in a break before it's stubbed out. */
   disconnectGraceMs: number;
-  /** One person can start a new break at most this often. */
+  /** One person (roster entry, and token label) can start a new break at most this often. */
   breakCooldownMs: number;
+  /** Owner actions per minute for each owner and team: remove, hand over, change the code. */
+  ownerActionsPerMinute: number;
+  /** Approvals and denials per minute for each owner and team. */
+  approvalsPerMinute: number;
   saveDelayMs: number;
   /** A team's last-used time is only bumped (and saved) this often. */
   lastActiveResolutionMs: number;
@@ -149,6 +170,10 @@ export const DEFAULT_LIMITS: HubLimits = {
   // An office behind one NAT or proxy address: ~250 people with the app open.
   connectionsPerIp: envInt('SMOKE_BREAK_CONNECTIONS_PER_IP', 500),
   maxConnections: envInt('SMOKE_BREAK_MAX_CONNECTIONS', 10_000),
+  // Apps say hello as soon as they connect, so even an office reconnecting at once holds few of these.
+  unidentifiedPerIp: 100,
+  maxUnidentified: 2000,
+  messagesBeforeHello: 2,
   maxMembersPerTeam: 200,
   maxSocketsPerMember: 4,
   identitiesPerLabel: envInt('SMOKE_BREAK_IDENTITIES_PER_LABEL', 3),
@@ -156,6 +181,7 @@ export const DEFAULT_LIMITS: HubLimits = {
   pendingPerIp: 3,
   pendingRequestsPerIpPerHour: 20,
   pendingTtlMs: 3 * DAY_MS,
+  denyMs: DAY_MS,
   messageBurst: 30,
   messagesPerSecond: 10,
   // After a hub restart a whole office reconnects at once: one hello per socket.
@@ -166,9 +192,12 @@ export const DEFAULT_LIMITS: HubLimits = {
   bufferCheckMs: 1000,
   broadcastIntervalMs: 150,
   pingIntervalMs: 30_000,
-  helloTimeoutMs: 10_000,
+  helloTimeoutMs: 3000,
   disconnectGraceMs: 20_000,
   breakCooldownMs: 10_000,
+  ownerActionsPerMinute: 5,
+  // One owner may have a whole team waiting after an upgrade (maxPending is 20).
+  approvalsPerMinute: 20,
   saveDelayMs: 200,
   lastActiveResolutionMs: HOUR_MS,
   housekeepingMs: HOUR_MS,
@@ -184,10 +213,21 @@ const MAX_DROPPED_MESSAGES = 50;
 export interface HubOptions {
   dataFile: string;
   limits?: Partial<HubLimits>;
-  /** A token shared by everyone; create/hello must carry it (or a per-person one). Default: SMOKE_BREAK_ACCESS_TOKEN. */
+  /**
+   * A token shared by everyone, offered as a WebSocket subprotocol (see
+   * `tokenProtocol`). Default: SMOKE_BREAK_ACCESS_TOKEN. Can't be combined with a tokens file.
+   */
   accessToken?: string;
   /** File of `label:token` lines, one per person or group. Default: SMOKE_BREAK_ACCESS_TOKENS_FILE. */
   accessTokensFile?: string;
+  /**
+   * A secret the reverse proxy sends in `X-Smoke-Break-Proxy`. When set, upgrades
+   * without it are refused, so a local process can't connect around the proxy
+   * (or fake X-Forwarded-For). Default: SMOKE_BREAK_PROXY_SECRET.
+   */
+  proxySecret?: string;
+  /** The hub listens on a Unix socket only the proxy can open: peers without an IP address are the proxy. */
+  unixSocket?: boolean;
   /**
    * Reverse proxies whose X-Forwarded-For is believed: IPs and CIDR ranges, or
    * true for loopback only. Default: SMOKE_BREAK_TRUST_PROXY.
@@ -209,7 +249,6 @@ interface Member {
   id: string;
   sockets: Set<WebSocket>;
   leaveTimer: ReturnType<typeof setTimeout> | null;
-  lastInviteAt: number;
 }
 
 interface RosterEntry {
@@ -223,6 +262,14 @@ interface BanEntry {
   id: string;
   label: string | null;
   reason: BanReason;
+  /** 'denied' only: when they may ask again. */
+  until?: number;
+}
+
+interface LabelBan {
+  label: string;
+  reason: BanReason;
+  until?: number;
 }
 
 interface PendingEntry {
@@ -230,7 +277,7 @@ interface PendingEntry {
   name: string;
   label: string | null;
   at: number;
-  /** Address key it came from (not saved). */
+  /** Limit key (address or label) it came from (not saved). */
   addr: string | null;
 }
 
@@ -255,8 +302,12 @@ interface Team {
   requireApproval: boolean;
   /** Everyone who belongs to the team, by public id, oldest first. */
   roster: Map<string, RosterEntry>;
-  /** People the owner removed or turned away. They can't rejoin. */
+  /** People the owner removed (for good) or turned away (for `denyMs`). */
   banned: Map<string, BanEntry>;
+  /** Token labels removed as a whole (or turned away for a while): no new identity under them. */
+  labelBans: Map<string, LabelBan>;
+  /** A break with two or more people has happened. */
+  hadGroupBreak: boolean;
   /** People waiting for the owner to let them in. */
   pending: Map<string, PendingEntry>;
   /** Roster members with open sockets (or within the disconnect grace period), by public id. */
@@ -277,12 +328,20 @@ interface Conn {
   ip: string;
   /** Address used for per-address limits (IPv6 grouped by /64). */
   key: string;
+  /** What its limits are counted against: its token label if it has one, else `key`. */
+  limitKey: string;
+  /** What it counts against while unidentified: its token label, else its address with IPv6 grouped by /56. */
+  preKey: string;
+  /** Which connection count it's in: unidentified, identified, or neither once closed. */
+  pool: 'pre' | 'joined' | null;
+  /** Messages sent before create/hello. */
+  preMsgs: number;
   alive: boolean;
   /** new → (refusing, while a refusal is delayed) → joined, or done once refused or removed. */
   state: 'new' | 'refusing' | 'joined' | 'done';
   team: Team | null;
   me: Member | null;
-  /** Per-person token label, if it used one. */
+  /** Per-person token label, if it used one (known from the upgrade). */
   label: string | null;
   /** Which token let it in, so revoking that token closes it. */
   tokenDigest: Buffer | null;
@@ -310,6 +369,24 @@ const sameBreak = (a: Break | null, b: Break | null) => a === b || JSON.stringif
 
 type ErrorFrame = { type: 'error'; message: string; fatal?: boolean; code?: ErrorCode };
 
+/** The header a reverse proxy puts SMOKE_BREAK_PROXY_SECRET in. */
+export const PROXY_HEADER = 'x-smoke-break-proxy';
+const PROXY_SECRET = /^[\x21-\x7e]{16,512}$/;
+const sha256 = (s: string) => createHash('sha256').update(s).digest();
+
+/** The subprotocols a client offered, from its upgrade request. */
+function offeredProtocols(req: IncomingMessage): string[] {
+  const h = req.headers['sec-websocket-protocol'];
+  return (Array.isArray(h) ? h.join(',') : (h ?? '')).split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+const inc = (m: Map<string, number>, k: string) => m.set(k, (m.get(k) ?? 0) + 1);
+function dec(m: Map<string, number>, k: string) {
+  const n = (m.get(k) ?? 1) - 1;
+  if (n > 0) m.set(k, n);
+  else m.delete(k);
+}
+
 // ── The hub ──────────────────────────────────────────────────────────────
 
 export function createHub(opts: HubOptions) {
@@ -318,11 +395,16 @@ export function createHub(opts: HubOptions) {
   // Anything misconfigured throws here, before any timer starts or socket is accepted.
   checkDataDir(dirname(opts.dataFile));
   const trusted: TrustedProxies = parseTrustedProxies(opts.trustProxy ?? process.env.SMOKE_BREAK_TRUST_PROXY);
+  const proxySecret = opts.proxySecret ?? process.env.SMOKE_BREAK_PROXY_SECRET?.trim() ?? '';
+  if (proxySecret && !PROXY_SECRET.test(proxySecret)) {
+    throw new Error('SMOKE_BREAK_PROXY_SECRET must be 16-512 printable characters without spaces (e.g. openssl rand -hex 32).');
+  }
+  const proxyDigest = proxySecret ? sha256(proxySecret) : null;
   const tokens = new AccessTokens({
     shared: opts.accessToken ?? process.env.SMOKE_BREAK_ACCESS_TOKEN?.trim() ?? '',
     file: opts.accessTokensFile ?? process.env.SMOKE_BREAK_ACCESS_TOKENS_FILE?.trim() ?? '',
     pollMs: limits.tokensPollMs,
-    onReload: (valid) => guard(() => closeRevoked(valid)),
+    onReload: (change) => guard(() => onTokensChange(change)),
     log: (event, fields) => audit(event, fields),
   });
   const auditLog = createAuditLog(log, limits);
@@ -338,23 +420,44 @@ export function createHub(opts: HubOptions) {
   const codes = new Map<string, Team>();
   /** Earlier codes that still work for people on the roster. */
   const aliasCodes = new Map<string, Team>();
-  const wss = new WebSocketServer({ noServer: true, maxPayload: limits.maxPayloadBytes, clientTracking: false });
+  const wss = new WebSocketServer({
+    noServer: true,
+    maxPayload: limits.maxPayloadBytes,
+    clientTracking: false,
+    // The app offers WS_PROTOCOL (plus its token); answer with it. Clients that offer nothing get nothing back.
+    handleProtocols: (offered) => (offered.has(WS_PROTOCOL) ? WS_PROTOCOL : false),
+  });
   const conns = new Map<WebSocket, Conn>();
-  const connectionsPerKey = new Map<string, number>();
-  const addressBuckets = new Map<string, TokenBucket>();
+  /** Unidentified connections per preKey, and identified ones per limitKey. */
+  const preCounts = new Map<string, number>();
+  const joinedCounts = new Map<string, number>();
+  let preTotal = 0;
+  let joinedTotal = 0;
+  const messageBuckets = new Map<string, TokenBucket>();
   const creates = new WindowLimiter(limits.createsPerIpPerHour, HOUR_MS);
   const createsGlobal = new WindowLimiter(limits.createsPerHour, HOUR_MS);
   const createsPerLabel = new WindowLimiter(limits.createsPerLabelPerDay, DAY_MS);
   const badCodes = new WindowLimiter(limits.badCodesPerIp, BAD_CODE_WINDOW_MS);
   const joinRequests = new WindowLimiter(limits.pendingRequestsPerIpPerHour, HOUR_MS);
+  /** New breaks, per roster entry and per token label in a team: one per cooldown, across reconnects. */
+  const breakStarts = new WindowLimiter(1, limits.breakCooldownMs);
+  const ownerActions = new WindowLimiter(limits.ownerActionsPerMinute, 60_000);
+  const approvals = new WindowLimiter(limits.approvalsPerMinute, 60_000);
+  /** Ownerless teams already reported in the log. */
+  const ownerlessLogged = new WeakSet<Team>();
   const timers = new Set<ReturnType<typeof setTimeout>>();
   let closed = false;
-  /** False when the data file couldn't be read or backed up: never overwrite what we couldn't read. */
+  /** False when the data file couldn't be backed up before an upgrade: never overwrite what we couldn't keep. */
   let persist = true;
 
   const who = (c: Conn) => (c.label ? { ip: c.ip, label: c.label } : { ip: c.ip });
-  /** Owners can repeat harmless actions as fast as the rate limits allow; their lines are throttled per team too. */
-  const ownerThrottle = (event: string, team: Team, me: Member) => ({ key: `${event}|${team.ref}|${me.id}`, perMinute: 20 });
+  /**
+   * Owner actions are rate limited (a few a minute), and their lines are
+   * throttled per team and owner as well, so no owner can crowd other teams'
+   * events out of the hub-wide log ceiling.
+   */
+  const ownerThrottle = (team: Team, me: Member) => ({ key: `owner|${team.ref}|${me.id}`, perMinute: 30 });
+  const settingsThrottle = (team: Team, me: Member) => ({ key: `settings|${team.ref}|${me.id}`, perMinute: 20 });
   /** Limit hits are logged at most once a minute per limit and address. */
   function limitHit(kind: string, c: { ip: string; label?: string | null }, key = c.ip) {
     audit('limit', c.label ? { kind, ip: c.ip, label: c.label } : { kind, ip: c.ip }, { key: `limit|${kind}|${key}`, perMinute: 1 });
@@ -399,11 +502,15 @@ export function createHub(opts: HubOptions) {
 
   // ── Loading and saving ─────────────────────────────────────────────────
 
-  function fromSaved(t: SavedTeam): Team {
+  function fromSaved(t: SavedTeam, now: number): Team {
+    // Denials used to be for good; from files of that time they last `denyMs` from now.
+    const until = (b: { reason: BanReason; until?: number }) => (b.reason === 'denied' ? { until: b.until ?? now + limits.denyMs } : {});
+    const { bannedLabels, ...rest } = t;
     return {
-      ...t,
+      ...rest,
       roster: new Map(t.roster.map((m) => [m.id, { id: m.id, name: m.name, label: m.label ?? null }])),
-      banned: new Map(t.banned.map((b) => [b.id, { id: b.id, label: b.label ?? null, reason: b.reason }])),
+      banned: new Map(t.banned.map((b) => [b.id, { id: b.id, label: b.label ?? null, reason: b.reason, ...until(b) }])),
+      labelBans: new Map(bannedLabels.map((b) => [b.label, { label: b.label, reason: b.reason, ...until(b) }])),
       pending: new Map(t.pending.map((p) => [p.id, { id: p.id, name: p.name, label: p.label ?? null, at: p.at, addr: null }])),
       online: new Map(),
       brk: null,
@@ -416,6 +523,7 @@ export function createHub(opts: HubOptions) {
 
   function toSaved(t: Team): SavedTeam {
     const withLabel = <T extends object>(x: T, label: string | null) => (label ? { ...x, label } : x);
+    const withUntil = <T extends object>(x: T, until: number | undefined) => (until ? { ...x, until } : x);
     return {
       code: t.code,
       aliases: [...t.aliases],
@@ -429,23 +537,39 @@ export function createHub(opts: HubOptions) {
       lastActive: t.lastActive,
       requireApproval: t.requireApproval,
       roster: [...t.roster.values()].map((m) => withLabel({ id: m.id, name: m.name }, m.label)),
-      banned: [...t.banned.values()].map((b) => withLabel({ id: b.id, reason: b.reason }, b.label)),
+      banned: [...t.banned.values()].map((b) => withUntil(withLabel({ id: b.id, reason: b.reason }, b.label), b.until)),
+      bannedLabels: [...t.labelBans.values()].map((b) => withUntil({ label: b.label, reason: b.reason }, b.until)),
       pending: [...t.pending.values()].map((p) => withLabel({ id: p.id, name: p.name, at: p.at }, p.label)),
+      hadGroupBreak: t.hadGroupBreak,
     };
   }
 
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
-  load();
+  try {
+    load();
+  } catch (err) {
+    tokens.close();
+    auditLog.close();
+    throw err;
+  }
+  // Labels deleted from the tokens file while the hub was stopped.
+  const presentLabels = tokens.present();
+  if (presentLabels) forgetLabels(presentLabels, null);
 
+  /**
+   * Reads the saved teams. A file that exists but can't be read or isn't a
+   * team list stops the hub from starting: running with no teams would make
+   * every app forget its team, and the next save would overwrite the file.
+   */
   function load() {
     let text: string;
     try {
       text = readFileSync(opts.dataFile, 'utf8');
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') return; // No saved teams yet.
-      persist = false;
-      console.error(`[smoke-break] !!! Can't read ${opts.dataFile} (${(err as Error).message}). Teams will NOT be saved until this is fixed.`);
-      return;
+      throw new Error(
+        `Can't read the team file ${opts.dataFile} (${(err as Error).message}). Fix its owner or permissions; the hub won't start without its teams.`,
+      );
     }
     let data: unknown;
     try {
@@ -453,7 +577,14 @@ export function createHub(opts: HubOptions) {
     } catch {
       data = undefined;
     }
-    if (!Array.isArray(data)) return quarantine();
+    if (!Array.isArray(data)) {
+      const copy = backup('corrupt');
+      throw new Error(
+        `The team file ${opts.dataFile} is not a valid team list` +
+          (copy ? ` (a copy is kept at ${copy}).` : ' (and a copy could not be made).') +
+          ' Restore a good copy (e.g. a teams.json.pre-roster-* one, or from backup), or move the file away to start with no teams.',
+      );
+    }
     const now = Date.now();
     let invalid = 0;
     let expired = 0;
@@ -470,7 +601,7 @@ export function createHub(opts: HubOptions) {
       }
       const rawLink = (raw as Record<string, unknown>).zoomLink;
       if (typeof rawLink === 'string' && rawLink !== '' && t.zoomLink === '') droppedLinks++;
-      const team = fromSaved(t);
+      const team = fromSaved(t, now);
       teams.add(team);
       codes.set(team.code, team);
     }
@@ -493,29 +624,23 @@ export function createHub(opts: HubOptions) {
     if (migrated || upgraded) {
       // The file is about to be rewritten in the new format: keep the old one, like a corrupt file.
       if (backup('pre-roster')) save();
+      else persist = false;
     }
     audit('load', { teams: teams.size, invalid, expired, droppedLinks, migrated, upgradedCodes: upgraded });
   }
 
-  /** Keeps a private copy of the data file. False (and saving switched off) if that fails. */
-  function backup(tag: string): boolean {
+  /** Keeps a private copy of the data file. Its path, or null if that failed. */
+  function backup(tag: string): string | null {
     const copy = `${opts.dataFile}.${tag}-${Date.now()}`;
     try {
       copyFileSync(opts.dataFile, copy, fsConstants.COPYFILE_EXCL);
       chmodSync(copy, 0o600);
       console.warn(`[smoke-break] Kept a copy of the previous ${opts.dataFile} at ${copy}.`);
-      return true;
+      return copy;
     } catch (err) {
-      persist = false;
       console.error(`[smoke-break] !!! Couldn't copy ${opts.dataFile} to ${copy} (${(err as Error).message}). Teams will NOT be saved until this is fixed.`);
-      return false;
+      return null;
     }
-  }
-
-  /** The file exists but isn't a team list: keep a copy before it can be overwritten. */
-  function quarantine() {
-    if (backup('corrupt')) console.error(`[smoke-break] !!! ${opts.dataFile} is not a valid team list. Starting with no teams.`);
-    else console.error(`[smoke-break] !!! ${opts.dataFile} is not a valid team list and couldn't be backed up.`);
   }
 
   /** Call only when something saved actually changed. */
@@ -553,9 +678,11 @@ export function createHub(opts: HubOptions) {
   }
 
   /**
-   * Makes room for a new team. First choice: a team only its creator ever
-   * joined, idle for a day (junk). Otherwise the least recently used empty
-   * team, but never one used in the last `teamKeepDays`: then the new team is refused.
+   * Makes room for a new team. First choice: a junk team idle for a day, one
+   * only its creator ever joined, or one made without a per-person token that
+   * never had a break with two or more people (however many identities its
+   * creator added). Otherwise the least recently used empty team, but never
+   * one used in the last `teamKeepDays`: then the new team is refused.
    */
   function roomForTeam(): boolean {
     if (teams.size < limits.maxTeams) return true;
@@ -566,7 +693,9 @@ export function createHub(opts: HubOptions) {
     let stale: Team | null = null;
     for (const t of teams) {
       if (t.online.size || t.brk) continue;
-      if (t.roster.size <= 1 && !t.banned.size && !t.pending.size && t.lastActive <= junkAfter) {
+      const lonely = t.roster.size <= 1 && !t.banned.size && !t.pending.size;
+      const unused = !t.hadGroupBreak && !(t.ownerId && t.roster.get(t.ownerId)?.label);
+      if ((lonely || unused) && t.lastActive <= junkAfter) {
         if (!junk || t.lastActive < junk.lastActive) junk = t;
       } else if (t.lastActive <= keepAfter && (!stale || t.lastActive < stale.lastActive)) stale = t;
     }
@@ -582,15 +711,18 @@ export function createHub(opts: HubOptions) {
 
   const isOnline = (team: Team, id: string) => (team.online.get(id)?.sockets.size ?? 0) > 0;
 
+  /** The owner sees whose token each person used, since anyone can type any name. */
+  const withLabel = (v: MemberView, label: string | null): MemberView => (label ? { ...v, label } : v);
+
   function pendingView(team: Team): MemberView[] {
-    return [...team.pending.values()].map((p) => ({ id: p.id, name: p.name, online: false }));
+    return [...team.pending.values()].map((p) => withLabel({ id: p.id, name: p.name, online: false }, p.label));
   }
 
   /**
    * Builds state frames for one team. The team view is serialized at most four
    * times (owner or not × in the break or not), not once per socket: only the
-   * owner gets the team link and join requests, only participants get the
-   * break's meeting link.
+   * owner gets the team link, join requests and token labels, only
+   * participants get the break's meeting link.
    */
   function framer(team: Team) {
     const serverNow = Date.now();
@@ -617,7 +749,12 @@ export function createHub(opts: HubOptions) {
       let json = cache.get(k);
       if (json === undefined) {
         const v: TeamView = { ...base };
-        if (owner) (v.zoomLink = team.zoomLink), (v.pending = pendingView(team));
+        if (owner) {
+          v.zoomLink = team.zoomLink;
+          v.pending = pendingView(team);
+          const labels = [...team.roster.values()].map((m) => m.label);
+          v.members = base.members.map((m, i) => withLabel(m, labels[i]));
+        }
         if (part) v.brk = brk;
         cache.set(k, (json = JSON.stringify(v)));
       }
@@ -731,6 +868,10 @@ export function createHub(opts: HubOptions) {
     }
     if (!result.effects.length && sameBreak(result.brk, team.brk)) return;
     team.brk = result.brk;
+    if (!team.hadGroupBreak && (team.brk?.participants.length ?? 0) >= 2) {
+      team.hadGroupBreak = true;
+      save();
+    }
     for (const effect of result.effects) runEffect(team, effect);
     schedule(team);
     broadcast(team);
@@ -776,10 +917,46 @@ export function createHub(opts: HubOptions) {
     return taken;
   }
 
-  function ban(team: Team, id: string, label: string | null, reason: BanReason) {
+  function ban(team: Team, id: string, label: string | null, reason: BanReason, until?: number) {
     team.banned.delete(id);
-    team.banned.set(id, { id, label, reason });
+    team.banned.set(id, until ? { id, label, reason, until } : { id, label, reason });
     if (team.banned.size > MAX_BANNED) team.banned.delete(team.banned.keys().next().value!);
+  }
+
+  /** Bans a token label from the team; a removal is never weakened to a denial. */
+  function banLabel(team: Team, label: string, reason: BanReason, until?: number) {
+    if (team.labelBans.get(label)?.reason === 'removed' && reason !== 'removed') return;
+    team.labelBans.delete(label);
+    team.labelBans.set(label, until ? { label, reason, until } : { label, reason });
+    if (team.labelBans.size > MAX_BANNED) team.labelBans.delete(team.labelBans.keys().next().value!);
+  }
+
+  /** A ban that still applies (an expired denial is dropped). */
+  function activeBan<K, B extends { reason: BanReason; until?: number }>(map: Map<K, B>, key: K, now: number): B | null {
+    const b = map.get(key);
+    if (!b) return null;
+    if (b.reason === 'denied' && (b.until ?? 0) <= now) {
+      map.delete(key);
+      save();
+      return null;
+    }
+    return b;
+  }
+
+  /** Drops denials that have run out. True if any were dropped. */
+  function pruneDenials(team: Team, now = Date.now()): boolean {
+    let dropped = false;
+    for (const map of [team.banned, team.labelBans] as Map<string, { reason: BanReason; until?: number }>[]) {
+      for (const [k, b] of map) {
+        if (b.reason === 'denied' && (b.until ?? 0) <= now) (map.delete(k), (dropped = true));
+      }
+    }
+    return dropped;
+  }
+
+  /** The owner's own token label: removing or turning away one of their own devices mustn't ban it. */
+  function ownerLabel(team: Team): string | null {
+    return team.ownerId ? (team.roster.get(team.ownerId)?.label ?? null) : null;
   }
 
   /** Identities (roster and waiting) a token label holds in a team, other than `exceptId`. */
@@ -812,16 +989,10 @@ export function createHub(opts: HubOptions) {
     const entry = team.roster.get(id)!;
     let m = team.online.get(id);
     if (!m) {
-      m = { id, sockets: new Set(), leaveTimer: null, lastInviteAt: -Infinity };
+      m = { id, sockets: new Set(), leaveTimer: null };
       team.online.set(id, m);
     }
     let changed = m.sockets.size === 0;
-    // Teams saved before owners existed: the first person back becomes the owner.
-    if (team.ownerId === null) {
-      team.ownerId = id;
-      changed = true;
-      save();
-    }
     // One person holds a few sockets (the desktop app uses two). More would let one member multiply every broadcast.
     while (m.sockets.size >= limits.maxSocketsPerMember) {
       const oldest: WebSocket = m.sockets.values().next().value!;
@@ -886,8 +1057,8 @@ export function createHub(opts: HubOptions) {
   /** Refuses a create/hello: a fatal error (after `delayMs`), then the socket is closed. */
   function refuse(conn: Conn, ws: WebSocket, message: string, code: ErrorCode | undefined, reason: string, delayMs = 0) {
     conn.state = delayMs ? 'refusing' : 'done';
-    // A stranger can cause these as fast as they can connect: throttled per reason and address.
-    audit('join-failed', { ...who(conn), reason }, { key: `join-failed|${reason}|${conn.key}` });
+    // A stranger can cause these as fast as they can connect: throttled per reason and address (or label).
+    audit('join-failed', { ...who(conn), reason }, { key: `join-failed|${reason}|${conn.limitKey}` });
     const go = () => {
       conn.state = 'done';
       sendError(ws, message, true, code);
@@ -899,28 +1070,35 @@ export function createHub(opts: HubOptions) {
 
   function onHello(conn: Conn, ws: WebSocket, msg: Record<string, unknown>) {
     if (conn.state !== 'new') return;
-    const access = tokens.check(msg.token);
-    if (!access) {
-      return refuse(conn, ws, 'This hub needs an access token. Ask whoever runs it.', 'unauthorized', 'unauthorized');
+    // The token was checked before the socket was accepted; one in the message must be that same token.
+    if (tokens.required && msg.token !== undefined && !tokens.sameToken(msg.token, conn.tokenDigest)) {
+      return refuse(conn, ws, "This hub needs an access token. Ask whoever runs it.", 'unauthorized', 'token-mismatch');
     }
-    conn.label = access.label;
-    conn.tokenDigest = access.digest;
     const clientId = typeof msg.clientId === 'string' ? msg.clientId : '';
     if (!CLIENT_ID.test(clientId)) return refuse(conn, ws, 'Invalid client id.', undefined, 'invalid-client-id');
+    // Identified connections have their own caps, which unidentified ones can't use up.
+    if (joinedTotal >= limits.maxConnections) {
+      limitHit('connections-total', conn, '*');
+      return refuse(conn, ws, 'This server is busy. Try again later.', 'full', 'connections-total');
+    }
+    if ((joinedCounts.get(conn.limitKey) ?? 0) >= limits.connectionsPerIp) {
+      const kind = conn.label ? 'connections-per-label' : 'connections-per-ip';
+      limitHit(kind, conn, conn.limitKey);
+      return refuse(conn, ws, 'Too many connections from here. Try again later.', 'rate-limited', kind);
+    }
     const name = cleanName(msg.name, 'Someone');
     if (msg.type === 'create') createTeam(conn, ws, clientId, name, msg.teamName);
     else joinTeam(conn, ws, clientId, name, msg.teamCode);
   }
 
   function createTeam(conn: Conn, ws: WebSocket, clientId: string, name: string, teamName: unknown) {
-    if (!creates.take(conn.key)) {
-      limitHit('creates-per-ip', conn, conn.key);
-      return refuse(conn, ws, 'Too many new teams. Try again later.', 'rate-limited', 'creates-per-ip');
-    }
-    // People with their own token have their own quota; the hub-wide one is for everyone else.
-    if (conn.label ? !createsPerLabel.take(conn.label) : !createsGlobal.take('*')) {
-      limitHit(conn.label ? 'creates-per-label' : 'creates-global', conn, conn.label ?? '*');
-      return refuse(conn, ws, 'Too many new teams on this server. Try again later.', 'rate-limited', conn.label ? 'creates-per-label' : 'creates-global');
+    // People with their own token have their own quota; the per-address and hub-wide ones are for everyone else.
+    const why = conn.label
+      ? !createsPerLabel.take(conn.label) && 'creates-per-label'
+      : (!creates.take(conn.key) && 'creates-per-ip') || (!createsGlobal.take('*') && 'creates-global');
+    if (why) {
+      limitHit(why, conn, why === 'creates-global' ? '*' : conn.limitKey);
+      return refuse(conn, ws, 'Too many new teams. Try again later.', 'rate-limited', why);
     }
     if (!roomForTeam()) {
       limitHit('teams-full', conn, '*');
@@ -941,6 +1119,8 @@ export function createHub(opts: HubOptions) {
       requireApproval: true,
       roster: new Map([[ownerId, { id: ownerId, name, label: conn.label }]]),
       banned: new Map(),
+      labelBans: new Map(),
+      hadGroupBreak: false,
       pending: new Map(),
       online: new Map(),
       lastActive: Date.now(),
@@ -957,10 +1137,30 @@ export function createHub(opts: HubOptions) {
     join(conn, ws, team, ownerId, name);
   }
 
+  /** Moves a connection from the unidentified count to the identified one. */
+  function identify(conn: Conn) {
+    leavePool(conn);
+    conn.pool = 'joined';
+    inc(joinedCounts, conn.limitKey);
+    joinedTotal++;
+  }
+
+  function leavePool(conn: Conn) {
+    if (conn.pool === 'pre') {
+      dec(preCounts, conn.preKey);
+      preTotal--;
+    } else if (conn.pool === 'joined') {
+      dec(joinedCounts, conn.limitKey);
+      joinedTotal--;
+    }
+    conn.pool = null;
+  }
+
   function join(conn: Conn, ws: WebSocket, team: Team, id: string, name: string) {
     clearTimeout(conn.helloTimer);
     conn.state = 'joined';
     conn.team = team;
+    identify(conn);
     conn.me = attach(team, ws, conn, id, name);
   }
 
@@ -969,46 +1169,58 @@ export function createHub(opts: HubOptions) {
     const current = code ? codes.get(code) : undefined;
     const team = current ?? (code ? aliasCodes.get(code) : undefined);
     const id = team ? publicId(team.idSalt, clientId) : '';
-    const onRoster = !!team && team.roster.has(id);
+    const entry = team?.roster.get(id);
+    // A roster entry made under a per-person token belongs to that token's label: no other
+    // token (a colleague's, a shared one, none) can use it, so revoking the label cuts it off.
+    if (entry?.label && entry.label !== conn.label) {
+      return refuse(conn, ws, 'This device joined the team with a different access token. Use that one.', 'unauthorized', 'label-mismatch', limits.badCodeDelayMs);
+    }
+    const onRoster = !!entry;
     // Someone on the roster with a right (or recent) code isn't guessing: the lockout doesn't apply to them.
-    if (badCodes.blocked(conn.key) && !onRoster) {
-      limitHit('bad-codes', conn, conn.key);
+    if (badCodes.blocked(conn.limitKey) && !onRoster) {
+      limitHit('bad-codes', conn, conn.limitKey);
       return refuse(conn, ws, 'Too many wrong invite codes. Try again in a few minutes.', 'rate-limited', 'locked-out', limits.badCodeDelayMs);
     }
     // An old code only lets the roster straight in; from anyone else it's wrong. One exception:
     // a short code from before rosters existed, on a team whose owner hasn't replaced the code
-    // since, counts as a request the owner can turn down. That's how teammates from before the
-    // upgrade get back in instead of being told their team is gone. (Teams saved before owners
-    // existed have nobody to let people in, so there the first one back still gets in.)
+    // since, counts as a join request the owner can approve or turn down. That's how teammates
+    // from before the upgrade get back in instead of being told their team is gone.
     const legacyRequest =
       !!team && team.requireApproval && code.length < CODE_LENGTH && team.aliases.length === 1 && team.aliases[0] === code;
-    if (!team || (!current && !onRoster && team.ownerId !== null && !legacyRequest)) {
-      badCodes.take(conn.key);
+    if (!team || (!current && !onRoster && !legacyRequest)) {
+      badCodes.take(conn.limitKey);
       return refuse(conn, ws, 'No team with that invite code.', 'bad-code', 'bad-code', limits.badCodeDelayMs);
     }
-    const banned = team.banned.get(id);
+    const now = Date.now();
+    const banned = activeBan(team.banned, id, now);
     if (banned) return refuseBanned(conn, ws, banned.reason);
+    // A label that was removed (or, for a while, turned away) can't come back as a "new device".
+    const labelBan = conn.label && !onRoster ? activeBan(team.labelBans, conn.label, now) : null;
+    if (labelBan) return refuseBanned(conn, ws, labelBan.reason);
     if (onRoster) {
+      if (team.ownerId === null) return refuseOwnerless(conn, ws, team);
       join(conn, ws, team, id, name);
       return audit('join', { ...who(conn), team: team.ref, member: id, name: team.roster.get(id)!.name }, { key: `join|${team.ref}|${id}` });
     }
 
-    // Someone new, with the current code.
-    if (conn.label) {
-      // A person removed under their own token can't come back as a "new device".
-      const labelBan = [...team.banned.values()].find((b) => b.label === conn.label);
-      if (labelBan) return refuseBanned(conn, ws, labelBan.reason);
-      if (identitiesOf(team, conn.label, id) >= limits.identitiesPerLabel) {
-        limitHit('identities-per-label', conn, `${team.ref}|${conn.label}`);
-        return refuse(conn, ws, 'Too many devices on this team for your access token. Ask the owner to remove an old one.', 'full', 'identities-per-label');
-      }
+    // Someone new.
+    if (conn.label && identitiesOf(team, conn.label, id) >= limits.identitiesPerLabel) {
+      limitHit('identities-per-label', conn, `${team.ref}|${conn.label}`);
+      return refuse(conn, ws, 'Too many devices on this team for your access token. Ask the owner to remove an old one.', 'full', 'identities-per-label');
     }
     if (team.roster.size >= limits.maxMembersPerTeam) {
       limitHit('members-per-team', conn, team.ref);
       return refuse(conn, ws, 'This team is full.', 'full', 'team-full');
     }
-    // An ownerless team (saved before owners existed) has nobody to approve: the first one in becomes the owner.
-    if (team.requireApproval && team.ownerId !== null) return requestToJoin(conn, ws, team, id, name);
+    // A team saved before owners existed has nobody to let people in: they wait for the hub admin.
+    if (team.ownerId === null) {
+      if (recordRequest(conn, ws, team, id, name)) refuseOwnerless(conn, ws, team);
+      return;
+    }
+    if (team.requireApproval) {
+      if (!recordRequest(conn, ws, team, id, name)) return;
+      return refuse(conn, ws, "The team's owner needs to let you in. Ask them, then try again.", 'pending', 'pending');
+    }
     addToRoster(team, id, name, conn.label);
     join(conn, ws, team, id, name);
     audit('join', { ...who(conn), team: team.ref, member: id, name: team.roster.get(id)!.name, first: true });
@@ -1016,36 +1228,62 @@ export function createHub(opts: HubOptions) {
 
   function refuseBanned(conn: Conn, ws: WebSocket, reason: BanReason) {
     return reason === 'denied'
-      ? refuse(conn, ws, "The team's owner didn't let you in.", 'denied', 'denied', limits.badCodeDelayMs)
+      ? refuse(conn, ws, "The team's owner didn't let you in. You can ask again tomorrow.", 'denied', 'denied', limits.badCodeDelayMs)
       : refuse(conn, ws, 'You were removed from this team.', 'removed', 'removed', limits.badCodeDelayMs);
   }
 
-  /** Approval is on: record (or keep) a request for the owner, and tell the joiner to wait. */
-  function requestToJoin(conn: Conn, ws: WebSocket, team: Team, id: string, name: string) {
+  /** Nobody gets into an ownerless team (keep it, try later) until an admin runs `admin.ts set-owner`. */
+  function refuseOwnerless(conn: Conn, ws: WebSocket, team: Team) {
+    if (!ownerlessLogged.has(team)) {
+      ownerlessLogged.add(team);
+      audit('ownerless-team', { team: team.ref, fix: 'node server/admin.ts list, then set-owner <team-ref> <member-id>' });
+    }
+    refuse(conn, ws, 'This team has no owner, so nobody can let you in. Ask whoever runs the hub to make someone its owner.', 'pending', 'ownerless');
+  }
+
+  /**
+   * Records (or keeps) a join request for the owner. False if it was refused
+   * for being over a limit (the refusal is already on its way).
+   */
+  function recordRequest(conn: Conn, ws: WebSocket, team: Team, id: string, name: string): boolean {
     const now = Date.now();
     if (prunePending(team, now)) (save(), broadcast(team));
-    if (!team.pending.has(id)) {
-      let fromHere = 0;
-      for (const p of team.pending.values()) if (p.addr === conn.key) fromHere++;
-      const why =
-        team.pending.size >= limits.maxPending ? 'pending-full' : fromHere >= limits.pendingPerIp ? 'pending-per-ip' : !joinRequests.take(conn.key) ? 'pending-rate' : null;
-      if (why) {
-        limitHit(why, conn, why === 'pending-full' ? team.ref : conn.key);
-        return refuse(conn, ws, 'Too many people are waiting to join this team. Try again later.', 'rate-limited', why);
-      }
-      // Waiting names can't pass for someone on the roster (or another waiting person) either.
-      const taken = rosterNames(team);
-      for (const p of team.pending.values()) taken.add(nameKey(p.name));
-      const entry = { id, name: uniqueName(taken, name), label: conn.label, at: now, addr: conn.key };
-      team.pending.set(id, entry);
-      save();
-      broadcast(team);
-      audit('join-requested', { ...who(conn), team: team.ref, member: id, name: entry.name }, { key: `join-requested|${conn.key}` });
+    if (team.pending.has(id)) return true;
+    let fromHere = 0;
+    for (const p of team.pending.values()) if (p.addr === conn.limitKey) fromHere++;
+    const why =
+      team.pending.size >= limits.maxPending
+        ? 'pending-full'
+        : fromHere >= limits.pendingPerIp
+          ? 'pending-per-ip'
+          : !joinRequests.take(conn.limitKey)
+            ? 'pending-rate'
+            : null;
+    if (why) {
+      limitHit(why, conn, why === 'pending-full' ? team.ref : conn.limitKey);
+      refuse(conn, ws, 'Too many people are waiting to join this team. Try again later.', 'rate-limited', why);
+      return false;
     }
-    refuse(conn, ws, "The team's owner needs to let you in. Ask them, then try again.", 'pending', 'pending');
+    // Waiting names can't pass for someone on the roster (or another waiting person) either.
+    const taken = rosterNames(team);
+    for (const p of team.pending.values()) taken.add(nameKey(p.name));
+    const entry = { id, name: uniqueName(taken, name), label: conn.label, at: now, addr: conn.limitKey };
+    team.pending.set(id, entry);
+    save();
+    broadcast(team);
+    audit('join-requested', { ...who(conn), team: team.ref, member: id, name: entry.name }, { key: `join-requested|${conn.limitKey}` });
+    return true;
   }
 
   // ── Owner actions ──────────────────────────────────────────────────────
+
+  /** Rate limits an owner action (per team and owner). False, after telling them, when over. */
+  function ownerMay(limiter: WindowLimiter, team: Team, me: Member, ws: WebSocket, conn: Conn): boolean {
+    if (limiter.take(`${team.ref}|${me.id}`)) return true;
+    limitHit('owner-actions', conn, `${team.ref}|${me.id}`);
+    sendError(ws, 'Slow down: try that again in a minute.');
+    return false;
+  }
 
   function settings(team: Team, me: Member, ws: WebSocket, conn: Conn, msg: Record<string, unknown>) {
     if (me.id !== team.ownerId) return sendError(ws, 'Only the team owner can change settings.');
@@ -1088,37 +1326,59 @@ export function createHub(opts: HubOptions) {
     // Nothing changed, nothing sent: a no-op must not cost a broadcast.
     if (!changed.length) return;
     save();
-    audit('settings', { ...who(conn), team: team.ref, member: me.id, changed }, ownerThrottle('settings', team, me));
+    audit('settings', { ...who(conn), team: team.ref, member: me.id, changed }, settingsThrottle(team, me));
     broadcast(team);
   }
 
   function rotateCode(team: Team, me: Member, ws: WebSocket, conn: Conn) {
     if (me.id !== team.ownerId) return sendError(ws, 'Only the team owner can change the invite code.');
+    if (!ownerMay(ownerActions, team, me, ws, conn)) return;
     replaceCode(team);
     save();
-    audit('rotate-code', { ...who(conn), team: team.ref, member: me.id }, ownerThrottle('rotate-code', team, me));
+    audit('rotate-code', { ...who(conn), team: team.ref, member: me.id }, ownerThrottle(team, me));
     broadcast(team);
   }
 
-  /** Takes anyone on the roster (online or not) off the team for good, and replaces the code they know. */
+  /**
+   * Takes someone on the roster (online or not) off the team for good, and
+   * replaces the code they know. Someone with a per-person token is removed as
+   * a person: every identity under that label goes, and the label is banned,
+   * all before the new code goes out. (Not the owner's own label: then it's
+   * one old device of theirs.)
+   */
   function removeMember(team: Team, me: Member, ws: WebSocket, conn: Conn, msg: Record<string, unknown>) {
     if (me.id !== team.ownerId) return sendError(ws, 'Only the team owner can remove people.');
     const id = typeof msg.id === 'string' ? msg.id : '';
     if (id === me.id) return sendError(ws, "You can't remove yourself.");
     const entry = PUBLIC_ID.test(id) ? team.roster.get(id) : undefined;
     if (!entry) return sendError(ws, 'No such member.');
+    if (!ownerMay(ownerActions, team, me, ws, conn)) return;
 
-    team.roster.delete(id);
-    ban(team, id, entry.label, 'removed');
-    // Their sockets are closed before anything is broadcast, so the new code never reaches them.
-    disconnectMember(team, id, 'You were removed from this team.', 'removed');
+    const label = entry.label && entry.label !== ownerLabel(team) ? entry.label : null;
+    const gone = label ? [...team.roster.values()].filter((m) => m.label === label) : [entry];
+    for (const m of gone) {
+      team.roster.delete(m.id);
+      ban(team, m.id, m.label, 'removed');
+      // Their sockets are closed before anything is broadcast, so the new code never reaches them.
+      disconnectMember(team, m.id, 'You were removed from this team.', 'removed');
+    }
+    if (label) {
+      banLabel(team, label, 'removed');
+      for (const p of team.pending.values()) if (p.label === label) team.pending.delete(p.id);
+    }
     replaceCode(team);
     save();
-    audit('remove-member', { ...who(conn), team: team.ref, member: me.id, removed: id, removedLabel: entry.label ?? undefined });
-    apply(team, machine.leave(team.brk, id, Date.now()));
+    const also = gone.filter((m) => m.id !== id).map((m) => m.id);
+    audit(
+      'remove-member',
+      { ...who(conn), team: team.ref, member: me.id, removed: id, removedLabel: entry.label ?? undefined, alsoRemoved: also.length ? also : undefined },
+      ownerThrottle(team, me),
+    );
+    for (const m of gone) apply(team, machine.leave(team.brk, m.id, Date.now()));
     broadcast(team);
   }
 
+  /** Lets a waiting person in, or turns them away: they (and their label) can't ask again for `denyMs`. */
   function approveMember(team: Team, me: Member, ws: WebSocket, conn: Conn, msg: Record<string, unknown>) {
     if (me.id !== team.ownerId) return sendError(ws, 'Only the team owner can let people in.');
     if (typeof msg.allow !== 'boolean') return sendError(ws, 'allow must be true or false.');
@@ -1126,14 +1386,20 @@ export function createHub(opts: HubOptions) {
     prunePending(team);
     const entry = team.pending.get(id);
     if (!entry) return sendError(ws, 'No such request.');
+    if (msg.allow && team.roster.size >= limits.maxMembersPerTeam) return sendError(ws, 'The team is full.');
+    if (!ownerMay(approvals, team, me, ws, conn)) return;
     if (msg.allow) {
-      if (team.roster.size >= limits.maxMembersPerTeam) return sendError(ws, 'The team is full.');
       addToRoster(team, id, entry.name, entry.label);
-      audit('approve-member', { ...who(conn), team: team.ref, member: me.id, approved: id, approvedLabel: entry.label ?? undefined });
+      audit('approve-member', { ...who(conn), team: team.ref, member: me.id, approved: id, approvedLabel: entry.label ?? undefined }, ownerThrottle(team, me));
     } else {
+      const until = Date.now() + limits.denyMs;
       team.pending.delete(id);
-      ban(team, id, entry.label, 'denied');
-      audit('deny-member', { ...who(conn), team: team.ref, member: me.id, denied: id, deniedLabel: entry.label ?? undefined });
+      ban(team, id, entry.label, 'denied', until);
+      if (entry.label && entry.label !== ownerLabel(team)) {
+        banLabel(team, entry.label, 'denied', until);
+        for (const p of team.pending.values()) if (p.label === entry.label) team.pending.delete(p.id);
+      }
+      audit('deny-member', { ...who(conn), team: team.ref, member: me.id, denied: id, deniedLabel: entry.label ?? undefined }, ownerThrottle(team, me));
     }
     save();
     broadcast(team);
@@ -1144,9 +1410,10 @@ export function createHub(opts: HubOptions) {
     const id = typeof msg.id === 'string' ? msg.id : '';
     if (id === me.id) return sendError(ws, 'You already own this team.');
     if (!PUBLIC_ID.test(id) || !team.roster.has(id)) return sendError(ws, 'No such member.');
+    if (!ownerMay(ownerActions, team, me, ws, conn)) return;
     team.ownerId = id;
     save();
-    audit('transfer-owner', { ...who(conn), team: team.ref, member: me.id, to: id });
+    audit('transfer-owner', { ...who(conn), team: team.ref, member: me.id, to: id }, ownerThrottle(team, me));
     broadcast(team);
   }
 
@@ -1157,12 +1424,16 @@ export function createHub(opts: HubOptions) {
     const self = { id: me.id, name: team.roster.get(me.id)?.name ?? '' };
     switch (msg.type) {
       case 'invite': {
-        const starting = !machine.isActive(team.brk);
-        if (starting && now - me.lastInviteAt < limits.breakCooldownMs) {
-          limitHit('break-cooldown', conn, me.id);
-          return sendError(ws, 'Wait a few seconds before starting another break.');
+        if (!machine.isActive(team.brk)) {
+          // Per roster entry (so reconnecting doesn't reset it) and per label (so extra devices don't multiply it).
+          const keys = [`id|${team.ref}|${me.id}`];
+          if (conn.label) keys.push(`label|${team.ref}|${conn.label}`);
+          if (keys.some((k) => breakStarts.blocked(k, now))) {
+            limitHit('break-cooldown', conn, keys.at(-1));
+            return sendError(ws, 'Wait a few seconds before starting another break.');
+          }
+          for (const k of keys) breakStarts.take(k, now);
         }
-        if (starting) me.lastInviteAt = now;
         return apply(team, machine.invite(team.brk, self, team.defaultLengthMin, now, randomUUID(), MINUTE_MS), ws);
       }
       case 'setLength':
@@ -1189,70 +1460,125 @@ export function createHub(opts: HubOptions) {
 
   // ── Sockets ────────────────────────────────────────────────────────────
 
-  /** The message budget shared by every socket from one address. */
-  function addressBucket(key: string): TokenBucket {
-    let b = addressBuckets.get(key);
-    if (b) addressBuckets.delete(key);
+  /** The message budget shared by every identified socket of one label, or (without a label) one address. */
+  function messageBucket(key: string): TokenBucket {
+    let b = messageBuckets.get(key);
+    if (b) messageBuckets.delete(key);
     else b = new TokenBucket(limits.addressMessageBurst, limits.addressMessagesPerSecond);
-    addressBuckets.set(key, b); // most recently used last
-    if (addressBuckets.size > MAX_ADDRESS_BUCKETS) addressBuckets.delete(addressBuckets.keys().next().value!);
+    messageBuckets.set(key, b); // most recently used last
+    if (messageBuckets.size > MAX_ADDRESS_BUCKETS) messageBuckets.delete(messageBuckets.keys().next().value!);
     return b;
+  }
+
+  function parseMessage(raw: RawData, isBinary: boolean): Record<string, unknown> | null {
+    if (isBinary) return null;
+    let data: unknown;
+    try {
+      data = JSON.parse(String(raw));
+    } catch {
+      return null;
+    }
+    return data && typeof data === 'object' && !Array.isArray(data) ? (data as Record<string, unknown>) : null;
   }
 
   function onMessage(conn: Conn, ws: WebSocket, raw: RawData, isBinary: boolean, bucket: TokenBucket) {
     if (conn.state === 'done' || conn.state === 'refusing') return;
-    if (!bucket.take() || !addressBucket(conn.key).take()) {
+    if (conn.state === 'new') {
+      // Not identified yet: a create/hello, or a couple of anything else, and nothing is
+      // charged to a budget an identified socket depends on.
+      const msg = parseMessage(raw, isBinary);
+      if (msg && (msg.type === 'create' || msg.type === 'hello')) return onHello(conn, ws, msg);
+      if (++conn.preMsgs > limits.messagesBeforeHello) {
+        limitHit('messages-before-hello', conn, conn.preKey);
+        conn.state = 'done';
+        ws.close(1008, 'Say hello first');
+      }
+      return;
+    }
+    // Only a socket's own flooding closes it.
+    if (!bucket.take()) {
       if (++conn.dropped > MAX_DROPPED_MESSAGES) {
-        limitHit('message-flood', conn, conn.key);
+        limitHit('message-flood', conn, conn.limitKey);
         conn.state = 'done';
         ws.close(1008, 'Too many messages');
       }
       return;
     }
-    if (isBinary) return;
-    let data: unknown;
-    try {
-      data = JSON.parse(String(raw));
-    } catch {
-      return;
-    }
-    if (!data || typeof data !== 'object' || Array.isArray(data)) return;
-    const msg = data as Record<string, unknown>;
-    if (msg.type === 'create' || msg.type === 'hello') return onHello(conn, ws, msg);
-    if (conn.state === 'joined' && conn.team && conn.me) handle(conn, ws, msg);
+    // The shared budget: running out of it drops the message, but never closes the socket.
+    if (!messageBucket(conn.limitKey).take()) return limitHit('message-budget', conn, conn.limitKey);
+    const msg = parseMessage(raw, isBinary);
+    if (msg && conn.team && conn.me) handle(conn, ws, msg);
   }
 
-  /** After the tokens file changed: connections whose token is gone are closed. */
+  /** After the tokens file was read again (or turned out broken): connections whose token is gone are closed. */
   function closeRevoked(valid: (label: string | null, digest: Buffer | null) => boolean) {
+    const message = tokens.broken
+      ? "The hub can't check access tokens right now. Try again later."
+      : 'Your access to this hub was revoked.';
     for (const [ws, conn] of conns) {
-      if (conn.state !== 'joined' || valid(conn.label, conn.tokenDigest)) continue;
+      if ((conn.state !== 'joined' && conn.state !== 'new') || valid(conn.label, conn.tokenDigest)) continue;
       conn.state = 'done';
       audit('token-revoked', { ...who(conn), team: conn.team?.ref }, { key: `token-revoked|${conn.label}`, perMinute: 1 });
-      sendError(ws, 'Your access to this hub was revoked.', true, 'unauthorized');
+      sendError(ws, message, true, 'unauthorized');
       ws.close(1008, 'unauthorized');
     }
   }
 
-  function onConnection(ws: WebSocket, ip: string, key: string) {
+  function onTokensChange(change: TokensChange) {
+    closeRevoked(change.valid);
+    if (change.present) forgetLabels(change.present, change.revoked);
+  }
+
+  /**
+   * Labels no longer in the tokens file: their join requests are dropped, and
+   * teams they own are reported so an admin can hand them over (`revoked` null:
+   * at startup, report every such team).
+   */
+  function forgetLabels(present: Set<string>, revoked: string[] | null) {
+    if (revoked && !revoked.length) return;
+    for (const team of teams) {
+      let dropped = false;
+      for (const p of team.pending.values()) {
+        if (p.label && !present.has(p.label)) (team.pending.delete(p.id), (dropped = true));
+      }
+      if (dropped) (save(), broadcast(team));
+      const label = ownerLabel(team);
+      if (label && !present.has(label) && (!revoked || revoked.includes(label))) {
+        audit('owner-token-revoked', {
+          team: team.ref,
+          owner: team.ownerId,
+          label,
+          fix: `node server/admin.ts set-owner ${team.ref} <member-id> (see: node server/admin.ts list)`,
+        });
+      }
+    }
+  }
+
+  function onConnection(ws: WebSocket, ip: string, key: string, preKey: string, access: { label: string | null; digest: Buffer | null }) {
     const conn: Conn = {
       ip,
       key,
+      limitKey: access.label ? `label:${access.label}` : key,
+      preKey,
+      pool: 'pre',
+      preMsgs: 0,
       alive: true,
       state: 'new',
       team: null,
       me: null,
-      label: null,
-      tokenDigest: null,
+      label: access.label,
+      tokenDigest: access.digest,
       dropped: 0,
-      // A socket that never says who it is would otherwise hold a connection slot forever.
+      // A socket that never says who it is would otherwise hold a connection slot.
       helloTimer: setTimeout(() => {
         if (conn.state !== 'new') return;
-        limitHit('hello-timeout', conn, key);
+        limitHit('hello-timeout', conn, preKey);
         ws.terminate();
       }, limits.helloTimeoutMs),
     };
     conns.set(ws, conn);
-    connectionsPerKey.set(key, (connectionsPerKey.get(key) ?? 0) + 1);
+    inc(preCounts, preKey);
+    preTotal++;
     const bucket = new TokenBucket(limits.messageBurst, limits.messagesPerSecond);
     // e.g. an oversized frame. ws closes the socket itself; without a listener the error would crash the hub.
     ws.on('error', () => {});
@@ -1262,9 +1588,7 @@ export function createHub(opts: HubOptions) {
       guard(() => {
         clearTimeout(conn.helloTimer);
         conns.delete(ws);
-        const n = (connectionsPerKey.get(key) ?? 1) - 1;
-        if (n > 0) connectionsPerKey.set(key, n);
-        else connectionsPerKey.delete(key);
+        leavePool(conn);
         const { team, me } = conn;
         // Removed members were already taken out; don't touch whoever has their slot now.
         if (team && me && team.online.get(me.id) === me) detach(team, me, ws);
@@ -1295,7 +1619,10 @@ export function createHub(opts: HubOptions) {
   const housekeeping = setInterval(
     () =>
       guard(() => {
-        for (const team of teams) if (prunePending(team)) (save(), broadcast(team));
+        for (const team of teams) {
+          if (prunePending(team)) (save(), broadcast(team));
+          if (pruneDenials(team)) save();
+        }
       }),
     limits.housekeepingMs,
   );
@@ -1312,7 +1639,16 @@ export function createHub(opts: HubOptions) {
     /** Writes the audit log's suppressed-lines summary now. */
     summarizeAudit: () => auditLog.summarize(),
     /** Numbers for tests and the startup line. */
-    stats: () => ({ teams: teams.size, connections: conns.size, tokenLabels: tokens.labels, tokensRequired: tokens.required }),
+    stats: () => ({
+      teams: teams.size,
+      connections: conns.size,
+      identified: joinedTotal,
+      unidentified: preTotal,
+      tokenLabels: tokens.labels,
+      tokensRequired: tokens.required,
+      tokensBroken: tokens.broken !== null,
+      proxySecret: !!proxyDigest,
+    }),
     /** Stops timers, closes every socket and writes any pending save. */
     close() {
       if (closed) return;
@@ -1341,21 +1677,38 @@ export function createHub(opts: HubOptions) {
       socket.on('error', () => {});
       try {
         if (closed) return reject(socket, '503 Service Unavailable');
-        const ip = clientAddress(req, trusted);
+        // With a proxy secret, only the proxy gets in: nobody can connect around it or fake X-Forwarded-For.
+        if (proxyDigest) {
+          const given = req.headers[PROXY_HEADER];
+          if (typeof given !== 'string' || !timingSafeEqual(sha256(given), proxyDigest)) {
+            const peer = req.socket.remoteAddress ?? 'unix';
+            limitHit('proxy-secret', { ip: peer }, peer);
+            return reject(socket, '403 Forbidden');
+          }
+        }
+        const ip = clientAddress(req, trusted, opts.unixSocket ?? false);
         const key = addressKey(ip);
         if (!isAllowedHost(req.headers.host, policy) || !isAllowedOrigin(req.headers.origin, req.headers.host, policy)) {
           limitHit('origin', { ip }, key);
           return reject(socket, '403 Forbidden');
         }
-        if (conns.size >= limits.maxConnections) {
-          limitHit('connections-total', { ip }, '*');
+        // The token comes with the upgrade (as a subprotocol), so strangers never get a socket.
+        const access = tokens.check(tokens.required ? tokenFromProtocols(offeredProtocols(req)) : undefined);
+        if (!access) {
+          limitHit('unauthorized', { ip }, key);
+          return reject(socket, '401 Unauthorized');
+        }
+        // Until create/hello, a connection only counts against these small, separate budgets.
+        const preKey = access.label ? `label:${access.label}` : addressKey(ip, 56);
+        if (preTotal >= limits.maxUnidentified) {
+          limitHit('unidentified-total', { ip, label: access.label }, '*');
           return reject(socket, '503 Service Unavailable');
         }
-        if ((connectionsPerKey.get(key) ?? 0) >= limits.connectionsPerIp) {
-          limitHit('connections-per-ip', { ip }, key);
+        if ((preCounts.get(preKey) ?? 0) >= limits.unidentifiedPerIp) {
+          limitHit('unidentified-per-ip', { ip, label: access.label }, preKey);
           return reject(socket, '429 Too Many Requests');
         }
-        wss.handleUpgrade(req, socket, head, (ws) => guard(() => onConnection(ws, ip, key)));
+        wss.handleUpgrade(req, socket, head, (ws) => guard(() => onConnection(ws, ip, key, preKey, access)));
       } catch (err) {
         console.error('[smoke-break] internal error during upgrade (ignored):', err);
         socket.destroy();

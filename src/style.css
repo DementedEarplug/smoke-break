@@ -287,6 +287,22 @@ body {
   color: var(--muted);
 }
 
+/* The access-token label: who someone really is, so it stands out more than the name they typed. */
+.sb-label {
+  margin-left: 6px;
+  padding: 0 4px;
+  font-size: 11px;
+  font-weight: bold;
+  color: var(--ink);
+  border: 1px solid var(--ink);
+  background: var(--paper);
+  overflow-wrap: anywhere;
+}
+
+.sb-notice-action {
+  margin: 6px 0 0;
+}
+
 .sb-waiting .sb-field-label {
   margin-top: 0;
 }

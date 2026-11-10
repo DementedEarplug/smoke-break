@@ -66,6 +66,15 @@ function start(first: JoinMsg, joining: boolean, hub = platform.currentHub()) {
         }
         panel.setNotice(`${message} Trying again in ${Math.round(retryInMs / 1000)} s.`);
       },
+      onCantConnect(message, withToken) {
+        // Probably a token the hub refused at the door, possibly just the
+        // network. Keep backing off, say so, and offer to fix the token.
+        const teamCode = platform.savedTeam(hub) || (first.type === 'hello' ? first.teamCode : '');
+        panel.setNotice(message, {
+          label: withToken ? 'Change access token' : 'Enter access token',
+          run: () => onboard(message, { teamCode, askToken: true }),
+        });
+      },
       onPending() {
         // The session saved the team and keeps asking; the overlay picks it up
         // and waits quietly (hidden) too.

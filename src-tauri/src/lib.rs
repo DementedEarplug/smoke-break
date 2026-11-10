@@ -1,7 +1,8 @@
 // Smoke Break desktop shell: a transparent always-on-top overlay window (the
 // pack), a "Team & settings" window, and a tray menu. All app logic lives in
 // the web frontend; this file only wires up windows, the tray, autostart,
-// opening meeting links, and keeping hub access tokens in the Keychain.
+// opening meeting links, and keeping hub access tokens and the device secret
+// in the Keychain.
 
 mod meeting;
 mod token;
@@ -66,13 +67,41 @@ async fn token_set(app: AppHandle, hub: String, token: String) -> Result<(), Str
         .map_err(|e| e.to_string())?
 }
 
+/// The device secret client ids are derived from (see `token.rs`), or None.
+#[tauri::command]
+async fn device_secret_get(app: AppHandle) -> Result<Option<String>, String> {
+    let service = app.config().identifier.clone();
+    tauri::async_runtime::spawn_blocking(move || token::secret_get(&service))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Stores the device secret in a new Keychain item (once per run; later calls
+/// get the stored one back) and returns the secret now in use.
+#[tauri::command]
+async fn device_secret_create(app: AppHandle, secret: String) -> Result<String, String> {
+    token::check_secret(&secret)?;
+    let service = app.config().identifier.clone();
+    tauri::async_runtime::spawn_blocking(move || token::secret_create(&service, &secret))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         // A second launch just opens the settings window of the running one.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_panel(app.clone())))
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))
-        .invoke_handler(tauri::generate_handler![set_dnd, show_panel, open_meeting, token_get, token_set])
+        .invoke_handler(tauri::generate_handler![
+            set_dnd,
+            show_panel,
+            open_meeting,
+            token_get,
+            token_set,
+            device_secret_get,
+            device_secret_create
+        ])
         .setup(|app| {
             // Menu-bar app: no Dock icon or app switcher entry.
             #[cfg(target_os = "macos")]

@@ -1,6 +1,6 @@
 // Item 3: per-person access tokens: labels, revocation, bans and quotas per label.
 
-import { chmodSync, writeFileSync } from 'node:fs';
+import { chmodSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { parseTokensFile } from './accessTokens.ts';
@@ -43,6 +43,13 @@ describe('tokens file format (item 3)', () => {
     expect(message).not.toContain(ALICE_TOKEN);
   });
 
+  it('refuses to start with both a shared token and a tokens file (item 1)', () => {
+    expect(() => h.start({ accessTokensFile: tokensFile(ALL), accessToken: SHARED })).toThrow(
+      /SMOKE_BREAK_ACCESS_TOKENS_FILE and SMOKE_BREAK_ACCESS_TOKEN are both set/,
+    );
+    h.start();
+  });
+
   it('refuses to start with a file others can read, or a malformed one', () => {
     expect(() => h.start({ accessTokensFile: tokensFile(ALL, 0o644) })).toThrow(/other users.*chmod 600/);
     expect(() => h.start({ accessTokensFile: tokensFile('alice:x') })).toThrow(/SMOKE_BREAK_ACCESS_TOKENS_FILE: line 1/);
@@ -52,15 +59,16 @@ describe('tokens file format (item 3)', () => {
 });
 
 describe('per-person tokens on the hub (item 3)', () => {
-  it('lets in any listed token or the shared one, and logs the label, never the token', async () => {
-    h.start({ accessTokensFile: tokensFile(ALL), accessToken: SHARED });
+  it('lets in any listed token, and logs the label, never the token', async () => {
+    h.start({ accessTokensFile: tokensFile(ALL) });
     const { msg } = await h.create('alice-client-id-0000000', 'Alice', 'T', undefined, ALICE_TOKEN);
     const code = (msg as StateMsg).team.code;
-    expect((await h.hello(code, 'shared-client-id-000000', 'S', undefined, SHARED)).msg).toMatchObject({ code: 'pending' });
-    expect((await h.hello(code, 'nobody-client-id-000000', 'N', undefined, 'not-a-token-at-all-000000')).msg).toMatchObject({ code: 'unauthorized' });
+    expect((await h.hello(code, 'bob-client-id-000000000', 'B', undefined, BOB_TOKEN)).msg).toMatchObject({ code: 'pending' });
+    await expect(h.connect({}, 'not-a-token-at-all-000000')).rejects.toThrow(/401/);
+    await expect(h.connect({}, SHARED)).rejects.toThrow(/401/);
     const lines = h.logs.map((l) => JSON.parse(l));
     expect(lines.find((l) => l.event === 'create')).toMatchObject({ label: 'alice' });
-    expect(lines.find((l) => l.event === 'join-requested')).not.toHaveProperty('label');
+    expect(lines.find((l) => l.event === 'join-requested')).toMatchObject({ label: 'bob' });
     const all = h.logs.join('\n');
     for (const t of [ALICE_TOKEN, BOB_TOKEN, SHARED]) expect(all).not.toContain(t);
   });
@@ -78,23 +86,42 @@ describe('per-person tokens on the hub (item 3)', () => {
     await bob.closed;
     await sleep(100);
     expect(alice.ws.readyState).toBe(alice.ws.OPEN);
-    expect((await h.hello(code, 'bob-client-id-000000000', 'Bob', undefined, BOB_TOKEN)).msg).toMatchObject({ code: 'unauthorized' });
+    await expect(h.connect({}, BOB_TOKEN)).rejects.toThrow(/401/);
     expect(h.logs.some((l) => l.includes('"tokens-reloaded"') && l.includes('"bob"'))).toBe(true);
   });
 
-  it('keeps the last good list when the file turns bad', async () => {
+  it('fails closed while the file is broken, says so once with the reason, and recovers (item 5)', async () => {
     const file = tokensFile(ALL);
     h.start({ accessTokensFile: file });
-    const errors: unknown[] = [];
+    const alice = (await h.create('alice-client-id-0000000', 'Alice', 'T', undefined, ALICE_TOKEN)).c;
+    const errors: string[] = [];
     const orig = console.error;
     console.error = (...a: unknown[]) => errors.push(a.join(' '));
     try {
-      writeFileSync(file, 'garbage');
+      // A bad edit: the hub must not keep the old list (which may hold a line the admin just deleted).
+      writeFileSync(file, `alice:${ALICE_TOKEN}\nbob ${BOB_TOKEN}\n`);
+      h.hub.reloadTokens();
+      h.hub.reloadTokens();
+      chmodSync(file, 0o644);
       h.hub.reloadTokens();
     } finally {
       console.error = orig;
     }
-    expect(String(errors[0])).toMatch(/Keeping the previous token list/);
+    expect(errors.filter((e) => /NO access token is valid/.test(e))).toHaveLength(2); // once per reason
+    expect(errors[0]).toMatch(/line 2/);
+    expect(errors[1]).toMatch(/other users/);
+    expect(errors.join('\n')).not.toContain(BOB_TOKEN);
+    expect(h.logs.filter((l) => l.includes('"tokens-file-broken"'))).toHaveLength(2);
+    // Connected people are closed with "keep the team, retry later"; nobody new gets a socket.
+    expect(await alice.fatal()).toMatchObject({ code: 'unauthorized' });
+    await alice.closed;
+    await expect(h.connect({}, ALICE_TOKEN)).rejects.toThrow(/401/);
+    expect(h.hub.stats().tokensBroken).toBe(true);
+    // Fixed (written whole and renamed into place): back to normal.
+    const fixed = tokensFile(ALL);
+    renameSync(fixed, file);
+    h.hub.reloadTokens();
+    expect(h.hub.stats().tokensBroken).toBe(false);
     expect((await h.create('alice-client-id-0000000', 'Alice', 'T', undefined, ALICE_TOKEN)).msg.type).toBe('state');
   });
 
@@ -125,15 +152,16 @@ describe('per-person tokens on the hub (item 3)', () => {
     expect(await ask(3)).toBe('full');
   });
 
-  it('counts team creation per label instead of hub-wide', async () => {
-    h.start({ accessTokensFile: tokensFile(ALL), accessToken: SHARED, limits: { createsPerHour: 1, createsPerLabelPerDay: 2, createsPerIpPerHour: 100 } });
+  it('counts team creation per label instead of per address and hub-wide (items 2, 3)', async () => {
     const make = async (token: string, i: number) => {
       const m = (await h.create(`creator-client-id-${i}00000`, 'C', 'T', undefined, token)).msg;
       return m.type === 'error' ? m.code : m.type;
     };
-    // Unlabelled (shared token): the hub-wide limit of 1.
+    // Unlabelled (shared token): the per-address and hub-wide limits.
+    h.start({ accessToken: SHARED, limits: { createsPerHour: 1, createsPerIpPerHour: 100 } });
     expect([await make(SHARED, 1), await make(SHARED, 2)]).toEqual(['state', 'rate-limited']);
-    // Each label has its own quota of 2, untouched by the hub-wide one.
+    // Each label has its own quota of 2; neither the hub-wide nor the per-address one (all from 127.0.0.1) applies.
+    h.start({ accessTokensFile: tokensFile(ALL), limits: { createsPerHour: 1, createsPerLabelPerDay: 2, createsPerIpPerHour: 1 } });
     expect([await make(ALICE_TOKEN, 3), await make(ALICE_TOKEN, 4), await make(ALICE_TOKEN, 5)]).toEqual(['state', 'state', 'rate-limited']);
     expect(await make(BOB_TOKEN, 6)).toBe('state');
   });

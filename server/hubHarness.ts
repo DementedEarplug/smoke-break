@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, expect } from 'vitest';
 import { WebSocket, type ClientOptions } from 'ws';
-import type { ClientMsg, ServerMsg } from '../shared/protocol.ts';
+import { type ClientMsg, type ServerMsg, WS_PROTOCOL, tokenProtocol } from '../shared/protocol.ts';
 import { type HubOptions, createHub } from './hub.ts';
 
 export type StateMsg = Extract<ServerMsg, { type: 'state' }>;
@@ -95,8 +95,9 @@ export class HubHarness {
     return this.hub;
   };
 
-  connect = async (options: ClientOptions = {}): Promise<Client> => {
-    const ws = new WebSocket(this.url, options);
+  /** Connects like the app: with a token, it's offered as a subprotocol next to WS_PROTOCOL. */
+  connect = async (options: ClientOptions = {}, token?: string): Promise<Client> => {
+    const ws = token ? new WebSocket(this.url, [WS_PROTOCOL, tokenProtocol(token)], options) : new WebSocket(this.url, options);
     const c = new Client(ws);
     this.clients.push(c);
     await new Promise((resolve, reject) => (ws.once('open', resolve), ws.once('error', reject)));
@@ -104,17 +105,17 @@ export class HubHarness {
   };
 
   /** Connects from a given address (needs a trusted proxy: the test server's peer is 127.0.0.1). */
-  connectFrom = (ip: string, options: ClientOptions = {}): Promise<Client> =>
-    this.connect({ ...options, headers: { ...options.headers, 'x-forwarded-for': ip } });
+  connectFrom = (ip: string, options: ClientOptions = {}, token?: string): Promise<Client> =>
+    this.connect({ ...options, headers: { ...options.headers, 'x-forwarded-for': ip } }, token);
 
   hello = async (code: string, clientId: string, name = 'J', client?: Client, token?: string) => {
-    const c = client ?? (await this.connect());
+    const c = client ?? (await this.connect({}, token));
     c.send({ type: 'hello', teamCode: code, clientId, name, ...(token ? { token } : {}) });
     return { c, msg: await c.first() };
   };
 
   create = async (clientId: string, name = 'A', teamName = 'T', client?: Client, token?: string) => {
-    const c = client ?? (await this.connect());
+    const c = client ?? (await this.connect({}, token));
     c.send({ type: 'create', teamName, clientId, name, ...(token ? { token } : {}) });
     return { c, msg: await c.first() };
   };

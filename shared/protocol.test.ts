@@ -1,6 +1,14 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { MEETING_LINK_EXAMPLE, forgetsTeam, normalizeMeetingLink, parseServerMsg } from './protocol.ts';
+import {
+  MEETING_LINK_EXAMPLE,
+  WS_PROTOCOL,
+  forgetsTeam,
+  normalizeMeetingLink,
+  parseServerMsg,
+  tokenFromProtocols,
+  tokenProtocol,
+} from './protocol.ts';
 
 // Shared with the Rust validator (src-tauri/src/meeting.rs), so the two can't drift apart.
 const vectors = JSON.parse(readFileSync(new URL('./meeting-links.json', import.meta.url), 'utf8')) as {
@@ -155,6 +163,36 @@ describe('parseServerMsg', () => {
     expect(extra?.type === 'state' && extra.team.pending).toEqual([{ id: 'p1', name: 'A', online: true }]);
   });
 
+  it('keeps access-token labels, which only the owner receives', () => {
+    const labelled = { id: 'm3', name: 'Alex', online: true, label: 'alex.k@acme' };
+    const msg = parseServerMsg(withTeam({ members: [member, labelled], pending: [{ ...labelled, id: 'p9', label: 'bob' }] }));
+    expect(msg?.type === 'state' && msg.team.members).toEqual([member, labelled]);
+    expect(msg?.type === 'state' && msg.team.pending).toEqual([{ ...labelled, id: 'p9', label: 'bob' }]);
+    // A null label is the same as none.
+    const none = parseServerMsg(withTeam({ members: [{ ...member, label: null }] }));
+    expect(none?.type === 'state' && none.team.members).toEqual([member]);
+    // Up to 64 characters, counted as characters.
+    expect(parseServerMsg(withTeam({ members: [{ ...member, label: 'x'.repeat(64) }] }))).not.toBeNull();
+    expect(parseServerMsg(withTeam({ members: [{ ...member, label: 'é'.repeat(64) }] }))).not.toBeNull();
+  });
+
+  it.each([
+    ['empty', ''],
+    ['too long', 'x'.repeat(65)],
+    ['not a string', 5],
+    ['an object', { toString: 'alice' }],
+    ['a space', 'alice smith'],
+    ['a newline', 'alice\nbob'],
+    ['a control character', 'ali\u0007ce'],
+    ['a bidi override', 'ali\u202ece'],
+    ['a zero-width space', 'ali\u200bce'],
+    ['a private-use character', 'ali\ue000ce'],
+    ['a lone surrogate', 'ali\ud800ce'],
+  ])('rejects a label that is %s', (_, label) => {
+    expect(parseServerMsg(withTeam({ members: [{ ...member, label }] }))).toBeNull();
+    expect(parseServerMsg(withTeam({ pending: [{ ...member, label }] }))).toBeNull();
+  });
+
   it.each(['pending', 'denied'] as const)('keeps the %s error code', (code) => {
     expect(parseServerMsg(JSON.stringify({ type: 'error', message: 'm', fatal: true, code }))).toEqual({
       type: 'error',
@@ -199,6 +237,47 @@ describe('parseServerMsg', () => {
     ['serverNow not finite', state(team, { serverNow: null })],
     ['empty you', state(team, { you: '' })],
   ])('rejects state with %s', (_, raw) => expect(parseServerMsg(raw)).toBeNull());
+});
+
+describe('token subprotocol', () => {
+  const offered = (token: string) => [WS_PROTOCOL, tokenProtocol(token)];
+
+  it('round-trips tokens, as a valid subprotocol', () => {
+    for (const t of ['3f9c0a7e', 'a'.repeat(512), 'p@ss:w/rd+=?', 'x']) {
+      const p = tokenProtocol(t);
+      // RFC 6455 subprotocols are HTTP tokens: no separators, spaces or padding.
+      expect(p).toMatch(/^sb\.token\.[A-Za-z0-9_-]+$/);
+      expect(tokenFromProtocols(offered(t))).toBe(t);
+    }
+  });
+
+  it('round-trips non-ASCII tokens as UTF-8', () => {
+    for (const t of ['jalapeño-tøken', '鍵🔑', '\u{10ffff}']) expect(tokenFromProtocols(offered(t))).toBe(t);
+  });
+
+  it('finds the token whatever its position, and none when none is offered', () => {
+    expect(tokenFromProtocols([tokenProtocol('abc'), WS_PROTOCOL])).toBe('abc');
+    expect(tokenFromProtocols([WS_PROTOCOL])).toBeNull();
+    expect(tokenFromProtocols([])).toBeNull();
+    expect(tokenFromProtocols(new Set(['other', WS_PROTOCOL]))).toBeNull();
+  });
+
+  it.each([
+    ['empty', 'sb.token.'],
+    ['standard base64 characters', 'sb.token.ab+/'],
+    ['padding', 'sb.token.YQ=='],
+    ['an impossible length', 'sb.token.A'],
+    ['invalid UTF-8', `sb.token.${Buffer.from([0xff, 0xfe]).toString('base64url')}`],
+    ['a truncated character', `sb.token.${Buffer.from('é').subarray(0, 1).toString('base64url')}`],
+    ['spaces', 'sb.token.YWJj ZA'],
+  ])('rejects a malformed token: %s', (_, p) => expect(tokenFromProtocols([WS_PROTOCOL, p])).toBeNull());
+
+  it('rejects over-long tokens instead of decoding them', () => {
+    // 1024 base64 characters (768 bytes) is the most the hub will decode.
+    expect(tokenFromProtocols([`sb.token.${'A'.repeat(1024)}`])).toHaveLength(768);
+    expect(tokenFromProtocols([`sb.token.${'A'.repeat(1025)}`])).toBeNull();
+    expect(tokenFromProtocols(offered('t'.repeat(1000)))).toBeNull();
+  });
 });
 
 describe('forgetsTeam', () => {

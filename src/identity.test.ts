@@ -4,11 +4,14 @@ import {
   CLIENT_ID,
   type KeyValue,
   LEGACY_ID_KEY,
+  SECRET_IN_VAULT_KEY,
   SECRET_KEY,
+  type SecretVault,
   clientIdFor,
   deriveClientId,
   idKey,
   migrateLegacyId,
+  vaultSecret,
 } from './identity.ts';
 
 const subtle = webcrypto.subtle as SubtleCrypto;
@@ -111,5 +114,106 @@ describe('migrateLegacyId', () => {
     migrateLegacyId(store, HUB_A);
     expect(store.getItem(LEGACY_ID_KEY)).toBeNull();
     expect(await clientIdFor(store, HUB_A, subtle)).not.toBe('bad id!');
+  });
+});
+
+/** Stands in for the Keychain item, with the create-once-per-run rule of the Rust side. */
+class FakeVault implements SecretVault {
+  item: string | null = null;
+  createdThisRun: string | null = null;
+  creates = 0;
+  broken = false;
+  async get() {
+    if (this.broken) throw new Error('Keychain error');
+    return this.item;
+  }
+  async create(secret: string) {
+    if (this.broken) throw new Error('Keychain error');
+    if (this.createdThisRun) return this.createdThisRun;
+    this.creates++;
+    this.item = secret;
+    this.createdThisRun = secret;
+    return secret;
+  }
+  /** The app quits and starts again. */
+  restart() {
+    this.createdThisRun = null;
+  }
+}
+
+describe('vaultSecret', () => {
+  const OLD = 'O'.repeat(43);
+
+  it('moves the secret out of web storage into the Keychain, keeping every id', async () => {
+    const store = new MemoryStore();
+    store.setItem(SECRET_KEY, OLD);
+    const before = await clientIdFor(store, HUB_A, subtle);
+    const vault = new FakeVault();
+    const secret = await vaultSecret(store, vault);
+    expect(secret).toBe(OLD);
+    expect(vault.item).toBe(OLD);
+    expect(store.getItem(SECRET_KEY)).toBeNull();
+    expect(store.getItem(SECRET_IN_VAULT_KEY)).toBe('1');
+    // Same id as before the move, so nobody loses their place or ownership.
+    expect(await clientIdFor(store, HUB_A, subtle, secret)).toBe(before);
+    // Nothing is written back to web storage.
+    expect(store.getItem(SECRET_KEY)).toBeNull();
+  });
+
+  it('makes a new secret in the Keychain on a fresh install', async () => {
+    const store = new MemoryStore();
+    const vault = new FakeVault();
+    const secret = await vaultSecret(store, vault);
+    expect(secret).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(vault.item).toBe(secret);
+    expect(store.getItem(SECRET_KEY)).toBeNull();
+  });
+
+  it('only reads the Keychain once the secret is there, and never replaces it', async () => {
+    const store = new MemoryStore();
+    const vault = new FakeVault();
+    const first = await vaultSecret(store, vault);
+    vault.restart();
+    expect(await vaultSecret(store, vault)).toBe(first);
+    expect(vault.creates).toBe(1);
+  });
+
+  it('gives both windows the same secret when they start together', async () => {
+    const store = new MemoryStore();
+    const vault = new FakeVault();
+    const [a, b] = await Promise.all([vaultSecret(store, vault), vaultSecret(store, vault)]);
+    expect(a).toBe(b);
+    expect(vault.creates).toBe(1);
+  });
+
+  it('replaces whatever item was there before the first move', async () => {
+    // Pre-created by someone else, e.g. with an access list that lets any app read it.
+    const vault = new FakeVault();
+    vault.item = 'P'.repeat(43);
+    const store = new MemoryStore();
+    store.setItem(SECRET_KEY, OLD);
+    expect(await vaultSecret(store, vault)).toBe(OLD);
+    expect(vault.item).toBe(OLD);
+  });
+
+  it('keeps using web storage where there is no Keychain or it refuses', async () => {
+    for (const vault of [null, Object.assign(new FakeVault(), { broken: true })]) {
+      const store = new MemoryStore();
+      store.setItem(SECRET_KEY, OLD);
+      expect(await vaultSecret(store, vault)).toBeNull();
+      expect(store.getItem(SECRET_KEY)).toBe(OLD);
+      expect(store.getItem(SECRET_IN_VAULT_KEY)).toBeNull();
+    }
+  });
+
+  it('starts a new secret if the Keychain item was deleted', async () => {
+    const store = new MemoryStore();
+    const vault = new FakeVault();
+    const first = await vaultSecret(store, vault);
+    vault.item = null;
+    vault.restart();
+    const second = await vaultSecret(store, vault);
+    expect(second).not.toBe(first);
+    expect(vault.item).toBe(second);
   });
 });

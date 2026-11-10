@@ -104,6 +104,42 @@ export interface MemberView {
   id: string;
   name: string;
   online: boolean;
+  /**
+   * Whose access token this person connected with, when the hub uses per-person
+   * tokens. Unlike the name, they can't choose it. Only the owner receives it.
+   */
+  label?: string;
+}
+
+/**
+ * The app connects with these WebSocket subprotocols: `WS_PROTOCOL`, plus
+ * `tokenProtocol(token)` when it has an access token. A hub that requires
+ * tokens checks it before accepting the connection at all, so strangers can't
+ * hold sockets open. The hub always answers with `WS_PROTOCOL`.
+ */
+export const WS_PROTOCOL = 'sb.v1';
+const TOKEN_PROTOCOL_PREFIX = 'sb.token.';
+/** Tokens travel base64url-encoded (UTF-8), since a subprotocol can't hold arbitrary characters. */
+export function tokenProtocol(token: string): string {
+  const bytes = new TextEncoder().encode(token);
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return TOKEN_PROTOCOL_PREFIX + btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+/** The token from a list of offered subprotocols, or null if there isn't a well-formed one. */
+export function tokenFromProtocols(offered: Iterable<string>): string | null {
+  for (const p of offered) {
+    if (!p.startsWith(TOKEN_PROTOCOL_PREFIX)) continue;
+    const b64 = p.slice(TOKEN_PROTOCOL_PREFIX.length);
+    if (!/^[A-Za-z0-9_-]{1,1024}$/.test(b64)) return null;
+    try {
+      const bin = atob(b64.replace(/-/g, '+').replace(/_/g, '/'));
+      return new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(bin, (c) => c.charCodeAt(0)));
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 export interface TeamView {
@@ -138,7 +174,7 @@ export type ClientMsg =
    * rejoining. The hub also replaces the invite code, since they know the old one.
    */
   | { type: 'removeMember'; id: string }
-  /** Owner only: let a waiting person in, or turn them away. */
+  /** Owner only: let a waiting person in, or turn them away (they can ask again after a day). */
   | { type: 'approveMember'; id: string; allow: boolean }
   /** Owner only: hand the team to another member on the roster. */
   | { type: 'transferOwner'; id: string }
@@ -201,11 +237,25 @@ function parseParticipant(v: unknown): Participant | null {
   return { id, name, joinedAt, litAt };
 }
 
+/**
+ * Access-token labels are `letters, digits and . _ @ + -` on today's hubs. The
+ * owner reads them as who someone really is, so accept only short, visible
+ * text: no control, format (bidi, zero-width), separator or private-use
+ * characters that could make one label pass for another.
+ */
+export const LABEL_MAX = 64;
+const LABEL = /^[^\p{C}\p{Z}]+$/u;
+export const isValidLabel = (v: unknown): v is string =>
+  typeof v === 'string' && v.length <= LABEL_MAX * 2 && Array.from(v).length <= LABEL_MAX && LABEL.test(v);
+
 function parseMember(v: unknown): MemberView | null {
   if (!isObj(v)) return null;
-  const { id, name, online } = v;
+  const { id, name, online, label } = v;
   if (!str(id, 1, ID_MAX) || !str(name, 0, NAME_MAX) || typeof online !== 'boolean') return null;
-  return { id, name, online };
+  // A hub without per-person tokens (or a non-owner's view) sends none.
+  if (label === undefined || label === null) return { id, name, online };
+  if (!isValidLabel(label)) return null;
+  return { id, name, online, label };
 }
 
 /** Parses every element, or returns null if the array is too long or any element is bad. */
@@ -334,6 +384,10 @@ export function parseServerMsg(data: unknown): ServerMsg | null {
   return null;
 }
 
-/** Fatal errors after which the saved team is gone for good; anything else is worth retrying. */
+/**
+ * Fatal errors after which the app forgets the saved team; anything else is
+ * worth retrying. A denied request isn't permanent (they can ask again after
+ * a day, with the invite code), but retrying on our own would only be refused.
+ */
 export const forgetsTeam = (code: ErrorCode | undefined): boolean =>
   code === 'bad-code' || code === 'removed' || code === 'denied';

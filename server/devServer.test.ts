@@ -26,10 +26,10 @@ describe('dev and preview servers (item 9)', () => {
 
   it('dev server refuses audit notes and sends the headers', async () => {
     const { createServer } = await import('vite');
-    const server = await createServer({ configFile: CONFIG, root: ROOT, server: { port: 19310, strictPort: true, host: '127.0.0.1' }, logLevel: 'silent' });
+    const server = await createServer({ configFile: CONFIG, root: ROOT, server: { port: 19610, strictPort: true, host: '127.0.0.1' }, logLevel: 'silent' });
     await server.listen();
     try {
-      const get = (p: string) => fetch(`http://127.0.0.1:19310${p}`);
+      const get = (p: string) => fetch(`http://127.0.0.1:19610${p}`);
       for (const p of ['/AUDIT.md', '/SECURITY-AUDIT.md', '/security-audit.md', '/AUDIT.md?raw', `/@fs${ROOT}/SECURITY-AUDIT.md`, '/.data/teams.json']) {
         const r = await get(p);
         await r.arrayBuffer(); // never look at the body
@@ -49,9 +49,9 @@ describe('dev and preview servers (item 9)', () => {
     const dist = tempDir();
     mkdirSync(dist, { recursive: true });
     writeFileSync(join(dist, 'index.html'), '<!doctype html><title>t</title>');
-    const server = await preview({ configFile: CONFIG, root: ROOT, build: { outDir: dist }, preview: { port: 19311, strictPort: true, host: '127.0.0.1' }, logLevel: 'silent' });
+    const server = await preview({ configFile: CONFIG, root: ROOT, build: { outDir: dist }, preview: { port: 19611, strictPort: true, host: '127.0.0.1' }, logLevel: 'silent' });
     try {
-      const r = await fetch('http://127.0.0.1:19311/');
+      const r = await fetch('http://127.0.0.1:19611/');
       expect(r.status).toBe(200);
       expectHeaders(r);
     } finally {

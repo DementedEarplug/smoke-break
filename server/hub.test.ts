@@ -1,18 +1,22 @@
 import type { IncomingMessage } from 'node:http';
-import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
+import { WS_PROTOCOL } from '../shared/protocol.ts';
+import { runAdmin } from './admin.ts';
 import {
   addressKey,
   cleanName,
   clientAddress,
+  createHub,
   dataFileFromEnv,
   isAllowedHost,
   isAllowedOrigin,
   nameKey,
   parseSavedTeam,
   parseTrustedProxies,
+  publicId,
 } from './hub.ts';
 import { ALEX, type ErrorMsg, SAM, type StateMsg, hubHarness, saved, sleep, tempFile } from './hubHarness.ts';
 import { WindowLimiter } from './limits.ts';
@@ -238,12 +242,13 @@ describe('hub limits', () => {
     const day = 86_400_000;
     // Teams other people have used (several on the roster), so they aren't junk.
     const roster = [{ id: 'aaaaaaaaaaaaaaaa', name: 'A' }, { id: 'bbbbbbbbbbbbbbbb', name: 'B' }];
+    const ownerId = 'aaaaaaaaaaaaaaaa';
     writeFileSync(
       h.dataFile,
       JSON.stringify([
-        saved({ code: 'OLDONE2345', roster, requireApproval: false, lastActive: Date.now() - 10 * day }),
-        saved({ code: 'RECENT2345', roster, requireApproval: false, lastActive: Date.now() - 2 * day }),
-        saved({ code: 'GONEEE2345', roster, requireApproval: false, lastActive: Date.now() - 365 * day }),
+        saved({ code: 'OLDONE2345', roster, ownerId, requireApproval: false, lastActive: Date.now() - 10 * day }),
+        saved({ code: 'RECENT2345', roster, ownerId, requireApproval: false, lastActive: Date.now() - 2 * day }),
+        saved({ code: 'GONEEE2345', roster, ownerId, requireApproval: false, lastActive: Date.now() - 365 * day }),
       ]),
     );
     startHub({ limits: { maxTeams: 2 } });
@@ -282,18 +287,30 @@ describe('hub limits', () => {
     expect(await alex.closed).toBe(1008);
   });
 
-  it('caps connections per address', async () => {
-    startHub({ limits: { connectionsPerIp: 2 } });
-    await connect();
+  it('caps connections per address, unidentified and identified ones separately (item 2)', async () => {
+    startHub({ limits: { unidentifiedPerIp: 2, connectionsPerIp: 1 } });
+    const a = await connect();
     await connect();
     await expect(connect()).rejects.toThrow(/429/);
+    // Saying hello moves a connection to the identified count, making room for another unidentified one.
+    a.send({ type: 'create', teamName: 'T', clientId: 'cap-client-id-0000000', name: 'A' });
+    await a.state();
+    const b = await connect();
+    // …but only one identified connection per address is allowed here.
+    b.send({ type: 'hello', teamCode: a.lastState().team.code, clientId: 'cap-client-id-0000000', name: 'A' });
+    expect(await b.fatal()).toMatchObject({ code: 'rate-limited' });
   });
 
-  it('caps connections in total', async () => {
-    startHub({ trustProxy: true, limits: { maxConnections: 2 } });
-    await connectFrom('10.0.0.1');
+  it('caps connections in total, unidentified and identified ones separately (item 2)', async () => {
+    startHub({ trustProxy: true, limits: { maxUnidentified: 2, maxConnections: 1 } });
+    const a = await connectFrom('10.0.0.1');
     await connectFrom('10.0.0.2');
     await expect(connectFrom('10.0.0.3')).rejects.toThrow(/503/);
+    a.send({ type: 'create', teamName: 'T', clientId: 'cap-client-id-0000000', name: 'A' });
+    await a.state();
+    const b = await connectFrom('10.0.0.3');
+    b.send({ type: 'create', teamName: 'T', clientId: 'cap-client-id-0000001', name: 'B' });
+    expect(await b.fatal()).toMatchObject({ code: 'full' });
   });
 
   it('caps the roster, but lets existing members back in', async () => {
@@ -393,14 +410,28 @@ describe('hub invite codes', () => {
     expect((await hello(code, 'newbie-client-id-00000')).msg).toMatchObject({ type: 'error', code: 'rate-limited' });
   });
 
-  it('lets the first person back into an ownerless team saved before owners existed, and makes them owner', async () => {
-    writeFileSync(h.dataFile, JSON.stringify([saved({ code: 'LEGACY2345' })]));
-    startHub({ limits: { badCodesPerIp: 1, badCodeDelayMs: 0 } });
+  it('admits nobody to an ownerless team saved before owners existed, until an admin sets one (item 7)', async () => {
+    writeFileSync(h.dataFile, JSON.stringify([saved({ code: 'LEGACY2345', ref: '0e0e0e0e', known: [publicId('LEGACY2345', SAM)] })]));
+    startHub({ limits: { badCodeDelayMs: 0 } });
     const first = await hello('LEGACY2345', ALEX, 'Alex');
-    expect(first.msg).toMatchObject({ type: 'state' });
-    expect((first.msg as StateMsg).team.ownerId).toBe((first.msg as StateMsg).you);
-    // From then on, approval applies to everyone else.
-    expect((await hello('LEGACY2345', SAM, 'Sam')).msg).toMatchObject({ type: 'error', code: 'pending' });
+    expect(first.msg).toMatchObject({ type: 'error', fatal: true, code: 'pending', message: expect.stringMatching(/no owner.*runs the hub/) });
+    // Not even someone on the roster.
+    expect((await hello('LEGACY2345', SAM, 'Sam')).msg).toMatchObject({ code: 'pending' });
+    expect((await hello('LEGACY2345', 'third-client-id-000000', 'Lee')).msg).toMatchObject({ code: 'pending' });
+    // Logged once for the team, not once per try.
+    expect(logs().filter((l) => l.includes('"ownerless-team"'))).toHaveLength(1);
+    // The admin hands it to the person who asked (they were recorded as waiting).
+    h.hub.close();
+    const out: string[] = [];
+    runAdmin(['--file', h.dataFile, 'list'], (l) => out.push(l));
+    const alexId = publicId('LEGACY2345', ALEX);
+    expect(out.join('\n')).toContain(`${alexId}  Alex  (waiting)`);
+    expect(runAdmin(['--file', h.dataFile, 'set-owner', '0e0e0e0e', alexId], () => {})).toBe(0);
+    startHub();
+    const back = (await hello('LEGACY2345', ALEX, 'Alex')).msg as StateMsg;
+    expect(back).toMatchObject({ type: 'state', you: alexId });
+    expect(back.team.ownerId).toBe(alexId);
+    expect((await hello('LEGACY2345', SAM, 'Sam')).msg.type).toBe('state');
   });
 
   it('has no hub-wide wrong-code lockout: guesses from many addresses lock out only those addresses (item 2)', async () => {
@@ -441,6 +472,7 @@ describe('hub invite codes', () => {
   });
 
   it('keeps only the last few old codes', async () => {
+    startHub({ limits: { ownerActionsPerMinute: 100 } });
     const { alex, code } = await team();
     for (let i = 0; i < 6; i++) {
       const from = alex.msgs.length;
@@ -456,19 +488,31 @@ describe('hub invite codes', () => {
 describe('hub access token (H5)', () => {
   const TOKEN = 'a-long-random-hub-access-token-000000000';
 
-  it('refuses create/hello without the right token', async () => {
+  it('refuses the connection itself without the right token (item 2)', async () => {
     startHub({ accessToken: TOKEN });
-    const tries = [undefined, '', 'wrong', { toString: 1 }, TOKEN.slice(0, -1)];
-    for (const token of tries) {
-      const c = await connect();
-      c.send({ type: 'create', teamName: 'T', clientId: 'token-client-id-00000', name: 'A', token });
-      expect(await c.first()).toMatchObject({ type: 'error', fatal: true, code: 'unauthorized' });
-    }
+    // No subprotocol, the wrong token, a malformed one: no socket at all.
+    await expect(connect()).rejects.toThrow(/401/);
+    for (const token of ['wrong-token-0000000000', TOKEN.slice(0, -1), TOKEN + 'x']) await expect(connect({}, token)).rejects.toThrow(/401/);
+    await expect(new Promise((res, rej) => new WebSocket(h.url, [WS_PROTOCOL, 'sb.token.!!']).once('open', res).once('error', rej))).rejects.toThrow(/401/);
+    const c = await connect({}, TOKEN);
+    expect(c.ws.protocol).toBe(WS_PROTOCOL);
+    // A token in the message must be the connection's own (or left out).
+    c.send({ type: 'create', teamName: 'T', clientId: 'token-client-id-00000', name: 'A', token: 'some-other-token-00000' });
+    expect(await c.first()).toMatchObject({ type: 'error', fatal: true, code: 'unauthorized' });
     const code = ((await h.create('token-client-id-00000', 'A', 'T', undefined, TOKEN)).msg as StateMsg).team.code;
-    expect((await hello(code, 'token-client-id-00001', 'B')).msg).toMatchObject({ type: 'error', code: 'unauthorized' });
+    const d = await connect({}, TOKEN);
+    d.send({ type: 'hello', teamCode: code, clientId: 'token-client-id-00001', name: 'B', token: TOKEN });
     // With the token, they get as far as the owner's approval.
-    expect((await hello(code, 'token-client-id-00001', 'B', undefined, TOKEN)).msg).toMatchObject({ type: 'error', code: 'pending' });
+    expect(await d.first()).toMatchObject({ type: 'error', code: 'pending' });
     expect(logs().join('\n')).not.toContain(TOKEN);
+  });
+
+  it('answers WS_PROTOCOL when offered, and still serves clients that offer none on an open hub (item 2)', async () => {
+    const offered = await connect({}, 'any-token-is-ignored-here');
+    expect(offered.ws.protocol).toBe(WS_PROTOCOL);
+    const plain = await connect();
+    expect(plain.ws.protocol).toBe('');
+    expect((await h.create('plain-client-id-000000', 'P', 'T', plain)).msg.type).toBe('state');
   });
 });
 
@@ -520,8 +564,15 @@ describe('client addresses (M1, item 5)', () => {
     ['fe80::1%en0', 'fe80:0:0:0::/64'],
   ])('addressKey(%s) → %s', (ip, key) => expect(addressKey(ip)).toBe(key));
 
+  it.each([
+    ['2001:db8:a:bb1:2:3:4:5', '2001:db8:a:b00::/56'],
+    ['2001:db8:a:bff::1', '2001:db8:a:b00::/56'],
+    ['2001:db8:a:c00::1', '2001:db8:a:c00::/56'],
+    ['1.2.3.4', '1.2.3.4'],
+  ])('addressKey(%s, 56) → %s (item 2)', (ip, key) => expect(addressKey(ip, 56)).toBe(key));
+
   it('applies per-address limits to the forwarded address when the proxy is trusted', async () => {
-    startHub({ trustProxy: true, limits: { connectionsPerIp: 1 } });
+    startHub({ trustProxy: true, limits: { unidentifiedPerIp: 1 } });
     await connectFrom('10.0.0.1');
     await connectFrom('10.0.0.2');
     // A spoofed left-hand entry doesn't make it a different address.
@@ -529,7 +580,7 @@ describe('client addresses (M1, item 5)', () => {
   });
 
   it('ignores the header when the peer is not a trusted proxy', async () => {
-    startHub({ trustProxy: '10.9.9.9', limits: { connectionsPerIp: 1 } });
+    startHub({ trustProxy: '10.9.9.9', limits: { unidentifiedPerIp: 1 } });
     await connectFrom('10.0.0.1');
     await expect(connectFrom('10.0.0.2')).rejects.toThrow(/429/);
   });
@@ -629,23 +680,39 @@ describe('hub persistence (M5)', () => {
     expect(statSync(h.dataFile).mtimeMs).not.toBe(before);
   });
 
-  it('keeps a copy of a file that does not parse, then carries on', async () => {
-    writeFileSync(h.dataFile, '[{"code": "ABCDEF", "name": "half-writ');
-    const errors: unknown[] = [];
-    const orig = console.error;
-    console.error = (...a: unknown[]) => errors.push(a.join(' '));
+  it('refuses to start on a file that does not parse, keeping a copy and naming both (item 3)', async () => {
+    const text = '[{"code": "ABCDEF", "name": "half-writ';
+    writeFileSync(h.dataFile, text);
+    const keep = h.hub;
+    let message = '';
     try {
       startHub();
-    } finally {
-      console.error = orig;
+    } catch (err) {
+      message = (err as Error).message;
     }
+    h.hub = keep; // the harness closes the hub it has
     const copies = readdirSync(dirname(h.dataFile)).filter((f) => f.startsWith('teams.json.corrupt-'));
     expect(copies).toHaveLength(1);
-    expect(readFileSync(join(dirname(h.dataFile), copies[0]), 'utf8')).toBe('[{"code": "ABCDEF", "name": "half-writ');
-    expect(String(errors[0])).toMatch(/not a valid team list/);
-    await h.create('after-client-id-000000', 'S', 'After');
-    h.hub.flush();
-    expect(JSON.parse(readFileSync(h.dataFile, 'utf8'))[0].name).toBe('After');
+    expect(message).toContain(`${h.dataFile} is not a valid team list`);
+    expect(message).toContain(join(dirname(h.dataFile), copies[0]));
+    expect(readFileSync(join(dirname(h.dataFile), copies[0]), 'utf8')).toBe(text);
+    // The file itself is untouched.
+    expect(readFileSync(h.dataFile, 'utf8')).toBe(text);
+    // Not a team list either: valid JSON that isn't an array.
+    writeFileSync(h.dataFile, '{"teams": []}');
+    expect(() => createHub({ dataFile: h.dataFile, log: () => {} })).toThrow(/not a valid team list/);
+  });
+
+  it('refuses to start on a file it cannot read (item 3)', () => {
+    writeFileSync(h.dataFile, '[]');
+    chmodSync(h.dataFile, 0o000);
+    try {
+      // (Root reads anything; then there's nothing to test.)
+      if (process.getuid?.() === 0) return;
+      expect(() => createHub({ dataFile: h.dataFile, log: () => {} })).toThrow(new RegExp(`Can't read the team file ${h.dataFile}`));
+    } finally {
+      chmodSync(h.dataFile, 0o600);
+    }
   });
 
   it('checks every field of saved teams', async () => {
@@ -668,9 +735,11 @@ describe('hub persistence (M5)', () => {
       console.error = orig;
     }
     expect(String(errors[0])).toMatch(/Skipped 4/);
-    // Ownerless, so the first one in becomes owner (approval can't apply with nobody to approve).
-    const { msg } = await hello('GOODONE234', 'field-client-id-000000');
-    expect((msg as StateMsg).team).toMatchObject({ name: 'My team', defaultLengthMin: 12, meetingProvider: 'fixed-link', requireApproval: true });
+    // The one good entry was kept (ownerless, so it waits for an admin), fixed up field by field.
+    expect((await hello('GOODONE234', 'field-client-id-000000')).msg).toMatchObject({ code: 'pending' });
+    h.hub.flush();
+    const kept = parseSavedTeam(JSON.parse(readFileSync(h.dataFile, 'utf8'))[0], Date.now())!;
+    expect(kept).toMatchObject({ code: 'GOODONE234', name: 'My team', defaultLengthMin: 12, meetingProvider: 'fixed-link', ownerId: null, requireApproval: true });
   });
 
   it('puts data where SMOKE_BREAK_DATA_DIR says, else .data/ in the repo (M3)', () => {

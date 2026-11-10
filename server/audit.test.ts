@@ -49,7 +49,7 @@ describe('audit log on the hub (item 4)', () => {
   const h = hubHarness();
 
   it('a client hammering bad hellos writes a handful of lines, not thousands', async () => {
-    h.start({ limits: { badCodeDelayMs: 0, connectionsPerIp: 10_000 } });
+    h.start({ limits: { badCodeDelayMs: 0, connectionsPerIp: 10_000, unidentifiedPerIp: 10_000, maxUnidentified: 10_000 } });
     const runs = Array.from({ length: 400 }, async (_, i) => {
       const c = await h.connect();
       c.send(i % 2 ? { type: 'hello', clientId: 'x', name: 'A'.repeat(24) } : { type: 'hello', clientId: 'valid-client-id-000000', teamCode: 'NOPE' });

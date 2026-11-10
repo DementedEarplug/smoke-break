@@ -79,4 +79,67 @@ describe('admin CLI (item 2: ownership recovery)', () => {
     expect(runAdmin(['--file', file, 'oops'], () => {})).toBe(2);
     expect(existsSync(file)).toBe(true);
   });
+
+  it("won't run as a different user than the file's owner, and keeps the file's mode (item 3)", () => {
+    const { file, member } = setup();
+    const before = readFileSync(file, 'utf8');
+    const out: string[] = [];
+    const other = (process.getuid?.() ?? 0) + 1;
+    expect(runAdmin(['--file', file, 'set-owner', '0a0b0c0d', member], (l) => out.push(l), { uid: other })).toBe(1);
+    expect(out.join('\n')).toMatch(/belongs to user id .*sudo -u <hub user>/);
+    expect(readFileSync(file, 'utf8')).toBe(before);
+    chmodSync(file, 0o640);
+    expect(runAdmin(['--file', file, 'set-owner', '0a0b0c0d', member], () => {})).toBe(0);
+    expect(statSync(file).mode & 0o777).toBe(0o640);
+    expect(statSync(file).uid).toBe(process.getuid?.());
+  });
+
+  it('prints a team’s current invite code on request, and only then (item 3)', () => {
+    const { file } = setup();
+    const out: string[] = [];
+    expect(runAdmin(['--file', file, 'codes', '0a0b0c0d'], (l) => out.push(l))).toBe(0);
+    expect(out.join('\n')).toContain('invite code: ADMINTEAM2');
+    expect(out.join('\n')).not.toContain('5551234');
+    expect(runAdmin(['--file', file, 'codes', 'ffffffff'], () => {})).toBe(1);
+  });
+
+  it('lifts removals and denials by id or by label (item 1)', () => {
+    const dir = tempDir();
+    const file = join(dir, 'teams.json');
+    const owner = publicId('UNBANTEAM2', 'owner-client-id-00000000');
+    const mal1 = publicId('UNBANTEAM2', 'mallory-client-id-00001');
+    const mal2 = publicId('UNBANTEAM2', 'mallory-client-id-00002');
+    const kim = publicId('UNBANTEAM2', 'kim-secret-client-id-0003');
+    writeFileSync(
+      file,
+      JSON.stringify([
+        saved({
+          code: 'UNBANTEAM2',
+          ref: '0a0a0a0a',
+          ownerId: owner,
+          roster: [{ id: owner, name: 'O' }],
+          // An older file: the label ban is only implied by the bans carrying it.
+          banned: [
+            { id: mal1, reason: 'removed', label: 'mallory' },
+            { id: mal2, reason: 'removed', label: 'mallory' },
+            { id: kim, reason: 'denied' },
+          ],
+        }),
+      ]),
+    );
+    chmodSync(file, 0o600);
+    const out: string[] = [];
+    expect(runAdmin(['--file', file, 'unban', '0a0a0a0a', mal1], (l) => out.push(l))).toBe(0);
+    expect(out.join('\n')).toMatch(/label mallory is still banned/);
+    let t = JSON.parse(readFileSync(file, 'utf8'))[0];
+    expect(t.banned.map((b: { id: string }) => b.id)).toEqual([mal2, kim]);
+    expect(t.bannedLabels).toEqual([{ label: 'mallory', reason: 'removed' }]);
+    expect(runAdmin(['--file', file, 'unban', '0a0a0a0a', 'mallory'], () => {})).toBe(0);
+    t = JSON.parse(readFileSync(file, 'utf8'))[0];
+    expect(t.banned.map((b: { id: string }) => b.id)).toEqual([kim]);
+    expect(t.bannedLabels).toEqual([]);
+    expect(runAdmin(['--file', file, 'unban', '0a0a0a0a', kim], () => {})).toBe(0);
+    expect(JSON.parse(readFileSync(file, 'utf8'))[0].banned).toEqual([]);
+    expect(runAdmin(['--file', file, 'unban', '0a0a0a0a', 'nobody'], () => {})).toBe(1);
+  });
 });

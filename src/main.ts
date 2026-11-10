@@ -90,6 +90,17 @@ function start(first: JoinMsg) {
       widget.showToast(message, 6000);
       panel.setNotice(`${message} Trying again in ${Math.round(retryInMs / 1000)} s.`);
     },
+    onCantConnect(message, withToken) {
+      // Probably a token the hub refused at the door, possibly just the
+      // network: keep backing off, and offer to enter the token.
+      panel.setNotice(message, {
+        label: withToken ? 'Change access token' : 'Enter access token',
+        run: () => {
+          net.close();
+          onboard(message, true);
+        },
+      });
+    },
     onPending() {
       // Keep the code in the address, so a reload keeps waiting for the same team.
       if (params.get('team') !== teamCode) {

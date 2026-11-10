@@ -1,6 +1,6 @@
 // WebSocket client with auto-reconnect and a server-synced clock.
 
-import { type ClientMsg, type ServerMsg, parseServerMsg } from '../shared/protocol.ts';
+import { type ClientMsg, type ServerMsg, WS_PROTOCOL, parseServerMsg, tokenProtocol } from '../shared/protocol.ts';
 import { serverProblem } from './platform.ts';
 
 export type NetStatus = 'connecting' | 'open' | 'closed';
@@ -21,11 +21,46 @@ const REFUSED_MAX_MS = 5 * 60_000;
  * after they click Allow.
  */
 export const PENDING_RETRY_MS = 12_500;
+/**
+ * A hub that refuses the WebSocket upgrade (a missing or wrong access token)
+ * looks exactly like one that can't be reached. After this many attempts in a
+ * row that never opened, reconnects slow down to `UNREACHABLE_*`.
+ */
+const FAST_FAILURES = 3;
+const UNREACHABLE_MIN_MS = 10_000;
+const UNREACHABLE_MAX_MS = 60_000;
+
+/** The first message on a connection: it carries the access token too. */
+export type HelloMsg = Extract<ClientMsg, { type: 'create' } | { type: 'hello' }>;
+
+/** The WebSocket subprotocols to offer a hub: the token travels in the upgrade request too. */
+export function protocolsFor(token: string): string[] {
+  return token ? [WS_PROTOCOL, tokenProtocol(token)] : [WS_PROTOCOL];
+}
+
+export interface NetOptions {
+  /**
+   * The access token for this hub ('' for none), read on every connect so a
+   * corrected one is used on the next retry. It is offered as a subprotocol
+   * and also sent in the hello.
+   */
+  token?: () => string | Promise<string>;
+  /**
+   * A connection attempt failed before it opened, `failures` times in a row
+   * (reset once one opens). `withToken` says whether a token was offered.
+   */
+  onConnectFailed?(failures: number, withToken: boolean): void;
+}
 
 export class Net {
   private ws: WebSocket | null = null;
   private retryMs = RETRY_MIN_MS;
   private refusedMs = REFUSED_MIN_MS;
+  private unreachableMs = UNREACHABLE_MIN_MS;
+  /** Attempts in a row that closed without ever opening. */
+  private failedOpens = 0;
+  /** Bumped by every connect and close, so a token read that finishes late is dropped. */
+  private attempt = 0;
   private retryTimer: ReturnType<typeof setTimeout> | undefined;
   /** serverTime - localTime. */
   private offset = 0;
@@ -39,32 +74,60 @@ export class Net {
      * server setting must never send them somewhere else.
      */
     readonly url: string,
-    /** First message on every (re)connect. */
-    public hello: () => ClientMsg | Promise<ClientMsg>,
+    /** First message on every (re)connect, without the token (see `NetOptions.token`). */
+    public hello: () => HelloMsg,
     private readonly onMessage: (msg: ServerMsg) => void,
     private readonly onStatus: (s: NetStatus) => void,
     /** The configured hub address isn't acceptable (e.g. plain ws:// to another machine). */
     private readonly onBadServer: (message: string) => void = () => {},
+    private readonly opts: NetOptions = {},
   ) {}
 
   connect() {
     clearTimeout(this.retryTimer);
+    const attempt = ++this.attempt;
+    const old = this.ws;
+    this.ws = null;
+    old?.close();
     const problem = serverProblem(this.url);
     if (problem) {
-      this.ws = null;
       this.onStatus('closed');
       this.onBadServer(problem);
       return;
     }
     this.onStatus('connecting');
-    const ws = new WebSocket(this.url);
+    void this.open(attempt);
+  }
+
+  private async open(attempt: number) {
+    // The token may need a moment (it comes from the Keychain).
+    let token = '';
+    try {
+      token = (await this.opts.token?.()) ?? '';
+    } catch {
+      token = '';
+    }
+    // Closed, or connecting again, meanwhile.
+    if (attempt !== this.attempt) return;
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(this.url, protocolsFor(token));
+    } catch {
+      // Only a malformed address or subprotocol throws here; treat it like a failed attempt.
+      this.failed(!!token);
+      return;
+    }
     this.ws = ws;
-    ws.onopen = async () => {
+    let opened = false;
+    ws.onopen = () => {
+      if (this.ws !== ws) return;
+      opened = true;
+      this.failedOpens = 0;
+      this.unreachableMs = UNREACHABLE_MIN_MS;
       this.samples = [];
       this.onStatus('open');
-      // The hello may need a moment (the token comes from the Keychain).
-      const hello = await this.hello();
-      if (this.ws === ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(hello));
+      const hello = this.hello();
+      ws.send(JSON.stringify(token ? { ...hello, token } : hello));
     };
     ws.onmessage = (e) => {
       const msg = parseServerMsg(e.data);
@@ -80,10 +143,34 @@ export class Net {
     };
     ws.onclose = () => {
       if (this.ws !== ws) return;
+      this.ws = null;
+      if (!opened) return this.failed(!!token);
       this.onStatus('closed');
-      this.schedule(this.retryMs);
-      this.retryMs = Math.min(RETRY_MAX_MS, this.retryMs * 2);
+      this.reconnectSoon();
     };
+  }
+
+  /** The usual reconnect after a dropped connection: quick, backing off to a few seconds. */
+  private reconnectSoon() {
+    this.schedule(this.retryMs);
+    this.retryMs = Math.min(RETRY_MAX_MS, this.retryMs * 2);
+  }
+
+  /**
+   * An attempt that never opened: the hub is down, unreachable, or refused the
+   * upgrade (it does that for a missing or wrong access token). Say so, and
+   * after a few quick retries slow down, so a refused app doesn't hammer it.
+   */
+  private failed(withToken: boolean) {
+    this.failedOpens++;
+    const attempt = this.attempt;
+    this.onStatus('closed');
+    this.opts.onConnectFailed?.(this.failedOpens, withToken);
+    // A handler closed us (or connected again): leave the retries to that.
+    if (attempt !== this.attempt) return;
+    if (this.failedOpens < FAST_FAILURES) return this.reconnectSoon();
+    this.schedule(this.unreachableMs);
+    this.unreachableMs = Math.min(UNREACHABLE_MAX_MS, this.unreachableMs * 2);
   }
 
   /** The hub refused us for now: drop the connection and try again later, backing off each time. Returns the delay. */
@@ -123,6 +210,7 @@ export class Net {
   /** Disconnect and stop reconnecting (until `connect()` or `retryLater()`). */
   close() {
     clearTimeout(this.retryTimer);
+    this.attempt++;
     const ws = this.ws;
     this.ws = null;
     ws?.close();

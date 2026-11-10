@@ -5,6 +5,10 @@
 // keeps one random secret and derives a different id for every hub from it:
 // HMAC-SHA256(secret, hub address). A hub you were tricked into connecting to
 // sees an id that means nothing anywhere else.
+//
+// On the desktop (macOS) the secret lives in the login Keychain rather than in
+// web storage, which any process running as the user can read; see
+// `vaultSecret` and `src-tauri/src/token.rs`.
 
 /** The bits of `Storage` used here. */
 export interface KeyValue {
@@ -14,6 +18,10 @@ export interface KeyValue {
 }
 
 export const SECRET_KEY = 'sb:deviceSecret';
+/** Set once the secret is in the Keychain: from then on it is only read from there. */
+export const SECRET_IN_VAULT_KEY = 'sb:deviceSecretInKeychain';
+/** What a device secret looks like (the Keychain side checks the same). */
+export const DEVICE_SECRET = /^[A-Za-z0-9_-]{32,128}$/;
 /** Before per-hub ids: one id for every hub. */
 export const LEGACY_ID_KEY = 'sb:clientId';
 /** An id pinned to one hub: the legacy id after migration, or a random one where WebCrypto is missing. */
@@ -55,6 +63,46 @@ export function migrateLegacyId(store: KeyValue, hub: string) {
   store.removeItem(LEGACY_ID_KEY);
 }
 
+/** The Keychain item for the device secret (see the `device_secret_*` commands). */
+export interface SecretVault {
+  /** The stored secret, or null if there is none. Throws if the Keychain can't be used. */
+  get(): Promise<string | null>;
+  /**
+   * Replaces any existing item with a new one holding `secret`, so the item is
+   * always one this app created, and returns the secret now stored. Within one
+   * run of the app only the first call creates; later ones (the other window)
+   * get that secret back.
+   */
+  create(secret: string): Promise<string>;
+}
+
+/**
+ * The device secret from the Keychain, moving the one in web storage there
+ * (and out of web storage) the first time. Returns null where there is no
+ * Keychain or it refused, and the secret stays in web storage as before.
+ */
+export async function vaultSecret(store: KeyValue, vault: SecretVault | null): Promise<string | null> {
+  if (!vault) return null;
+  try {
+    if (store.getItem(SECRET_IN_VAULT_KEY) === '1') {
+      const stored = await vault.get();
+      if (stored && DEVICE_SECRET.test(stored)) {
+        store.removeItem(SECRET_KEY);
+        return stored;
+      }
+      // The item is gone (deleted by hand): start a new one below.
+    }
+    const local = store.getItem(SECRET_KEY);
+    const created = await vault.create(local && DEVICE_SECRET.test(local) ? local : randomId(32));
+    if (!DEVICE_SECRET.test(created)) return null;
+    store.setItem(SECRET_IN_VAULT_KEY, '1');
+    store.removeItem(SECRET_KEY);
+    return created;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * This device's client id for `hub`. Where WebCrypto is missing (the browser
  * version on a plain-http LAN address, which isn't a secure context) each hub
@@ -65,6 +113,8 @@ export async function clientIdFor(
   store: KeyValue,
   hub: string,
   subtle: SubtleCrypto | null = globalThis.crypto?.subtle ?? null,
+  /** The secret from the Keychain (`vaultSecret`), if there is one; else web storage holds it. */
+  vaulted: string | null = null,
 ): Promise<string> {
   const pinned = store.getItem(idKey(hub));
   if (pinned && CLIENT_ID.test(pinned)) return pinned;
@@ -73,6 +123,7 @@ export async function clientIdFor(
     store.setItem(idKey(hub), id);
     return id;
   }
+  if (vaulted) return deriveClientId(vaulted, hub, subtle);
   let secret = store.getItem(SECRET_KEY);
   if (!secret || secret.length < 32) {
     secret = randomId(32);

@@ -61,10 +61,13 @@ export function isTrustedProxy(trusted: TrustedProxies, ip: string): boolean {
  * one of the trusted proxies; then the right-most entry that isn't itself a
  * trusted proxy is the client (so a CDN → nginx chain works when both are
  * listed). Anything left of that was written by the client and is ignored.
+ * `socketPeerIsProxy`: the hub listens on a Unix socket only the proxy can
+ * open, so a peer without an IP address is the proxy.
  */
-export function clientAddress(req: IncomingMessage, trusted: TrustedProxies): string {
-  const peer = plainIp(req.socket.remoteAddress ?? 'unknown');
-  if (!isTrustedProxy(trusted, peer)) return peer;
+export function clientAddress(req: IncomingMessage, trusted: TrustedProxies, socketPeerIsProxy = false): string {
+  const remote = req.socket.remoteAddress;
+  const peer = plainIp(remote ?? 'unix');
+  if (!(socketPeerIsProxy && remote === undefined) && !isTrustedProxy(trusted, peer)) return peer;
   const header = req.headers['x-forwarded-for'];
   const hops = (Array.isArray(header) ? header.join(',') : (header ?? '')).split(',').map((s) => s.trim()).filter(Boolean);
   let client = peer;
@@ -79,9 +82,10 @@ export function clientAddress(req: IncomingMessage, trusted: TrustedProxies): st
 
 /**
  * The key per-address limits use. One machine usually gets a whole IPv6 /64,
- * so IPv6 addresses are grouped by it; IPv4-mapped addresses count as IPv4.
+ * so IPv6 addresses are grouped by it (or, with `v6Bits` 56, by the /56 a
+ * home or small office is usually given); IPv4-mapped addresses count as IPv4.
  */
-export function addressKey(ip: string): string {
+export function addressKey(ip: string, v6Bits: 64 | 56 = 64): string {
   if (ip.startsWith('::ffff:') && isIP(ip.slice(7)) === 4) return ip.slice(7);
   const bare = ip.split('%')[0];
   if (isIP(bare) !== 6) return ip;
@@ -91,7 +95,9 @@ export function addressKey(ip: string): string {
   const left = groups(halves[0]);
   const right = groups(halves[1]);
   const full = halves.length === 2 ? [...left, ...Array(8 - width(left) - width(right)).fill('0'), ...right] : left;
-  return `${full.slice(0, 4).map((g) => parseInt(g, 16).toString(16)).join(':')}::/64`;
+  const head = full.slice(0, 4).map((g) => parseInt(g, 16));
+  if (v6Bits === 56) head[3] &= 0xff00;
+  return `${head.map((g) => g.toString(16)).join(':')}::/${v6Bits}`;
 }
 
 /** The desktop app's own origins (macOS/Linux, Windows). */

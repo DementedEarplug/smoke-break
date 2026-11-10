@@ -70,10 +70,13 @@ async function start(id: platform.Identity) {
   let placed = false;
 
   let askedForToken = false;
+  /** Got a team update since starting, i.e. the hub took our token at least once. */
+  let connected = false;
   const net = createSession(
     { type: 'hello', teamCode: id.teamCode, clientId: id.clientId, name: id.name },
     {
       onTeam: (team, you) => {
+        connected = true;
         widget.setTeam(team, you);
         if (waiting) {
           waiting = false;
@@ -87,6 +90,17 @@ async function start(id: platform.Identity) {
         // address is refused) the settings window explains and keeps the team.
         await win.hide();
         await invoke('show_panel');
+      },
+      onCantConnect: () => {
+        // The session keeps backing off. If this never worked since the app
+        // started, it's most likely the token (a new or revoked one): the
+        // settings window says so and offers to change it. A dropped network
+        // later on only gets the toast.
+        widget.showToast('Can’t connect to the hub', 6000);
+        if (!connected && !askedForToken) {
+          askedForToken = true;
+          void invoke('show_panel');
+        }
       },
       // The settings window shows the waiting screen; the session keeps asking.
       onPending: () => {

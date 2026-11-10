@@ -1,7 +1,7 @@
 // The saved team file: its format, migration from older formats, and safe writes.
 
 import { randomBytes } from 'node:crypto';
-import { closeSync, constants as fsConstants, fsyncSync, mkdirSync, openSync, renameSync, rmSync, statSync, writeSync } from 'node:fs';
+import { closeSync, constants as fsConstants, fchmodSync, fsyncSync, mkdirSync, openSync, renameSync, rmSync, statSync, writeSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { DEFAULT_LENGTH_MIN, type MeetingProviderKind, clampLength, normalizeMeetingLink } from '../shared/protocol.ts';
 import { cleanName } from './names.ts';
@@ -36,6 +36,16 @@ export interface SavedBan {
   id: string;
   label?: string;
   reason: BanReason;
+  /** 'denied' only: when they may ask again (ms). Removals are for good. */
+  until?: number;
+}
+
+/** A whole access-token label kept out of a team. */
+export interface SavedLabelBan {
+  label: string;
+  reason: BanReason;
+  /** As for SavedBan. */
+  until?: number;
 }
 
 export interface SavedPending {
@@ -61,13 +71,18 @@ export interface SavedTeam {
   requireApproval: boolean;
   roster: SavedMember[];
   banned: SavedBan[];
+  /** Labels removed (or, for a day, turned away) as a whole. */
+  bannedLabels: SavedLabelBan[];
   pending: SavedPending[];
+  /** A break with two or more people has happened: the team is really used. */
+  hadGroupBreak: boolean;
 }
 
 export const randomRef = () => randomBytes(4).toString('hex');
 
 const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 const labelOf = (v: unknown) => (typeof v === 'string' && LABEL.test(v) ? v : undefined);
+const timeOf = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : undefined);
 
 /** Keeps the last occurrence of each id, in order, at most `max` (the newest). */
 function byId<T extends { id: string }>(items: T[], max: number): T[] {
@@ -105,10 +120,41 @@ function parseBanned(r: Record<string, unknown>): SavedBan[] {
       const b: SavedBan = { id: x.id, reason: x.reason === 'denied' ? 'denied' : 'removed' };
       const label = labelOf(x.label);
       if (label) b.label = label;
+      const until = timeOf(x.until);
+      if (b.reason === 'denied' && until) b.until = until;
       out.push(b);
     }
   }
   return byId(out, MAX_SAVED_BANNED);
+}
+
+/**
+ * Label bans. Files from before they were kept separately banned a label
+ * through any ban that carried it, so those become label bans (a removal wins
+ * over a denial), except the owner's own label (an owner removing an old
+ * device of their own).
+ */
+function parseLabelBans(r: Record<string, unknown>, banned: SavedBan[], ownerLabel: string | undefined): SavedLabelBan[] {
+  const out = new Map<string, SavedLabelBan>();
+  const add = (b: SavedLabelBan) => {
+    const prev = out.get(b.label);
+    if (prev?.reason === 'removed' && b.reason !== 'removed') return;
+    out.delete(b.label);
+    out.set(b.label, b);
+  };
+  if (Array.isArray(r.bannedLabels)) {
+    for (const x of r.bannedLabels) {
+      const label = isObj(x) ? labelOf(x.label) : undefined;
+      if (!label) continue;
+      const b: SavedLabelBan = { label, reason: (x as Record<string, unknown>).reason === 'denied' ? 'denied' : 'removed' };
+      const until = timeOf((x as Record<string, unknown>).until);
+      if (b.reason === 'denied' && until) b.until = until;
+      add(b);
+    }
+  } else {
+    for (const b of banned) if (b.label && b.label !== ownerLabel) add(b.until ? { label: b.label, reason: b.reason, until: b.until } : { label: b.label, reason: b.reason });
+  }
+  return [...out.values()].slice(-MAX_SAVED_BANNED);
 }
 
 function parsePending(r: Record<string, unknown>, now: number): SavedPending[] {
@@ -162,7 +208,10 @@ export function parseSavedTeam(t: unknown, now: number): SavedTeam | null {
     requireApproval: typeof r.requireApproval === 'boolean' ? r.requireApproval : true,
     roster,
     banned,
+    bannedLabels: parseLabelBans(r, banned, roster.find((m) => m.id === ownerId)?.label),
     pending: parsePending(r, now).filter((p) => !rosterIds.has(p.id) && !bannedIds.has(p.id)),
+    // Teams from before this was kept: assume one several people belong to is really used.
+    hadGroupBreak: typeof r.hadGroupBreak === 'boolean' ? r.hadGroupBreak : roster.length >= 2,
   };
 }
 
@@ -189,15 +238,16 @@ export function checkDataDir(dir: string) {
  * Writes via a temp file and rename, so a crash mid-write never leaves a
  * half-written file. The temp file has a random name and is created fresh
  * (never following a planted symlink or reusing someone else's file), readable
- * only by this user.
+ * only by this user (or with `mode`, to keep an existing file's).
  */
-export function writeAtomic(file: string, text: string) {
+export function writeAtomic(file: string, text: string, mode = 0o600) {
   mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
   const tmp = `${file}.${randomBytes(8).toString('hex')}.tmp`;
   const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0);
   // Zoom links can carry the meeting passcode, so only this user may read the file.
   let fd: number | null = openSync(tmp, flags, 0o600);
   try {
+    if (mode !== 0o600) fchmodSync(fd, mode); // not subject to the umask, unlike openSync's mode
     writeSync(fd, text);
     fsyncSync(fd);
     closeSync(fd);

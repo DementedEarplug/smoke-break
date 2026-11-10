@@ -6,7 +6,15 @@
 // hands that server something that works on the real one.
 
 import { invoke } from '@tauri-apps/api/core';
-import { type KeyValue, LEGACY_ID_KEY, SECRET_KEY, clientIdFor, migrateLegacyId } from './identity.ts';
+import {
+  type KeyValue,
+  LEGACY_ID_KEY,
+  SECRET_KEY,
+  type SecretVault,
+  clientIdFor,
+  migrateLegacyId,
+  vaultSecret,
+} from './identity.ts';
 import { checkServerUrl, hubKey } from './serverUrl.ts';
 
 export const isDesktop = '__TAURI_INTERNALS__' in window;
@@ -110,8 +118,20 @@ export function leaveTeam(hub = currentHub()) {
 /** This device's client id for a hub (by default the configured one). */
 export async function clientId(hub = currentHub()): Promise<string> {
   await ready;
-  return clientIdFor(store, hub);
+  return clientIdFor(store, hub, undefined, deviceSecret);
 }
+
+/**
+ * Desktop on macOS: the device secret (the key every client id is derived
+ * from, so the proof of who you are and of team ownership) lives in the login
+ * Keychain, like access tokens. The commands only ever touch that one item.
+ */
+const keychainVault: SecretVault = {
+  get: () => invoke<string | null>('device_secret_get'),
+  create: (secret) => invoke<string>('device_secret_create', { secret }),
+};
+/** The secret from the Keychain, once `ready`; null where web storage holds it instead. */
+let deviceSecret: string | null = null;
 
 export async function loadIdentity(): Promise<Identity | null> {
   await ready;
@@ -203,11 +223,6 @@ export async function hubToken(hub: string): Promise<string> {
   return (await savedHubToken(hub)) || builtInToken(hub);
 }
 
-/** Adds the hub's access token to a create/hello, when there is one. */
-export async function withToken<T extends object>(msg: T, hub: string): Promise<T & { token?: string }> {
-  const token = await hubToken(hub);
-  return token ? { ...msg, token } : msg;
-}
 
 // ── Upgrade from one identity for every hub ─────────────────────────────────
 
@@ -219,6 +234,8 @@ export async function withToken<T extends object>(msg: T, hub: string): Promise<
 async function migrate(kv: KeyValue) {
   const hub = currentHub();
   migrateLegacyId(kv, hub);
+  // The browser version keeps one teammate per tab in session storage.
+  deviceSecret = await vaultSecret(kv, isDesktop ? keychainVault : null);
   const team = kv.getItem(LEGACY_TEAM_KEY);
   if (team !== null) {
     if (team && !kv.getItem(teamKey(hub))) kv.setItem(teamKey(hub), team);

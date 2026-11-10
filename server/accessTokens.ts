@@ -1,5 +1,5 @@
-// Who may create or join teams: one shared token (SMOKE_BREAK_ACCESS_TOKEN)
-// and/or per-person tokens from a file (SMOKE_BREAK_ACCESS_TOKENS_FILE).
+// Who may connect: one shared token (SMOKE_BREAK_ACCESS_TOKEN) or per-person
+// tokens from a file (SMOKE_BREAK_ACCESS_TOKENS_FILE), never both.
 
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
@@ -58,6 +58,16 @@ export interface Access {
   digest: Buffer | null;
 }
 
+/** What the hub learns after the tokens file was read again. */
+export interface TokensChange {
+  /** Whether a connection let in with (label, digest) may stay. */
+  valid: (label: string | null, digest: Buffer | null) => boolean;
+  /** Labels in the last good file that aren't in this one (empty while the file is broken). */
+  revoked: string[];
+  /** Labels in the file now, or null while it's broken (then no token is valid). */
+  present: Set<string> | null;
+}
+
 export interface AccessTokensOptions {
   /** The shared token (SMOKE_BREAK_ACCESS_TOKEN), or ''. */
   shared: string;
@@ -65,21 +75,36 @@ export interface AccessTokensOptions {
   file: string;
   /** How often to look for changes to the file. */
   pollMs: number;
-  /** Called after a reload with the entries that are now valid. */
-  onReload: (valid: (label: string | null, digest: Buffer | null) => boolean) => void;
+  /** Called after every reload, good or bad. */
+  onReload: (change: TokensChange) => void;
   log: (event: string, fields: Record<string, unknown>) => void;
 }
 
 export class AccessTokens {
   private entries: TokenEntry[];
+  /** The entries by label, so checking every open connection after a reload stays cheap. */
+  private byLabel = new Map<string, Buffer[]>();
   private readonly sharedDigest: Buffer | null;
   private readonly opts: AccessTokensOptions;
   private stamp: string;
   private timer: ReturnType<typeof setInterval> | null = null;
+  /** Labels in the last file that could be read, to tell what a new one revoked. */
+  private lastGood: Set<string>;
+  /** Why the file can't be used right now, or null if it's fine. */
+  private brokenReason: string | null = null;
 
-  /** Throws if the file is missing, readable by others or malformed: the hub must not start like that. */
+  /**
+   * Throws if both a shared token and a file are set, or if the file is
+   * missing, readable by others or malformed: the hub must not start like that.
+   */
   constructor(opts: AccessTokensOptions) {
     this.opts = opts;
+    if (opts.shared && opts.file) {
+      // A shared token would let anyone in under no label, past every per-person ban and revocation.
+      throw new Error(
+        'SMOKE_BREAK_ACCESS_TOKENS_FILE and SMOKE_BREAK_ACCESS_TOKEN are both set. Use one: per-person tokens (recommended) or a single shared token, not both.',
+      );
+    }
     this.sharedDigest = opts.shared ? digestOf(opts.shared) : null;
     this.entries = [];
     this.stamp = '';
@@ -93,9 +118,17 @@ export class AccessTokens {
       this.timer = setInterval(() => this.poll(), opts.pollMs);
       this.timer.unref();
     }
+    this.lastGood = new Set(this.entries.map((e) => e.label));
+    this.setEntries(this.entries);
   }
 
-  /** True when every create/hello must carry a token. */
+  private setEntries(entries: TokenEntry[]) {
+    this.entries = entries;
+    this.byLabel = new Map();
+    for (const e of entries) this.byLabel.set(e.label, [...(this.byLabel.get(e.label) ?? []), e.digest]);
+  }
+
+  /** True when every connection must carry a token. */
   get required(): boolean {
     return !!this.sharedDigest || !!this.opts.file;
   }
@@ -104,24 +137,39 @@ export class AccessTokens {
     return new Set(this.entries.map((e) => e.label)).size;
   }
 
+  /** Why the tokens file can't be used right now (no token is valid meanwhile), or null. */
+  get broken(): string | null {
+    return this.brokenReason;
+  }
+
+  /** Labels that are valid now, or null if there is no tokens file or it's broken. */
+  present(): Set<string> | null {
+    return this.opts.file && !this.brokenReason ? new Set(this.entries.map((e) => e.label)) : null;
+  }
+
   /** Who a token belongs to, or null if it isn't valid. Compares against every token in constant time. */
   check(given: unknown): Access | null {
     if (!this.required) return { label: null, digest: null };
     if (typeof given !== 'string' || given.length > 1024) return null;
     const d = digestOf(given);
+    if (this.sharedDigest) return timingSafeEqual(d, this.sharedDigest) ? { label: null, digest: this.sharedDigest } : null;
     let match: TokenEntry | null = null;
     for (const e of this.entries) if (timingSafeEqual(d, e.digest) && !match) match = e;
-    const shared = !!this.sharedDigest && timingSafeEqual(d, this.sharedDigest);
-    if (match) return { label: match.label, digest: match.digest };
-    return shared ? { label: null, digest: this.sharedDigest } : null;
+    return match ? { label: match.label, digest: match.digest } : null;
   }
 
-  /** Whether a connection let in with (label, digest) is still allowed after a reload. */
+  /** True if `given` is the very token whose digest is `digest`. */
+  sameToken(given: unknown, digest: Buffer | null): boolean {
+    if (typeof given !== 'string' || given.length > 1024 || !digest) return false;
+    return timingSafeEqual(digestOf(given), digest);
+  }
+
+  /** Whether a connection let in with (label, digest) is still allowed. */
   stillValid(label: string | null, digest: Buffer | null): boolean {
     if (!this.required) return true;
     if (!digest) return false;
     if (label === null) return !!this.sharedDigest && timingSafeEqual(digest, this.sharedDigest);
-    return this.entries.some((e) => e.label === label && timingSafeEqual(e.digest, digest));
+    return (this.byLabel.get(label) ?? []).some((d) => timingSafeEqual(d, digest));
   }
 
   private fileStamp(): string {
@@ -133,7 +181,7 @@ export class AccessTokens {
     }
   }
 
-  /** Re-reads the file if it changed. A broken file keeps the last good list (and says so) rather than locking everyone out. */
+  /** Re-reads the file if it changed. */
   poll() {
     const stamp = this.fileStamp();
     if (stamp === this.stamp) return;
@@ -141,21 +189,38 @@ export class AccessTokens {
     this.reload();
   }
 
+  /**
+   * Reads the file again. A file that can't be used fails closed: no token is
+   * valid until it's fixed (said once per reason), rather than keeping a list
+   * that may still hold a line the admin just deleted.
+   */
   reload() {
+    if (!this.opts.file) return;
     let next: TokenEntry[];
     try {
       next = readTokensFile(this.opts.file);
     } catch (err) {
-      console.error(`[smoke-break] !!! Can't use SMOKE_BREAK_ACCESS_TOKENS_FILE (${(err as Error).message}). Keeping the previous token list.`);
-      this.opts.log('tokens-reload-failed', {});
+      const reason = (err as Error).message;
+      this.setEntries([]);
+      if (reason !== this.brokenReason) {
+        this.brokenReason = reason;
+        console.error(
+          `[smoke-break] !!! Can't use SMOKE_BREAK_ACCESS_TOKENS_FILE (${reason}). NO access token is valid until it's fixed: ` +
+            'new connections are refused and per-person connections are closed. Write the new file next to it and rename it over the old one.',
+        );
+        this.opts.log('tokens-file-broken', { reason });
+      }
+      this.opts.onReload({ valid: (l, d) => this.stillValid(l, d), revoked: [], present: null });
       return;
     }
-    const before = new Set(this.entries.map((e) => e.label));
-    this.entries = next;
+    if (this.brokenReason) console.error('[smoke-break] SMOKE_BREAK_ACCESS_TOKENS_FILE can be used again.');
+    this.brokenReason = null;
+    this.setEntries(next);
     const after = new Set(next.map((e) => e.label));
-    const revoked = [...before].filter((l) => !after.has(l));
+    const revoked = [...this.lastGood].filter((l) => !after.has(l));
+    this.lastGood = after;
     this.opts.log('tokens-reloaded', { labels: after.size, revoked });
-    this.opts.onReload((label, digest) => this.stillValid(label, digest));
+    this.opts.onReload({ valid: (l, d) => this.stillValid(l, d), revoked, present: after });
   }
 
   close() {

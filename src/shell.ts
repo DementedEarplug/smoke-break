@@ -14,6 +14,7 @@ import {
 import { SIZES, loadAppearance, onAppearanceChange, saveAppearance } from './appearance.ts';
 import type { Net, NetStatus } from './net.ts';
 import * as platform from './platform.ts';
+import { lookalikeIds, whoTags } from './roster.ts';
 import { hubKey } from './serverUrl.ts';
 import { lighterPreview, packPreview } from './widget/preview.ts';
 import { LIGHTER_SKINS, packSkin } from './widget/skins.ts';
@@ -209,14 +210,19 @@ export interface TeamPanel {
   setTeam(team: TeamView, you: string): void;
   setStatus(status: NetStatus): void;
   setError(message: string): void;
-  /** A connection problem to show until the next team update ('' clears it). */
-  setNotice(message: string): void;
+  /**
+   * A connection problem to show until the next team update ('' clears it),
+   * optionally with a button that does something about it.
+   */
+  setNotice(message: string, action?: NoticeAction): void;
   /** The owner hasn't let us into this team yet: show the waiting screen until `setTeam`. */
   setWaiting(teamCode: string): void;
 }
 
-/** Public ids are long; this much tells people with the same name apart. */
-const shortId = (id: string) => id.slice(0, 6);
+export interface NoticeAction {
+  label: string;
+  run(): void;
+}
 
 export function createTeamPanel(
   panel: HTMLElement,
@@ -236,6 +242,7 @@ export function createTeamPanel(
   let panelError = '';
   let errorTimer: ReturnType<typeof setTimeout> | undefined;
   let notice = '';
+  let noticeAction: NoticeAction | undefined;
   /** Waiting for the owner's OK to join this team ('' when not waiting). */
   let waitingFor = '';
   /** Owner actions waiting for a second click: 'rotate', or `remove:<id>` / `owner:<id>` for a member. */
@@ -269,7 +276,13 @@ export function createTeamPanel(
 
   function render() {
     if (settingsOpen) return;
-    const problems = [notice, panelError].filter(Boolean).map((m) => h('p', { class: 'sb-error', textContent: m }));
+    const problems: HTMLElement[] = [notice, panelError].filter(Boolean).map((m) => h('p', { class: 'sb-error', textContent: m }));
+    if (notice && noticeAction) {
+      const act = noticeAction;
+      const b = h('button', { textContent: act.label, className: 'secondary' });
+      b.onclick = () => act.run();
+      problems.splice(1, 0, h('div', { class: 'sb-row sb-notice-action' }, b));
+    }
     if (waitingFor) {
       const cancel = h('button', { textContent: 'Cancel', className: 'secondary' });
       cancel.onclick = () => opts.onCancelWaiting();
@@ -318,13 +331,39 @@ export function createTeamPanel(
 
     const net = opts.net;
     const t = team;
+    /** Entries whose names look the same as another's: they get their id shown too. */
+    const alike = lookalikeIds(t.members, t.pending);
+    /**
+     * The access-token label (only the owner receives it) is who someone
+     * really is; the name is what they typed. Shown next to the name, with the
+     * start of the id where that alone doesn't tell people apart.
+     */
+    const who = (m: MemberView, waiting: boolean): HTMLElement[] => {
+      const tags = whoTags(m, { lookalike: alike.has(m.id), waiting });
+      const out: HTMLElement[] = [];
+      if (tags.label) {
+        out.push(
+          h('span', {
+            class: 'sb-label',
+            textContent: tags.label,
+            title: 'Whose access token they use: who they really are. The name is just what they typed.',
+          }),
+        );
+      }
+      if (tags.id) out.push(h('code', { class: 'sb-id', textContent: tags.id, title: 'Start of their id' }));
+      return out;
+    };
     /** Inline confirm for one member; only one of a member's actions asks at a time. */
     const memberActions = (m: MemberView) => {
+      const whom = m.label ? `${m.name} (${m.label})` : m.name;
+      const consequences = m.label
+        ? `This removes every device that uses ${m.label}’s access token, and none of them can rejoin.`
+        : 'They can’t rejoin.';
       const remove = () =>
         confirmable(
           `remove:${m.id}`,
           'Remove',
-          `Remove ${m.name}? They can’t rejoin, and the invite code changes: teammates who are offline will need the new one from you.`,
+          `Remove ${whom}? ${consequences} The invite code changes too: teammates who are offline will need the new one from you.`,
           'Remove',
           () => net.send({ type: 'removeMember', id: m.id }),
         );
@@ -332,7 +371,7 @@ export function createTeamPanel(
         confirmable(
           `owner:${m.id}`,
           'Make owner',
-          `Make ${m.name} the owner? They’ll manage the team and its settings, and you won’t any more.`,
+          `Make ${whom} the owner? They’ll manage the team and its settings, and you won’t any more.`,
           'Make owner',
           () => net.send({ type: 'transferOwner', id: m.id }),
         );
@@ -348,6 +387,7 @@ export function createTeamPanel(
           'li',
           { class: m.online ? 'online' : '', title: m.online ? 'Online' : 'Offline' },
           m.name + (m.id === you ? ' (you)' : ''),
+          ...who(m, false),
         );
         if (m.id === t.ownerId) li.append(h('span', { class: 'sb-tag', textContent: 'owner' }));
         // Removing also keeps them from rejoining with the code they have.
@@ -355,8 +395,8 @@ export function createTeamPanel(
         return li;
       }),
     );
-    // Only the owner receives the waiting list. Names are whatever people typed,
-    // so the start of their id tells two "Alex" apart.
+    // Only the owner receives the waiting list. Names are whatever people typed;
+    // the label (or else the start of their id) says who is really asking.
     const waiting =
       isOwner && t.pending.length
         ? h(
@@ -369,21 +409,20 @@ export function createTeamPanel(
               ...t.pending.map((m) => {
                 const allow = h('button', { textContent: 'Allow' });
                 allow.onclick = () => net.send({ type: 'approveMember', id: m.id, allow: true });
-                const deny = h('button', { textContent: 'Deny', className: 'secondary' });
+                // Not for good: the hub lets them ask again after a day.
+                const deny = h('button', {
+                  textContent: 'Not now',
+                  className: 'secondary',
+                  title: 'Turn them away for now. They can ask again after a day.',
+                });
                 deny.onclick = () => net.send({ type: 'approveMember', id: m.id, allow: false });
-                return h(
-                  'li',
-                  { class: 'online' },
-                  m.name,
-                  h('code', { class: 'sb-id', textContent: shortId(m.id), title: 'Start of their id' }),
-                  allow,
-                  deny,
-                );
+                return h('li', { class: 'online' }, m.name, ...who(m, true), allow, deny);
               }),
             ),
             h('p', {
               class: 'sb-hint',
-              textContent: 'Names are what people typed in. Only let in people you expect; the code after a name tells two with the same name apart.',
+              textContent:
+                'Names are what people typed in. The boxed name after it, when there is one, is whose access token they use: that is who is really asking. Only let in people you expect. “Not now” turns someone away for a day; after that they can ask again.',
             }),
           )
         : '';
@@ -494,6 +533,7 @@ export function createTeamPanel(
       team = t;
       you = me;
       notice = '';
+      noticeAction = undefined;
       waitingFor = '';
       // Ownership can move to someone else while their settings are open.
       if (settingsOpen && t.ownerId !== me) settingsOpen = false;
@@ -518,8 +558,9 @@ export function createTeamPanel(
         render();
       }, ERROR_SHOW_MS);
     },
-    setNotice(message) {
+    setNotice(message, action) {
       notice = message;
+      noticeAction = message ? action : undefined;
       render();
     },
   };
