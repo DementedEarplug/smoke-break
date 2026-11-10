@@ -28,3 +28,19 @@ export function checkServerUrl(raw: string): { url: string } | { error: string }
   return { error: 'The server address must start with wss://.' };
 }
 
+/**
+ * The form of a hub address that per-hub data (client id, access token, saved
+ * team) is filed under, so `WSS://Hub.example.com:443/ws` and
+ * `wss://hub.example.com/ws` are the same hub.
+ */
+export function hubKey(raw: string): string {
+  const s = raw.trim();
+  try {
+    const url = new URL(s);
+    url.hash = '';
+    return url.href;
+  } catch {
+    return s;
+  }
+}
+

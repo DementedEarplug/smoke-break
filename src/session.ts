@@ -12,8 +12,9 @@ export interface SessionHandlers {
   onError(message: string): void;
   /**
    * The team couldn't be joined and we've stopped trying; the connection is
-   * closed. `forget` is set when the team is gone for good (bad invite code, or
-   * we were removed), so the caller should drop the saved team.
+   * closed. `forget` is set when the team is gone for good (bad invite code,
+   * removed, or the owner said no); the session has already dropped it from
+   * the saved identity.
    */
   onFatal(message: string, forget: boolean, code?: ErrorCode): void;
   /**
@@ -21,22 +22,44 @@ export interface SessionHandlers {
    * given). The saved team is kept and the session retries by itself in `retryInMs`.
    */
   onRetrying?(message: string, code: ErrorCode | undefined, retryInMs: number): void;
+  /**
+   * The team owner hasn't let us in yet. The team is saved and the session asks
+   * again by itself every 10-15 s until they decide.
+   */
+  onPending?(message: string, retryInMs: number): void;
   onStatus?(status: NetStatus): void;
 }
 
-/** Call `connect()` on the result once the handlers' targets exist. */
-export function createSession(first: JoinMsg, handlers: SessionHandlers): Net {
+/**
+ * Call `connect()` on the result once the handlers' targets exist. `hub` is
+ * the hub `first.clientId` was made for; the session only ever talks to it.
+ */
+export function createSession(first: JoinMsg, handlers: SessionHandlers, hub = platform.currentHub()): Net {
   let hello = first;
+  /** The team this session is for, once known. */
+  const teamCode = () => (hello.type === 'hello' ? hello.teamCode : null);
   const net = new Net(
+    hub,
     // Read the token on every connect, so a corrected one is used on the next retry.
-    () => platform.withToken(hello),
+    () => platform.withToken(hello, hub),
     (msg) => {
       if (msg.type === 'error') {
         if (!msg.fatal) return handlers.onError(msg.message);
+        const code = teamCode();
+        if (msg.code === 'pending' && code) {
+          // Keep the team, so a restart picks up the wait where it left off.
+          if (platform.savedTeam(hub) !== code) platform.saveTeam(code, hub);
+          const retryInMs = net.retryPending();
+          if (handlers.onPending) handlers.onPending(msg.message, retryInMs);
+          else handlers.onRetrying?.(msg.message, msg.code, retryInMs);
+          return;
+        }
         const forget = forgetsTeam(msg.code);
         // A refused "create" has no team to keep retrying for: back to onboarding.
         if (forget || hello.type === 'create' || !handlers.onRetrying) {
           net.close();
+          // Gone for good: stop retrying and drop it, unless the saved team is another one.
+          if (forget && code && platform.savedTeam(hub) === code) platform.leaveTeam(hub);
           handlers.onFatal(msg.message, forget, msg.code);
         } else {
           handlers.onRetrying(msg.message, msg.code, net.retryLater());
@@ -48,7 +71,7 @@ export function createSession(first: JoinMsg, handlers: SessionHandlers): Net {
       if (hello.type === 'create' || hello.teamCode !== msg.team.code) {
         hello = { type: 'hello', teamCode: msg.team.code, clientId: hello.clientId, name: hello.name };
       }
-      if (platform.savedTeam() !== msg.team.code) platform.saveTeam(msg.team.code);
+      if (platform.savedTeam(hub) !== msg.team.code) platform.saveTeam(msg.team.code, hub);
       handlers.onTeam(msg.team, msg.you);
     },
     (s) => handlers.onStatus?.(s),

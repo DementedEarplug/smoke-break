@@ -51,31 +51,48 @@ const win = getCurrentWindow();
 // Joining or leaving a team happens in the settings window; start over when it does.
 void listen('identity-changed', () => location.reload());
 
-const identity = platform.loadIdentity();
-// A refused server address is explained (and fixed) in the settings window.
-if (identity && !platform.serverProblem()) {
-  void start(identity);
-} else {
-  void win.hide();
-  void invoke('show_panel');
-}
+void (async () => {
+  const identity = await platform.loadIdentity();
+  // A refused server address is explained (and fixed) in the settings window.
+  if (identity && !platform.serverProblem(identity.hub)) {
+    void start(identity);
+  } else {
+    void win.hide();
+    void invoke('show_panel');
+  }
+})();
 
 async function start(id: platform.Identity) {
   let mouseDown = false;
+  /** Waiting for the team owner's OK: the pack stays hidden until we're in. */
+  let waiting = false;
+  /** The window has its size and position and may be shown. */
+  let placed = false;
 
   let askedForToken = false;
   const net = createSession(
     { type: 'hello', teamCode: id.teamCode, clientId: id.clientId, name: id.name },
     {
-      onTeam: (team, you) => widget.setTeam(team, you),
+      onTeam: (team, you) => {
+        widget.setTeam(team, you);
+        if (waiting) {
+          waiting = false;
+          if (placed) void win.show();
+        }
+      },
       onError: (message) => widget.showToast(message),
-      onFatal: async (_message, forget) => {
-        // The team is gone (bad code, or we were removed): back to onboarding.
-        // Otherwise (e.g. the server address is refused) the settings window
-        // explains and keeps the team.
-        if (forget) platform.leaveTeam();
+      onFatal: async () => {
+        // The team is gone (bad code, removed, the owner said no; the session
+        // has dropped it): back to onboarding. Otherwise (e.g. the server
+        // address is refused) the settings window explains and keeps the team.
         await win.hide();
         await invoke('show_panel');
+      },
+      // The settings window shows the waiting screen; the session keeps asking.
+      onPending: () => {
+        if (waiting) return;
+        waiting = true;
+        void win.hide();
       },
       onRetrying: (message, code) => {
         // Keep the team and let the session back off; just say why the pack is quiet.
@@ -87,6 +104,7 @@ async function start(id: platform.Identity) {
         }
       },
     },
+    id.hub,
   );
 
   let look = loadAppearance();
@@ -144,7 +162,8 @@ async function start(id: platform.Identity) {
   window.addEventListener('pointerup', () => (mouseDown = false));
 
   await placeWindow(win);
-  await win.show();
+  placed = true;
+  if (!waiting) await win.show();
   await clickThrough(win, widget, () => mouseDown);
 }
 

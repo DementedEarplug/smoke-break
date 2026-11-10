@@ -1,46 +1,31 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { forgetsTeam, normalizeMeetingLink, parseServerMsg } from './protocol.ts';
+import { MEETING_LINK_EXAMPLE, forgetsTeam, normalizeMeetingLink, parseServerMsg } from './protocol.ts';
+
+// Shared with the Rust validator (src-tauri/src/meeting.rs), so the two can't drift apart.
+const vectors = JSON.parse(readFileSync(new URL('./meeting-links.json', import.meta.url), 'utf8')) as {
+  accept: [string, string][];
+  reject: string[];
+};
 
 describe('normalizeMeetingLink', () => {
-  it.each([
-    ['https://zoom.us/j/123?pwd=abc', 'https://zoom.us/j/123?pwd=abc'],
-    ['https://acme.zoom.us/j/123', 'https://acme.zoom.us/j/123'],
-    ['https://zoom.com/j/1', 'https://zoom.com/j/1'],
-    ['https://us02web.zoomgov.com/j/1', 'https://us02web.zoomgov.com/j/1'],
-    // Canonical form: lowercase host, explicit path, default port dropped.
-    ['https://ZOOM.us', 'https://zoom.us/'],
-    ['https://zoom.us:443/j/1', 'https://zoom.us/j/1'],
-    ['', ''],
-  ])('accepts %s', (raw, out) => expect(normalizeMeetingLink(raw)).toBe(out));
+  it.each(vectors.accept)('accepts %j', (raw, out) => expect(normalizeMeetingLink(raw)).toBe(out));
+  it.each(vectors.reject)('rejects %j', (raw) => expect(normalizeMeetingLink(raw)).toBeNull());
 
-  it.each([
-    // The audit's bypass: WHATWG URL reads host zoom.us, macOS reads evil.example.
-    'https://zoom.us\\@evil.example/.zoom.us/x',
-    'https://evil.example/.zoom.us/x',
-    'https://evil.example/?https://zoom.us/',
-    'https://zoom.us.evil.example/j/1',
-    'https://evilzoom.us/j/1',
-    'https://zoom.us./j/1',
-    'https://user@zoom.us/j/1',
-    'https://user:pw@zoom.us/j/1',
-    'https://zoom.us:8443/j/1',
-    'http://zoom.us/j/1',
-    'javascript:alert(1)//zoom.us',
-    'zoom.us/j/1',
-    'https://zoom.us/j/1\t',
-    'https://zoom.us/j/1\n',
-    'https://zoom.us/j/ 1',
-    ' https://zoom.us/j/1',
-    'https://zoom.us/j/1\u0000',
-    'https://zoom.us/j/1\u0085',
-    'https://zoom.us/j/1 ',
-    `https://zoom.us/${'a'.repeat(2000)}`,
-  ])('rejects %j', (raw) => expect(normalizeMeetingLink(raw)).toBeNull());
+  it('treats empty as "no link yet"', () => expect(normalizeMeetingLink('')).toBe(''));
+
+  it('rejects over-long links', () => {
+    expect(normalizeMeetingLink(`https://zoom.us/j/1?pwd=${'a'.repeat(2000)}`)).toBeNull();
+  });
 
   it('rejects non-strings', () => {
-    for (const v of [null, undefined, 1, {}, { toString: 1 }, ['https://zoom.us/']]) {
+    for (const v of [null, undefined, 1, {}, { toString: 1 }, ['https://zoom.us/j/1']]) {
       expect(normalizeMeetingLink(v)).toBeNull();
     }
+  });
+
+  it('has a valid example for error messages', () => {
+    expect(normalizeMeetingLink(MEETING_LINK_EXAMPLE.replace('…', 'abc'))).not.toBeNull();
   });
 });
 
@@ -71,7 +56,9 @@ const team = {
   hasZoomLink: true,
   meetingProvider: 'fixed-link',
   ownerId: 'm1',
-  members: [member],
+  members: [member, { id: 'm2', name: 'Alex', online: false }],
+  requireApproval: true,
+  pending: [{ id: 'p1', name: 'Alex', online: true }],
   brk,
 };
 const state = (t: object = team, extra: object = {}) =>
@@ -138,8 +125,43 @@ describe('parseServerMsg', () => {
     );
     expect(bad?.type === 'state' && bad.team.zoomLink).toBe('');
     expect(bad?.type === 'state' && bad.team.brk?.meetingUrl).toBeNull();
-    const ok = parseServerMsg(withBreak({ meetingUrl: 'https://ZOOM.us' }));
-    expect(ok?.type === 'state' && ok.team.brk?.meetingUrl).toBe('https://zoom.us/');
+    const ok = parseServerMsg(withBreak({ meetingUrl: 'https://ZOOM.us/j/1#x' }));
+    expect(ok?.type === 'state' && ok.team.brk?.meetingUrl).toBe('https://zoom.us/j/1');
+    // A Zoom host but not a meeting: dropped like any other bad link.
+    const page = parseServerMsg(withTeam({ zoomLink: 'https://zoom.us/signin', brk: { ...brk, meetingUrl: 'https://zoom.us/' } }));
+    expect(page?.type === 'state' && page.team.zoomLink).toBe('');
+    expect(page?.type === 'state' && page.team.brk?.meetingUrl).toBeNull();
+  });
+
+  it('accepts a break without a link (non-participants get none)', () => {
+    const msg = parseServerMsg(withBreak({ meetingUrl: null }));
+    expect(msg?.type === 'state' && msg.team.brk?.meetingUrl).toBeNull();
+  });
+
+  it('defaults approvals for hubs that predate them', () => {
+    const { requireApproval: _a, pending: _p, ...old } = team;
+    const msg = parseServerMsg(state(old));
+    expect(msg?.type === 'state' && msg.team.requireApproval).toBe(false);
+    expect(msg?.type === 'state' && msg.team.pending).toEqual([]);
+  });
+
+  it('keeps the roster, offline members and the waiting list', () => {
+    const msg = parseServerMsg(state(team));
+    expect(msg?.type === 'state' && msg.team.members).toEqual(team.members);
+    expect(msg?.type === 'state' && msg.team.pending).toEqual(team.pending);
+    expect(msg?.type === 'state' && msg.team.requireApproval).toBe(true);
+    // Only known member fields survive.
+    const extra = parseServerMsg(withTeam({ pending: [{ id: 'p1', name: 'A', online: true, clientId: 'secret' }] }));
+    expect(extra?.type === 'state' && extra.team.pending).toEqual([{ id: 'p1', name: 'A', online: true }]);
+  });
+
+  it.each(['pending', 'denied'] as const)('keeps the %s error code', (code) => {
+    expect(parseServerMsg(JSON.stringify({ type: 'error', message: 'm', fatal: true, code }))).toEqual({
+      type: 'error',
+      message: 'm',
+      fatal: true,
+      code,
+    });
   });
 
   it.each([
@@ -154,6 +176,14 @@ describe('parseServerMsg', () => {
     ['too many members', withTeam({ members: Array(501).fill(member) })],
     ['bad member', withTeam({ members: [{ id: 'x', name: 'y' }] })],
     ['member name too long', withTeam({ members: [{ ...member, name: 'x'.repeat(65) }] })],
+    ['requireApproval not a boolean', withTeam({ requireApproval: 'yes' })],
+    ['requireApproval null', withTeam({ requireApproval: null })],
+    ['pending not an array', withTeam({ pending: {} })],
+    ['pending null', withTeam({ pending: null })],
+    ['too many pending', withTeam({ pending: Array(501).fill(member) })],
+    ['bad pending entry', withTeam({ pending: [{ id: '', name: 'y', online: true }] })],
+    ['pending name too long', withTeam({ pending: [{ ...member, name: 'x'.repeat(65) }] })],
+    ['pending id too long', withTeam({ pending: [{ ...member, id: 'x'.repeat(65) }] })],
     ['brk not an object', withTeam({ brk: 'x' })],
     ['unknown phase', withBreak({ phase: 'boom' })],
     ['unknown outReason', withBreak({ outReason: 'boom' })],
@@ -172,9 +202,10 @@ describe('parseServerMsg', () => {
 });
 
 describe('forgetsTeam', () => {
-  it('forgets only for bad-code and removed', () => {
+  it('forgets only for bad-code, removed and denied', () => {
     expect(forgetsTeam('bad-code')).toBe(true);
     expect(forgetsTeam('removed')).toBe(true);
-    for (const c of ['rate-limited', 'full', 'unauthorized', undefined] as const) expect(forgetsTeam(c)).toBe(false);
+    expect(forgetsTeam('denied')).toBe(true);
+    for (const c of ['pending', 'rate-limited', 'full', 'unauthorized', undefined] as const) expect(forgetsTeam(c)).toBe(false);
   });
 });

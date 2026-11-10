@@ -20,11 +20,25 @@ export const MEETING_HOSTS = ['zoom.us', 'zoom.com', 'zoomgov.com'];
 const MEETING_LINK_MAX = 2000;
 
 /**
+ * The meeting paths we open: join (`/j/`), webinar (`/w/`), start (`/s/`) and
+ * web-client join (`/wc/join/`) by meeting number, or a personal link
+ * (`/my/<name>`). Zoom also hosts pages people write themselves, so any other
+ * path on a Zoom host is refused. `src-tauri/src/meeting.rs` applies the same
+ * rule; `shared/meeting-links.json` holds the test cases both run.
+ */
+const MEETING_PATH = /^\/(?:(?:j|w|s|wc\/join)\/[0-9]{1,20}|my\/[A-Za-z0-9][A-Za-z0-9._-]{0,63})$/;
+
+/** What a good link looks like, for error messages. */
+export const MEETING_LINK_EXAMPLE = 'https://zoom.us/j/1234567890?pwd=…';
+
+/**
  * Meeting links get opened on everyone's machine, so only accept https links to
- * a known meeting service, and only ever store or open the canonical form this
- * returns. Other URL parsers (the OS's, for one) read backslashes, whitespace
- * and control characters differently from `URL`, so those are refused outright.
- * Returns '' for "no link yet" and null for anything unacceptable.
+ * a meeting on a known meeting service, and only ever store or open the
+ * canonical form this returns (the query, which carries the passcode, is kept;
+ * the fragment is dropped). Other URL parsers (the OS's, for one) read
+ * backslashes, whitespace and control characters differently from `URL`, so
+ * those are refused outright. Returns '' for "no link yet" and null for
+ * anything unacceptable.
  */
 export function normalizeMeetingLink(s: unknown): string | null {
   if (typeof s !== 'string') return null;
@@ -42,8 +56,13 @@ export function normalizeMeetingLink(s: unknown): string | null {
     !url.username &&
     !url.password &&
     url.port === '' &&
-    MEETING_HOSTS.some((h) => host === h || host.endsWith(`.${h}`));
-  return ok ? url.href : null;
+    // No empty labels (".zoom.us", "a..zoom.us"), so "a subdomain" means a real one.
+    !host.split('.').includes('') &&
+    MEETING_HOSTS.some((h) => host === h || host.endsWith(`.${h}`)) &&
+    MEETING_PATH.test(url.pathname);
+  if (!ok) return null;
+  url.hash = '';
+  return url.href;
 }
 
 export const isValidMeetingLink = (s: unknown): boolean => normalizeMeetingLink(s) !== null;
@@ -98,7 +117,13 @@ export interface TeamView {
   meetingProvider: MeetingProviderKind;
   /** Public id of the member who can change team settings (whoever created the team). */
   ownerId: string | null;
+  /** Everyone on the team's roster, including people who are offline right now. */
   members: MemberView[];
+  /** New people need the owner's OK before they can join with the invite code. */
+  requireApproval: boolean;
+  /** People waiting for that OK. Only the owner receives them; everyone else gets []. */
+  pending: MemberView[];
+  /** `meetingUrl` is only filled in for people taking part in the break. */
   brk: Break | null;
 }
 
@@ -108,14 +133,21 @@ export type ClientMsg =
   | { type: 'hello'; teamCode: string; clientId: string; name: string; token?: string }
   /** Owner only: replace the invite code. Everyone connected gets the new one. */
   | { type: 'rotateCode' }
-  /** Owner only: remove a member (by public id) and keep them from rejoining. */
+  /**
+   * Owner only: remove a member (by public id, online or not) and keep them from
+   * rejoining. The hub also replaces the invite code, since they know the old one.
+   */
   | { type: 'removeMember'; id: string }
+  /** Owner only: let a waiting person in, or turn them away. */
+  | { type: 'approveMember'; id: string; allow: boolean }
+  /** Owner only: hand the team to another member on the roster. */
+  | { type: 'transferOwner'; id: string }
   | { type: 'invite' }
   | { type: 'setLength'; lengthMin: number }
   | { type: 'join'; light?: boolean }
   | { type: 'light' }
   | { type: 'leave' }
-  | { type: 'settings'; zoomLink?: string; defaultLengthMin?: number; teamName?: string };
+  | { type: 'settings'; zoomLink?: string; defaultLengthMin?: number; teamName?: string; requireApproval?: boolean };
 
 export type ServerMsg =
   /** `you` is your public id: compare it with member and participant ids. */
@@ -124,11 +156,13 @@ export type ServerMsg =
 
 /**
  * Why a fatal error happened. Clients forget their saved team only for
- * 'bad-code' and 'removed'; for the others they keep it and try again later.
+ * 'bad-code', 'removed' and 'denied'; for the others they keep it and try again
+ * later. 'pending' means the owner hasn't let them in yet: keep the team, say
+ * so, and ask again every so often.
  */
-export type ErrorCode = 'bad-code' | 'removed' | 'rate-limited' | 'unauthorized' | 'full';
+export type ErrorCode = 'bad-code' | 'removed' | 'denied' | 'pending' | 'rate-limited' | 'unauthorized' | 'full';
 
-const ERROR_CODES: readonly ErrorCode[] = ['bad-code', 'removed', 'rate-limited', 'unauthorized', 'full'];
+const ERROR_CODES: readonly ErrorCode[] = ['bad-code', 'removed', 'denied', 'pending', 'rate-limited', 'unauthorized', 'full'];
 const PHASES: readonly Phase[] = ['pending', 'lighter', 'lit', 'out'];
 const OUT_REASONS: readonly OutReason[] = ['burned', 'nobody', 'cancelled', 'everyone-left'];
 const PROVIDERS: readonly MeetingProviderKind[] = ['fixed-link', 'zoom-api'];
@@ -232,9 +266,13 @@ function parseBreak(v: unknown): Break | null {
 function parseTeam(v: unknown): TeamView | null {
   if (!isObj(v)) return null;
   const members = parseList(v.members, parseMember);
+  // Hubs from before approvals send neither field: nobody is waiting.
+  const pending = v.pending === undefined ? [] : parseList(v.pending, parseMember);
   const brk = v.brk === null ? null : parseBreak(v.brk);
   const ok =
     members &&
+    pending &&
+    (v.requireApproval === undefined || typeof v.requireApproval === 'boolean') &&
     (v.brk === null || brk) &&
     typeof v.code === 'string' &&
     INVITE_CODE.test(v.code) &&
@@ -256,6 +294,8 @@ function parseTeam(v: unknown): TeamView | null {
     meetingProvider: v.meetingProvider as MeetingProviderKind,
     ownerId: v.ownerId as string | null,
     members,
+    requireApproval: v.requireApproval === true,
+    pending,
     brk,
   };
 }
@@ -295,4 +335,5 @@ export function parseServerMsg(data: unknown): ServerMsg | null {
 }
 
 /** Fatal errors after which the saved team is gone for good; anything else is worth retrying. */
-export const forgetsTeam = (code: ErrorCode | undefined): boolean => code === 'bad-code' || code === 'removed';
+export const forgetsTeam = (code: ErrorCode | undefined): boolean =>
+  code === 'bad-code' || code === 'removed' || code === 'denied';

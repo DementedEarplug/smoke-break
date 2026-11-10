@@ -269,6 +269,32 @@ body {
   margin-left: 16px;
 }
 
+.sb-tag {
+  margin-left: 6px;
+  padding: 0 4px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  border: 1px solid currentColor;
+}
+
+.sb-id {
+  margin-left: 6px;
+  padding: 0 4px;
+  font-size: 11px;
+  background: var(--paper-shade);
+  color: var(--muted);
+}
+
+.sb-waiting .sb-field-label {
+  margin-top: 0;
+}
+
+.sb-waiting .sb-hint {
+  margin: 0 0 12px;
+}
+
 .sb-radio {
   flex-direction: row !important;
   align-items: center;

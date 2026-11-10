@@ -1,142 +1,27 @@
-import { createServer, type IncomingMessage, type Server } from 'node:http';
-import type { AddressInfo } from 'node:net';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import type { IncomingMessage } from 'node:http';
+import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { WebSocket, type ClientOptions } from 'ws';
-import type { ClientMsg, ErrorCode, ServerMsg } from '../shared/protocol.ts';
-import { isValidMeetingLink } from '../shared/protocol.ts';
+import { describe, expect, it } from 'vitest';
+import { WebSocket } from 'ws';
 import {
-  type HubOptions,
   addressKey,
   cleanName,
   clientAddress,
-  createHub,
   dataFileFromEnv,
   isAllowedHost,
   isAllowedOrigin,
   nameKey,
   parseSavedTeam,
+  parseTrustedProxies,
 } from './hub.ts';
+import { ALEX, type ErrorMsg, SAM, type StateMsg, hubHarness, saved, sleep, tempFile } from './hubHarness.ts';
 import { WindowLimiter } from './limits.ts';
 
-type StateMsg = Extract<ServerMsg, { type: 'state' }>;
-type ErrorMsg = Extract<ServerMsg, { type: 'error' }>;
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-/** A test client that records every message from the hub. */
-class Client {
-  readonly msgs: ServerMsg[] = [];
-  readonly closed: Promise<number>;
-  private waiters: (() => void)[] = [];
-  constructor(readonly ws: WebSocket) {
-    ws.on('message', (raw) => {
-      this.msgs.push(JSON.parse(String(raw)));
-      for (const w of this.waiters.splice(0)) w();
-    });
-    this.closed = new Promise((r) => ws.once('close', r));
-  }
-  send(msg: ClientMsg | Record<string, unknown>) {
-    this.ws.send(JSON.stringify(msg));
-  }
-  /** Resolves with the first message at or after index `from` matching `pred`, waiting if needed. */
-  async next<T extends ServerMsg>(pred: (m: ServerMsg) => m is T, from = 0): Promise<T> {
-    for (;;) {
-      const found = this.msgs.slice(from).find(pred);
-      if (found) return found;
-      await new Promise<void>((resolve, reject) => {
-        const t = setTimeout(() => reject(new Error('timed out waiting for message')), 2000);
-        this.waiters.push(() => (clearTimeout(t), resolve()));
-      });
-    }
-  }
-  first() {
-    return this.next((_m): _m is ServerMsg => true);
-  }
-  state(pred: (m: StateMsg) => boolean = () => true, from?: number) {
-    return this.next((m): m is StateMsg => m.type === 'state' && pred(m), from);
-  }
-  error(from?: number) {
-    return this.next((m): m is ErrorMsg => m.type === 'error', from);
-  }
-  lastState() {
-    return this.msgs.filter((m): m is StateMsg => m.type === 'state').at(-1)!;
-  }
-}
-
-let server: Server;
-let hub: ReturnType<typeof createHub>;
-let url: string;
-let dataFile: string;
-let logs: string[] = [];
-const clients: Client[] = [];
-
-const tempFile = () => join(mkdtempSync(join(tmpdir(), 'sb-hub-')), 'teams.json');
-
-/** (Re)starts the hub on `file` (default: the current test's data file). */
-function startHub(opts: Partial<HubOptions> = {}, file = dataFile) {
-  hub?.close();
-  dataFile = file;
-  hub = createHub({ dataFile, accessToken: '', trustProxy: false, publicHosts: [], allowedOrigins: [], log: (l) => logs.push(l), ...opts });
-}
-
-beforeEach(async () => {
-  logs = [];
-  dataFile = tempFile();
-  startHub();
-  server = createServer();
-  server.on('upgrade', (req, socket, head) => hub.handleUpgrade(req, socket, head));
-  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
-  url = `ws://127.0.0.1:${(server.address() as AddressInfo).port}/ws`;
-});
-
-afterEach(async () => {
-  for (const c of clients.splice(0)) c.ws.terminate();
-  hub.close();
-  await new Promise((r) => server.close(r));
-});
-
-async function connect(options: ClientOptions = {}): Promise<Client> {
-  const ws = new WebSocket(url, options);
-  const c = new Client(ws);
-  clients.push(c);
-  await new Promise((resolve, reject) => (ws.once('open', resolve), ws.once('error', reject)));
-  return c;
-}
-
-/** Connects from a given address (needs trustProxy). */
-const connectFrom = (ip: string) => connect({ headers: { 'x-forwarded-for': ip } });
-
-const ALEX = 'alex-secret-client-id-0001';
-const SAM = 'sam-secret-client-id-00002';
-
-async function team() {
-  const alex = await connect();
-  alex.send({ type: 'create', teamName: 'Crew', clientId: ALEX, name: 'Alex' });
-  const { team: t } = await alex.state();
-  const sam = await connect();
-  sam.send({ type: 'hello', teamCode: t.code, clientId: SAM, name: 'Sam' });
-  await sam.state((m) => m.team.members.length === 2);
-  await alex.state((m) => m.team.members.length === 2);
-  return { alex, sam, code: t.code };
-}
-
-async function hello(code: string, clientId: string, name = 'J', c?: Client) {
-  c ??= await connect();
-  c.send({ type: 'hello', teamCode: code, clientId, name });
-  return { c, msg: await c.first() };
-}
-
-const saved = (over: Record<string, unknown>) => ({
-  name: 'Old',
-  defaultLengthMin: 12,
-  zoomLink: '',
-  meetingProvider: 'fixed-link',
-  ownerId: null,
-  lastActive: Date.now(),
-  ...over,
-});
+const h = hubHarness();
+const { connect, connectFrom, hello } = h;
+const team = (o?: { approval?: boolean }) => h.team(o);
+const startHub = (...a: Parameters<typeof h.start>) => h.start(...a);
+const logs = () => h.logs;
 
 describe('hub identity', () => {
   it('never sends anyone a clientId', async () => {
@@ -219,24 +104,28 @@ describe('hub crash resistance (C1)', () => {
   const nasty: unknown[] = [null, 0, -1, 1e308, '', 'x'.repeat(5000), [], {}, { toString: 1 }, { valueOf: 1, toString: 1 }, true, '__proto__', [[[]]]];
 
   it('survives non-primitive and wrong-typed fields from strangers and members', async () => {
+    startHub({ limits: { messageBurst: 1e9, messagesPerSecond: 1e9, addressMessageBurst: 1e9, addressMessagesPerSecond: 1e9 } });
     const { alex, sam, code } = await team();
     const stranger = await connect();
     stranger.send({ type: 'hello', clientId: 'stranger-client-id-0001', name: 'x', teamCode: { toString: 1 } });
     expect(await stranger.error()).toMatchObject({ fatal: true, code: 'bad-code' });
-    const types = ['create', 'hello', 'invite', 'setLength', 'join', 'light', 'leave', 'settings', 'rotateCode', 'removeMember', '__proto__', 1, null];
-    const keys = ['clientId', 'name', 'teamName', 'teamCode', 'lengthMin', 'light', 'zoomLink', 'defaultLengthMin', 'id', 'token', '__proto__'];
+    const types = ['create', 'hello', 'invite', 'setLength', 'join', 'light', 'leave', 'settings', 'rotateCode', 'removeMember', 'approveMember', 'transferOwner', '__proto__', 1, null];
+    const keys = ['clientId', 'name', 'teamName', 'teamCode', 'lengthMin', 'light', 'zoomLink', 'defaultLengthMin', 'requireApproval', 'id', 'allow', 'token', '__proto__'];
     for (const sock of [sam, alex]) {
       for (const type of types) for (const k of keys) for (const v of nasty) if (type !== 'rotateCode') sock.send({ type, [k]: v });
       for (const raw of ['', '{', 'null', '[]', '"x"', '123', '{"type":"settings","zoomLink":{"trim":1}}']) sock.ws.send(raw);
       sock.ws.send(Buffer.from([0xff, 0xfe, 0x00]), { binary: true });
-      await sleep(50);
+      await sleep(100);
     }
-    // Still serving, and the team wasn't damaged by any of it.
-    const { msg } = await hello(code, 'checker-client-id-00001', 'Check');
+    // Still serving, nobody was thrown out, and the code and owner weren't touched by any of it.
+    expect(sam.ws.readyState).toBe(WebSocket.OPEN);
+    expect(alex.ws.readyState).toBe(WebSocket.OPEN);
+    const { msg } = await hello(code, SAM, 'Sam');
     const s = msg as StateMsg;
     expect(s.type).toBe('state');
-    expect(s.team.name).toBe('Crew');
     expect(s.team.code).toBe(code);
+    expect(s.team.ownerId).toBe(alex.lastState().you);
+    expect(s.team.members).toHaveLength(2);
   });
 
   it('rejects a wrong-typed setting without changing anything', async () => {
@@ -247,26 +136,15 @@ describe('hub crash resistance (C1)', () => {
     from = alex.msgs.length;
     alex.send({ type: 'setLength', lengthMin: { valueOf: 1, toString: 1 } });
     expect((await alex.error(from)).message).toMatch(/number/);
+    from = alex.msgs.length;
+    alex.send({ type: 'settings', teamName: 'Renamed', requireApproval: 'yes' });
+    expect((await alex.error(from)).message).toMatch(/requireApproval/);
     expect(alex.lastState().team.name).toBe('Crew');
   });
 });
 
 describe('meeting links (H1)', () => {
-  it.each([
-    ['', true],
-    ['https://zoom.us/j/123', true],
-    ['https://us02web.zoom.us/j/123?pwd=abc', true],
-    ['https://app.zoom.com/wc/123', true],
-    ['http://zoom.us/j/123', false],
-    ['javascript:alert(1)', false],
-    ['https://evil.example/login', false],
-    ['https://zoom.us.evil.example/j/1', false],
-    ['https://evilzoom.us/j/1', false],
-    ['https://zoom.us@evil.example/j/1', false],
-    ['https://zoom.us\\@evil.example/x', false],
-    ['not a url', false],
-  ])('%s → %s', (link, ok) => expect(isValidMeetingLink(link)).toBe(ok));
-
+  // Which links pass is tested with the protocol (shared/protocol.test.ts); here, what the hub does with them.
   it('stores and sends only the canonical form', async () => {
     const { alex } = await team();
     const from = alex.msgs.length;
@@ -297,7 +175,7 @@ describe('hub settings', () => {
   it('rejects settings from anyone but the owner', async () => {
     const { alex, sam } = await team();
     const from = sam.msgs.length;
-    sam.send({ type: 'settings', zoomLink: 'https://zoom.us/j/evil', teamName: 'Hijacked' });
+    sam.send({ type: 'settings', zoomLink: 'https://zoom.us/j/evil', teamName: 'Hijacked', requireApproval: false });
     expect((await sam.error(from)).message).toMatch(/owner/);
     const last = alex.lastState();
     expect(last.team.name).toBe('Crew');
@@ -332,11 +210,7 @@ describe('hub limits', () => {
   it('limits how many teams one address can create', async () => {
     startHub({ limits: { createsPerIpPerHour: 2 } });
     const results = [];
-    for (let i = 0; i < 3; i++) {
-      const c = await connect();
-      c.send({ type: 'create', teamName: `T${i}`, clientId: `creator-client-id-${i}-000`, name: 'A' });
-      results.push(await c.first());
-    }
+    for (let i = 0; i < 3; i++) results.push((await h.create(`creator-client-id-${i}-000`, 'A', `T${i}`)).msg);
     expect(results.map((m) => m.type)).toEqual(['state', 'state', 'error']);
     expect(results[2]).toMatchObject({ fatal: true, code: 'rate-limited' });
   });
@@ -346,8 +220,7 @@ describe('hub limits', () => {
     const codes = [];
     for (let i = 0; i < 3; i++) {
       const c = await connectFrom(`10.0.0.${i + 1}`);
-      c.send({ type: 'create', teamName: 'T', clientId: `spread-client-id-${i}-000`, name: 'A' });
-      const m = await c.first();
+      const m = (await h.create(`spread-client-id-${i}-000`, 'A', 'T', c)).msg;
       codes.push(m.type === 'error' ? m.code : m.type);
     }
     expect(codes).toEqual(['state', 'state', 'rate-limited']);
@@ -355,11 +228,7 @@ describe('hub limits', () => {
 
   it('counts a whole IPv6 /64 as one address (H4)', async () => {
     startHub({ trustProxy: true, limits: { createsPerIpPerHour: 1 } });
-    const create = async (ip: string, i: number) => {
-      const c = await connectFrom(ip);
-      c.send({ type: 'create', teamName: 'T', clientId: `v6-client-id-${i}-00000`, name: 'A' });
-      return (await c.first()).type;
-    };
+    const create = async (ip: string, i: number) => (await h.create(`v6-client-id-${i}-00000`, 'A', 'T', await connectFrom(ip))).msg.type;
     expect(await create('2001:db8:1:2::1', 1)).toBe('state');
     expect(await create('2001:db8:1:2:ffff:ffff:ffff:ffff', 2)).toBe('error');
     expect(await create('2001:db8:1:3::1', 3)).toBe('state');
@@ -367,27 +236,44 @@ describe('hub limits', () => {
 
   it('never forgets a recently used team to make room; refuses the new one instead (H4)', async () => {
     const day = 86_400_000;
+    // Teams other people have used (several on the roster), so they aren't junk.
+    const roster = [{ id: 'aaaaaaaaaaaaaaaa', name: 'A' }, { id: 'bbbbbbbbbbbbbbbb', name: 'B' }];
     writeFileSync(
-      dataFile,
+      h.dataFile,
       JSON.stringify([
-        saved({ code: 'OLDONE', lastActive: Date.now() - 10 * day }),
-        saved({ code: 'RECENT', lastActive: Date.now() - 2 * day }),
-        saved({ code: 'GONEEE', lastActive: Date.now() - 365 * day }),
+        saved({ code: 'OLDONE2345', roster, requireApproval: false, lastActive: Date.now() - 10 * day }),
+        saved({ code: 'RECENT2345', roster, requireApproval: false, lastActive: Date.now() - 2 * day }),
+        saved({ code: 'GONEEE2345', roster, requireApproval: false, lastActive: Date.now() - 365 * day }),
       ]),
     );
     startHub({ limits: { maxTeams: 2 } });
     // A year-old team was dropped on load.
-    expect((await hello('GONEEE', 'joiner-client-id-GONEEE')).msg).toMatchObject({ type: 'error', code: 'bad-code' });
-    const c = await connect();
-    c.send({ type: 'create', teamName: 'Fresh', clientId: 'fresh-client-id-00000', name: 'F' });
-    expect((await c.state()).team.name).toBe('Fresh');
+    expect((await hello('GONEEE2345', 'joiner-client-id-GONEEE')).msg).toMatchObject({ type: 'error', code: 'bad-code' });
+    expect((await h.create('fresh-client-id-00000', 'F', 'Fresh')).msg).toMatchObject({ type: 'state', team: { name: 'Fresh' } });
     // OLDONE was idle for 10 days, so it made room.
-    expect((await hello('OLDONE', 'joiner-client-id-OLDONE')).msg.type).toBe('error');
+    expect((await hello('OLDONE2345', 'joiner-client-id-OLDONE')).msg.type).toBe('error');
     // RECENT was used two days ago, and nobody is in it right now, but it isn't forgotten.
-    const d = await connect();
-    d.send({ type: 'create', teamName: 'More', clientId: 'more-client-id-000000', name: 'M' });
-    expect(await d.error()).toMatchObject({ fatal: true, code: 'full' });
-    expect((await hello('RECENT', 'joiner-client-id-RECENT')).msg.type).toBe('state');
+    expect((await h.create('more-client-id-000000', 'M', 'More')).msg).toMatchObject({ type: 'error', fatal: true, code: 'full' });
+    expect((await hello('RECENT2345', 'joiner-client-id-RECENT')).msg.type).toBe('state');
+  });
+
+  it('forgets junk teams (only the creator, idle a day) first, even if recently used (item 3)', async () => {
+    const day = 86_400_000;
+    const roster = [{ id: 'aaaaaaaaaaaaaaaa', name: 'A' }, { id: 'bbbbbbbbbbbbbbbb', name: 'B' }];
+    writeFileSync(
+      h.dataFile,
+      JSON.stringify([
+        saved({ code: 'REALTEAM23', roster, ownerId: 'aaaaaaaaaaaaaaaa', requireApproval: false, lastActive: Date.now() - 30 * day }),
+        saved({ code: 'JUNKTEAM23', roster: [roster[0]], ownerId: 'aaaaaaaaaaaaaaaa', lastActive: Date.now() - 2 * day }),
+        saved({ code: 'NEWJUNK234', roster: [roster[0]], ownerId: 'aaaaaaaaaaaaaaaa', lastActive: Date.now() - 3_600_000 }),
+      ]),
+    );
+    startHub({ limits: { maxTeams: 3 } });
+    expect((await h.create('fresh-client-id-00000', 'F', 'Fresh')).msg.type).toBe('state');
+    // The two-day-old junk team went, though the 30-day-old real team is older.
+    expect((await hello('JUNKTEAM23', 'joiner-client-id-000001')).msg).toMatchObject({ code: 'bad-code' });
+    expect((await hello('REALTEAM23', 'joiner-client-id-000002')).msg.type).toBe('state');
+    expect(logs().some((l) => /team-forgotten.*unused/.test(l))).toBe(true);
   });
 
   it('throttles message floods', async () => {
@@ -410,7 +296,7 @@ describe('hub limits', () => {
     await expect(connectFrom('10.0.0.3')).rejects.toThrow(/503/);
   });
 
-  it('caps members per team, but lets existing members back in', async () => {
+  it('caps the roster, but lets existing members back in', async () => {
     startHub({ limits: { maxMembersPerTeam: 2 } });
     const { code } = await team();
     expect((await hello(code, 'third-client-id-000000')).msg).toMatchObject({ type: 'error', fatal: true, code: 'full' });
@@ -418,19 +304,34 @@ describe('hub limits', () => {
   });
 
   it('drops a socket that stops reading instead of buffering for it (H3)', async () => {
-    startHub({ limits: { maxBufferedBytes: 4096, messageBurst: 1e9, messagesPerSecond: 1e9 } });
-    const { alex, sam } = await team();
+    startHub({
+      limits: {
+        maxBufferedBytes: 4096,
+        broadcastIntervalMs: 0,
+        messageBurst: 1e9,
+        messagesPerSecond: 1e9,
+        addressMessageBurst: 1e9,
+        addressMessagesPerSecond: 1e9,
+        auditLinesPerSecond: 1e9,
+        auditBurst: 1e9,
+      },
+    });
+    const { alex, sam, code } = await team();
+    // A bigger team makes bigger frames, so the kernel's socket buffer fills sooner.
+    for (let i = 0; i < 40; i++) (await hello(code, `filler-client-id-${String(i).padStart(4, '0')}`, `Filler ${i} ${'y'.repeat(12)}`)).c.ws.close();
     (sam.ws as unknown as { _socket: { pause(): void } })._socket.pause();
-    const samGone = alex.state((m) => m.team.members.some((x) => x.name === 'Sam' && !x.online));
+    const samGone = alex.state((m) => m.team.members.some((x) => x.name === 'Sam' && !x.online), alex.msgs.length);
     samGone.catch(() => {});
     let gone = false;
     void samGone.then(() => (gone = true));
-    for (let i = 0; i < 100 && !gone; i++) {
-      for (let j = 0; j < 500; j++) alex.send({ type: 'leave' });
-      await sleep(20);
+    // Every rename is a real change, so every one goes out (a no-op would send nothing at all).
+    // Coalescing merges changes in the same tick into one frame, so spread them out.
+    for (let i = 0; i < 3000 && !gone; i++) {
+      alex.send({ type: 'settings', teamName: `Crew ${i} ${'x'.repeat(10)}` });
+      await sleep(1);
     }
     expect(gone).toBe(true);
-    expect(logs.some((l) => JSON.parse(l).kind === 'send-buffer')).toBe(true);
+    expect(logs().some((l) => JSON.parse(l).kind === 'send-buffer')).toBe(true);
   });
 
   it('cools down starting new breaks (L3)', async () => {
@@ -468,33 +369,23 @@ describe('hub timeouts (M2)', () => {
 });
 
 describe('hub invite codes', () => {
-  it('makes 10-character codes and still accepts saved 6-character ones (H5)', async () => {
-    writeFileSync(dataFile, JSON.stringify([saved({ code: 'ABCDEF' })]));
-    startHub();
-    const { code } = await team();
-    expect(code).toMatch(/^[A-HJ-NP-Z2-9]{10}$/);
-    expect((await hello('abcdef', 'legacy-client-id-00000')).msg.type).toBe('state');
-  });
-
   it('locks out an address that guesses too many codes', async () => {
     startHub({ limits: { badCodesPerIp: 2, badCodeDelayMs: 0 } });
-    const owner = await connect();
-    owner.send({ type: 'create', teamName: 'Real', clientId: 'owner-client-id-000000', name: 'O' });
-    const real = (await owner.state()).team.code;
+    const real = ((await h.create('owner-client-id-000000', 'O', 'Real')).msg as StateMsg).team.code;
     const guess = async (c: string) => (await hello(c, 'guesser-client-id-0000', 'G')).msg;
     expect(await guess('AAAAAA')).toMatchObject({ type: 'error', code: 'bad-code', message: expect.stringMatching(/No team/) });
     expect(await guess('BBBBBB')).toMatchObject({ type: 'error', code: 'bad-code' });
     expect(await guess('CCCCCC')).toMatchObject({ type: 'error', code: 'rate-limited', message: expect.stringMatching(/Too many/) });
-    // Even the right code is refused for someone the team doesn't know, until the window passes.
+    // Even the right code is refused for someone not on the roster, until the window passes.
     expect(await guess(real)).toMatchObject({ type: 'error', code: 'rate-limited' });
   });
 
-  it("lets members the team already knows back in during a lockout, even after a restart (M1)", async () => {
+  it('lets roster members back in during a lockout, even after a restart (M1)', async () => {
     startHub({ limits: { badCodesPerIp: 2, badCodeDelayMs: 0 } });
     const { alex, sam, code } = await team();
     alex.ws.close();
     sam.ws.close();
-    hub.flush();
+    h.hub.flush();
     startHub({ limits: { badCodesPerIp: 2, badCodeDelayMs: 0 } });
     for (const g of ['AAAAAA', 'BBBBBB', 'CCCCCC']) await hello(g, 'guesser-client-id-0000');
     expect((await hello(code, SAM, 'Sam')).msg.type).toBe('state');
@@ -502,37 +393,31 @@ describe('hub invite codes', () => {
     expect((await hello(code, 'newbie-client-id-00000')).msg).toMatchObject({ type: 'error', code: 'rate-limited' });
   });
 
-  it('treats the owner of a team saved before members were remembered as known', async () => {
-    writeFileSync(dataFile, JSON.stringify([saved({ code: 'LEGACY' })]));
+  it('lets the first person back into an ownerless team saved before owners existed, and makes them owner', async () => {
+    writeFileSync(h.dataFile, JSON.stringify([saved({ code: 'LEGACY2345' })]));
     startHub({ limits: { badCodesPerIp: 1, badCodeDelayMs: 0 } });
-    // The first person back becomes the owner of an ownerless legacy team.
-    const first = await hello('LEGACY', ALEX, 'Alex');
-    expect(first.msg.type).toBe('state');
-    first.c.ws.close();
-    hub.flush();
-    const file = JSON.parse(readFileSync(dataFile, 'utf8'));
-    file[0].known = [];
-    writeFileSync(dataFile, JSON.stringify(file));
-    startHub({ limits: { badCodesPerIp: 1, badCodeDelayMs: 0 } });
-    for (const g of ['AAAAAA', 'BBBBBB']) await hello(g, 'guesser-client-id-0000');
-    expect((await hello('LEGACY', ALEX, 'Alex')).msg.type).toBe('state');
+    const first = await hello('LEGACY2345', ALEX, 'Alex');
+    expect(first.msg).toMatchObject({ type: 'state' });
+    expect((first.msg as StateMsg).team.ownerId).toBe((first.msg as StateMsg).you);
+    // From then on, approval applies to everyone else.
+    expect((await hello('LEGACY2345', SAM, 'Sam')).msg).toMatchObject({ type: 'error', code: 'pending' });
   });
 
-  it('limits wrong codes across all addresses (H5)', async () => {
-    startHub({ trustProxy: true, limits: { badCodes: 3, badCodeDelayMs: 0 } });
-    const results = [];
-    for (let i = 0; i < 4; i++) {
-      const c = await connectFrom(`10.1.0.${i + 1}`);
-      results.push(((await hello('ZZZZZZZZZZ', `spread-guess-id-${i}-000`, 'G', c)).msg as ErrorMsg).code);
-    }
-    expect(results).toEqual<(ErrorCode | undefined)[]>(['bad-code', 'bad-code', 'bad-code', 'rate-limited']);
+  it('has no hub-wide wrong-code lockout: guesses from many addresses lock out only those addresses (item 2)', async () => {
+    startHub({ trustProxy: true, limits: { badCodesPerIp: 1, badCodeDelayMs: 0 } });
+    const real = ((await h.create('owner-client-id-000000', 'O', 'Real', await connectFrom('10.9.9.9'))).msg as StateMsg).team.code;
+    for (let i = 0; i < 30; i++) await hello('ZZZZZZZZZZ', `spread-guess-id-${i}-000`, 'G', await connectFrom(`203.0.113.${i + 1}`));
+    // A new colleague with the right code still reaches the owner.
+    expect((await hello(real, 'newhire-client-id-0000', 'N', await connectFrom('10.1.1.1'))).msg).toMatchObject({ code: 'pending' });
+    // A locked-out address is still locked out.
+    expect((await hello(real, 'other-client-id-000000', 'N', await connectFrom('203.0.113.1'))).msg).toMatchObject({ code: 'rate-limited' });
   });
 
-  it('lets the owner rotate the code; everyone connected gets the new one (H5)', async () => {
+  it('lets the owner rotate the code; everyone connected gets the new one, the old one only works for the roster (H5)', async () => {
     const { alex, sam, code } = await team();
     const before = alex.lastState();
     sam.send({ type: 'rotateCode' });
-    expect((await sam.error(sam.msgs.length - 0)).message).toMatch(/owner/);
+    expect((await sam.error(sam.msgs.length)).message).toMatch(/owner/);
     alex.send({ type: 'rotateCode' });
     const s = await sam.state((m) => m.team.code !== code);
     const a = await alex.state((m) => m.team.code !== code);
@@ -541,39 +426,30 @@ describe('hub invite codes', () => {
     // Public ids (and so ownership) survive the rotation.
     expect(a.you).toBe(before.you);
     expect(a.team.ownerId).toBe(before.team.ownerId);
+    // Someone new with the old code: as if it were wrong.
     expect((await hello(code, 'late-client-id-000000')).msg).toMatchObject({ type: 'error', code: 'bad-code' });
     expect((await hello(s.team.code, 'late-client-id-000000')).msg.type).toBe('state');
+    // Sam was offline during a rotation? The old code still gets him in, and he learns the new one.
+    const back = (await hello(code, SAM, 'Sam')).msg as StateMsg;
+    expect(back.type).toBe('state');
+    expect(back.team.code).toBe(s.team.code);
     // Saved, too.
-    hub.flush();
-    expect(readFileSync(dataFile, 'utf8')).toContain(s.team.code);
-    expect(readFileSync(dataFile, 'utf8')).not.toContain(`"code": "${code}"`);
+    h.hub.flush();
+    const file = readFileSync(h.dataFile, 'utf8');
+    expect(file).toContain(`"code": "${s.team.code}"`);
+    expect(file).not.toContain(`"code": "${code}"`);
   });
 
-  it('lets the owner remove a member, who stays out (H5)', async () => {
-    const { alex, sam, code } = await team();
-    alex.send({ type: 'invite' });
-    await sam.state((m) => m.team.brk?.phase === 'pending');
-    sam.send({ type: 'join' });
-    const s = await alex.state((m) => m.team.brk?.participants.length === 2);
-    const samId = s.team.members.find((m) => m.name === 'Sam')!.id;
-
-    sam.send({ type: 'removeMember', id: s.you });
-    expect((await sam.error()).message).toMatch(/owner/);
-    alex.send({ type: 'removeMember', id: s.you });
-    expect((await alex.error()).message).toMatch(/yourself/);
-
-    alex.send({ type: 'removeMember', id: samId });
-    expect(await sam.next((m): m is ErrorMsg => m.type === 'error' && !!m.fatal)).toMatchObject({ code: 'removed' });
-    await sam.closed;
-    const after = await alex.state((m) => !m.team.members.some((x) => x.id === samId));
-    expect(after.team.brk?.participants.map((p) => p.id) ?? []).not.toContain(samId);
-
-    expect((await hello(code, SAM, 'Sam')).msg).toMatchObject({ type: 'error', fatal: true, code: 'removed' });
-    // The ban is saved.
-    hub.flush();
-    startHub();
-    expect((await hello(code, SAM, 'Sam')).msg).toMatchObject({ type: 'error', code: 'removed' });
-    expect((await hello(code, ALEX, 'Alex')).msg.type).toBe('state');
+  it('keeps only the last few old codes', async () => {
+    const { alex, code } = await team();
+    for (let i = 0; i < 6; i++) {
+      const from = alex.msgs.length;
+      const prev = alex.lastState().team.code;
+      alex.send({ type: 'rotateCode' });
+      await alex.state((m) => m.team.code !== prev, from);
+    }
+    // Six rotations: the first code fell off the end of the five kept.
+    expect((await hello(code, SAM, 'Sam')).msg).toMatchObject({ type: 'error', code: 'bad-code' });
   });
 });
 
@@ -588,33 +464,50 @@ describe('hub access token (H5)', () => {
       c.send({ type: 'create', teamName: 'T', clientId: 'token-client-id-00000', name: 'A', token });
       expect(await c.first()).toMatchObject({ type: 'error', fatal: true, code: 'unauthorized' });
     }
-    const ok = await connect();
-    ok.send({ type: 'create', teamName: 'T', clientId: 'token-client-id-00000', name: 'A', token: TOKEN });
-    const code = (await ok.state()).team.code;
-    const h = await connect();
-    h.send({ type: 'hello', teamCode: code, clientId: 'token-client-id-00001', name: 'B' });
-    expect(await h.first()).toMatchObject({ type: 'error', code: 'unauthorized' });
-    const h2 = await connect();
-    h2.send({ type: 'hello', teamCode: code, clientId: 'token-client-id-00001', name: 'B', token: TOKEN });
-    expect((await h2.first()).type).toBe('state');
-    expect(logs.join('\n')).not.toContain(TOKEN);
+    const code = ((await h.create('token-client-id-00000', 'A', 'T', undefined, TOKEN)).msg as StateMsg).team.code;
+    expect((await hello(code, 'token-client-id-00001', 'B')).msg).toMatchObject({ type: 'error', code: 'unauthorized' });
+    // With the token, they get as far as the owner's approval.
+    expect((await hello(code, 'token-client-id-00001', 'B', undefined, TOKEN)).msg).toMatchObject({ type: 'error', code: 'pending' });
+    expect(logs().join('\n')).not.toContain(TOKEN);
   });
 });
 
-describe('client addresses (M1)', () => {
+describe('client addresses (M1, item 5)', () => {
   const req = (remoteAddress: string, xff?: string | string[]) =>
     ({ socket: { remoteAddress }, headers: xff === undefined ? {} : { 'x-forwarded-for': xff } }) as unknown as IncomingMessage;
+  const loopback = parseTrustedProxies('1');
+  const proxies = parseTrustedProxies('10.9.9.9, 10.20.0.0/16, fd00::/8');
 
-  it('ignores X-Forwarded-For unless told to trust the proxy', () => {
-    expect(clientAddress(req('10.9.9.9', '1.2.3.4'), false)).toBe('10.9.9.9');
-    expect(clientAddress(req('10.9.9.9', '1.2.3.4'), true)).toBe('1.2.3.4');
+  it('ignores X-Forwarded-For unless the peer is a trusted proxy', () => {
+    expect(clientAddress(req('10.9.9.9', '1.2.3.4'), null)).toBe('10.9.9.9');
+    expect(clientAddress(req('10.9.9.9', '1.2.3.4'), proxies)).toBe('1.2.3.4');
+    // `1` means loopback only: anyone else sending the header is ignored.
+    expect(clientAddress(req('10.9.9.9', '1.2.3.4'), loopback)).toBe('10.9.9.9');
+    expect(clientAddress(req('127.0.0.1', '1.2.3.4'), loopback)).toBe('1.2.3.4');
+    expect(clientAddress(req('::ffff:127.0.0.1', '1.2.3.4'), loopback)).toBe('1.2.3.4');
+    expect(clientAddress(req('::1', '1.2.3.4'), loopback)).toBe('1.2.3.4');
+    expect(clientAddress(req('10.20.3.4', '1.2.3.4'), proxies)).toBe('1.2.3.4');
+    expect(clientAddress(req('10.21.3.4', '1.2.3.4'), proxies)).toBe('10.21.3.4');
+    expect(clientAddress(req('fd12::1', '1.2.3.4'), proxies)).toBe('1.2.3.4');
   });
 
-  it('uses the right-most entry (the one our proxy added)', () => {
-    expect(clientAddress(req('10.9.9.9', 'spoofed, 6.6.6.6, 1.2.3.4'), true)).toBe('1.2.3.4');
-    expect(clientAddress(req('10.9.9.9', ['5.5.5.5', '1.2.3.4']), true)).toBe('1.2.3.4');
-    expect(clientAddress(req('10.9.9.9', 'not-an-ip'), true)).toBe('10.9.9.9');
-    expect(clientAddress(req('10.9.9.9'), true)).toBe('10.9.9.9');
+  it('uses the right-most entry that is not one of our proxies', () => {
+    expect(clientAddress(req('10.9.9.9', 'spoofed, 6.6.6.6, 1.2.3.4'), proxies)).toBe('1.2.3.4');
+    expect(clientAddress(req('10.9.9.9', ['5.5.5.5', '1.2.3.4'], ), proxies)).toBe('1.2.3.4');
+    // CDN → nginx: the inner proxy's entry is skipped when it's listed.
+    expect(clientAddress(req('10.9.9.9', '6.6.6.6, 1.2.3.4, 10.20.0.7'), proxies)).toBe('1.2.3.4');
+    expect(clientAddress(req('10.9.9.9', 'not-an-ip'), proxies)).toBe('10.9.9.9');
+    expect(clientAddress(req('10.9.9.9'), proxies)).toBe('10.9.9.9');
+  });
+
+  it('parses SMOKE_BREAK_TRUST_PROXY strictly', () => {
+    expect(parseTrustedProxies(undefined)).toBeNull();
+    expect(parseTrustedProxies('')).toBeNull();
+    expect(parseTrustedProxies('0')).toBeNull();
+    expect(parseTrustedProxies(false)).toBeNull();
+    for (const bad of ['yes please', '10.0.0.0/33', '10.0.0.1/x', 'proxy.example.com', '10.0.0.0/8/9', '::1/129']) {
+      expect(() => parseTrustedProxies(bad)).toThrow(/SMOKE_BREAK_TRUST_PROXY/);
+    }
   });
 
   it.each([
@@ -627,7 +520,7 @@ describe('client addresses (M1)', () => {
     ['fe80::1%en0', 'fe80:0:0:0::/64'],
   ])('addressKey(%s) → %s', (ip, key) => expect(addressKey(ip)).toBe(key));
 
-  it('applies per-address limits to the forwarded address when trusted', async () => {
+  it('applies per-address limits to the forwarded address when the proxy is trusted', async () => {
     startHub({ trustProxy: true, limits: { connectionsPerIp: 1 } });
     await connectFrom('10.0.0.1');
     await connectFrom('10.0.0.2');
@@ -635,10 +528,15 @@ describe('client addresses (M1)', () => {
     await expect(connectFrom('9.9.9.9, 10.0.0.1')).rejects.toThrow(/429/);
   });
 
-  it('ignores the header when not trusted', async () => {
-    startHub({ trustProxy: false, limits: { connectionsPerIp: 1 } });
+  it('ignores the header when the peer is not a trusted proxy', async () => {
+    startHub({ trustProxy: '10.9.9.9', limits: { connectionsPerIp: 1 } });
     await connectFrom('10.0.0.1');
     await expect(connectFrom('10.0.0.2')).rejects.toThrow(/429/);
+  });
+
+  it('refuses to start with a malformed trusted proxy list', () => {
+    expect(() => startHub({ trustProxy: 'not-an-address' })).toThrow(/SMOKE_BREAK_TRUST_PROXY/);
+    startHub();
   });
 });
 
@@ -686,7 +584,7 @@ describe('hub origins and hosts (M4)', () => {
   });
 
   it('refuses a rebound page on the standalone hub', async () => {
-    const host = new URL(url).host;
+    const host = new URL(h.url).host;
     await expect(connect({ origin: `http://${host}` })).rejects.toThrow(/403/);
   });
 
@@ -701,41 +599,38 @@ describe('hub origins and hosts (M4)', () => {
 describe('hub persistence (M5)', () => {
   it('saves teams readable only by this user, atomically', async () => {
     startHub({}, join(dirname(tempFile()), 'data', 'teams.json'));
-    const c = await connect();
-    c.send({ type: 'create', teamName: 'Saved', clientId: 'saver-client-id-000000', name: 'S' });
-    await c.state();
+    await h.create('saver-client-id-000000', 'S', 'Saved');
     await sleep(300);
-    expect(statSync(dataFile).mode & 0o777).toBe(0o600);
-    expect(JSON.parse(readFileSync(dataFile, 'utf8'))[0].name).toBe('Saved');
-    expect(readdirSync(dirname(dataFile))).toEqual(['teams.json']);
+    expect(statSync(h.dataFile).mode & 0o777).toBe(0o600);
+    expect(statSync(dirname(h.dataFile)).mode & 0o777).toBe(0o700);
+    expect(JSON.parse(readFileSync(h.dataFile, 'utf8'))[0].name).toBe('Saved');
+    expect(readdirSync(dirname(h.dataFile))).toEqual(['teams.json']);
   });
 
   it('writes a pending save on close', async () => {
     startHub({ limits: { saveDelayMs: 60_000 } });
-    const c = await connect();
-    c.send({ type: 'create', teamName: 'Flushed', clientId: 'flush-client-id-000000', name: 'S' });
-    await c.state();
-    expect(existsSync(dataFile)).toBe(false);
-    hub.close();
-    expect(JSON.parse(readFileSync(dataFile, 'utf8'))[0].name).toBe('Flushed');
+    await h.create('flush-client-id-000000', 'S', 'Flushed');
+    expect(existsSync(h.dataFile)).toBe(false);
+    h.hub.close();
+    expect(JSON.parse(readFileSync(h.dataFile, 'utf8'))[0].name).toBe('Flushed');
   });
 
-  it("doesn't rewrite the file when a known member reconnects", async () => {
+  it("doesn't rewrite the file when a roster member reconnects", async () => {
     const { code } = await team();
     await sleep(300);
-    const before = statSync(dataFile).mtimeMs;
+    const before = statSync(h.dataFile).mtimeMs;
     await sleep(20);
     await hello(code, SAM, 'Sam');
     await sleep(300);
-    expect(statSync(dataFile).mtimeMs).toBe(before);
+    expect(statSync(h.dataFile).mtimeMs).toBe(before);
     // Someone new is a real change.
     await hello(code, 'newcomer-client-id-0000');
     await sleep(300);
-    expect(statSync(dataFile).mtimeMs).not.toBe(before);
+    expect(statSync(h.dataFile).mtimeMs).not.toBe(before);
   });
 
   it('keeps a copy of a file that does not parse, then carries on', async () => {
-    writeFileSync(dataFile, '[{"code": "ABCDEF", "name": "half-writ');
+    writeFileSync(h.dataFile, '[{"code": "ABCDEF", "name": "half-writ');
     const errors: unknown[] = [];
     const orig = console.error;
     console.error = (...a: unknown[]) => errors.push(a.join(' '));
@@ -744,22 +639,20 @@ describe('hub persistence (M5)', () => {
     } finally {
       console.error = orig;
     }
-    const copies = readdirSync(dirname(dataFile)).filter((f) => f.startsWith('teams.json.corrupt-'));
+    const copies = readdirSync(dirname(h.dataFile)).filter((f) => f.startsWith('teams.json.corrupt-'));
     expect(copies).toHaveLength(1);
-    expect(readFileSync(join(dirname(dataFile), copies[0]), 'utf8')).toBe('[{"code": "ABCDEF", "name": "half-writ');
+    expect(readFileSync(join(dirname(h.dataFile), copies[0]), 'utf8')).toBe('[{"code": "ABCDEF", "name": "half-writ');
     expect(String(errors[0])).toMatch(/not a valid team list/);
-    const c = await connect();
-    c.send({ type: 'create', teamName: 'After', clientId: 'after-client-id-000000', name: 'S' });
-    await c.state();
-    hub.flush();
-    expect(JSON.parse(readFileSync(dataFile, 'utf8'))[0].name).toBe('After');
+    await h.create('after-client-id-000000', 'S', 'After');
+    h.hub.flush();
+    expect(JSON.parse(readFileSync(h.dataFile, 'utf8'))[0].name).toBe('After');
   });
 
   it('checks every field of saved teams', async () => {
     writeFileSync(
-      dataFile,
+      h.dataFile,
       JSON.stringify([
-        saved({ code: 'GOODONE', name: { evil: 1 }, defaultLengthMin: '99', meetingProvider: 'rm -rf', ownerId: 42, lastActive: 'soon' }),
+        saved({ code: 'GOODONE234', name: { evil: 1 }, defaultLengthMin: '99', meetingProvider: 'rm -rf', ownerId: 42, lastActive: 'soon', requireApproval: 'no', roster: 'x' }),
         saved({ code: { toString: 1 } }),
         saved({ code: 'lower' }),
         null,
@@ -775,8 +668,9 @@ describe('hub persistence (M5)', () => {
       console.error = orig;
     }
     expect(String(errors[0])).toMatch(/Skipped 4/);
-    const { msg } = await hello('GOODONE', 'field-client-id-000000');
-    expect((msg as StateMsg).team).toMatchObject({ name: 'My team', defaultLengthMin: 12, meetingProvider: 'fixed-link' });
+    // Ownerless, so the first one in becomes owner (approval can't apply with nobody to approve).
+    const { msg } = await hello('GOODONE234', 'field-client-id-000000');
+    expect((msg as StateMsg).team).toMatchObject({ name: 'My team', defaultLengthMin: 12, meetingProvider: 'fixed-link', requireApproval: true });
   });
 
   it('puts data where SMOKE_BREAK_DATA_DIR says, else .data/ in the repo (M3)', () => {
@@ -796,15 +690,18 @@ describe('hub audit log (L6)', () => {
     const rotated = await alex.state((m) => m.team.code !== code);
     alex.send({ type: 'removeMember', id: sam.lastState().you });
     await sam.closed;
+    const final = await alex.state((m) => m.team.members.length === 1);
 
-    const lines = logs.map((l) => JSON.parse(l));
+    const lines = logs().map((l) => JSON.parse(l));
     for (const l of lines) expect(l.ts).toMatch(/^\d{4}-\d\d-\d\dT/);
     const events = lines.map((l) => l.event);
-    expect(events).toEqual(expect.arrayContaining(['create', 'join', 'join-failed', 'settings', 'rotate-code', 'remove-member']));
+    expect(events).toEqual(
+      expect.arrayContaining(['create', 'join', 'join-requested', 'approve-member', 'join-failed', 'settings', 'rotate-code', 'remove-member']),
+    );
     expect(lines.find((l) => l.event === 'join')).toMatchObject({ ip: '127.0.0.1', name: 'Sam' });
-    expect(lines.find((l) => l.event === 'settings').changed).toEqual(['zoomLink', 'teamName']);
-    const all = logs.join('\n');
-    for (const secret of [code, rotated.team.code, 'WRONGCODE1', ALEX, SAM, 'zoom.us/j/777']) expect(all).not.toContain(secret);
+    expect(lines.find((l) => l.event === 'settings' && l.changed.includes('teamName')).changed).toEqual(['zoomLink', 'teamName']);
+    const all = logs().join('\n');
+    for (const secret of [code, rotated.team.code, final.team.code, 'WRONGCODE1', ALEX, SAM, 'zoom.us/j/777']) expect(all).not.toContain(secret);
   });
 });
 
@@ -840,6 +737,31 @@ describe('hub breaks', () => {
     expect(lit.team.brk!.endsAt).toBeGreaterThan(lit.serverNow);
   });
 
+  it('sends the meeting link only to people in the break (item 7)', async () => {
+    const { alex, sam, code } = await team();
+    alex.send({ type: 'settings', zoomLink: 'https://zoom.us/j/4242' });
+    await sam.state((m) => m.team.hasZoomLink);
+    const { c: kim } = await hello(code, 'kim-client-id-000000000', 'Kim');
+    const { c: lee } = await hello(code, 'lee-client-id-000000000', 'Lee');
+    // Sam starts, Kim joins: the owner (Alex) and Lee aren't in the break.
+    sam.send({ type: 'invite' });
+    await kim.state((m) => m.team.brk?.phase === 'pending');
+    kim.send({ type: 'join' });
+    const k = await kim.state((m) => !!m.team.brk?.meetingUrl);
+    const s = await sam.state((m) => !!m.team.brk?.meetingUrl);
+    expect(k.team.brk!.meetingUrl).toBe('https://zoom.us/j/4242');
+    expect(s.team.brk!.meetingUrl).toBe('https://zoom.us/j/4242');
+    await lee.state((m) => m.team.brk?.phase === 'lighter');
+    await alex.state((m) => m.team.brk?.phase === 'lighter');
+    await sleep(100);
+    expect(lee.states().every((m) => m.team.brk?.meetingUrl == null)).toBe(true);
+    expect(JSON.stringify(lee.msgs)).not.toContain('4242');
+    expect(alex.states().every((m) => m.team.brk?.meetingUrl == null)).toBe(true);
+    // Once Lee joins, Lee gets it too.
+    lee.send({ type: 'join' });
+    expect((await lee.state((m) => !!m.team.brk?.meetingUrl)).team.brk!.meetingUrl).toBe('https://zoom.us/j/4242');
+  });
+
   it('leave only takes yourself out of a break', async () => {
     const { alex, sam } = await team();
     alex.send({ type: 'invite' });
@@ -852,3 +774,6 @@ describe('hub breaks', () => {
     expect(after.team.brk!.participants[0].id).not.toBe(s.you);
   });
 });
+
+// Keep the ErrorMsg type import used (handy in new tests).
+export type { ErrorMsg };

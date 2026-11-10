@@ -49,6 +49,8 @@ function onboard(error?: string, askToken = false) {
 }
 
 function start(first: JoinMsg) {
+  const hub = platform.currentHub();
+  const teamCode = first.type === 'hello' ? first.teamCode : '';
   const desktop = h('div', { class: 'sb-desktop' });
   const panelEl = h('aside', { class: 'sb-card sb-panel' });
   const lookEl = h('aside', { class: 'sb-card sb-panel' });
@@ -62,6 +64,7 @@ function start(first: JoinMsg) {
         params.set('team', team.code);
         replaceUrl();
       }
+      widget.root.hidden = false;
       widget.setTeam(team, you);
       panel.setTeam(team, you);
     },
@@ -70,7 +73,8 @@ function start(first: JoinMsg) {
       panel.setError(message);
     },
     onFatal(message, forget, code) {
-      // The link's code is dead: don't offer to join it again.
+      // The link's code is dead: don't offer to join it again. (The session
+      // has already dropped the saved team.)
       if (forget) {
         params.delete('team');
         replaceUrl();
@@ -86,8 +90,17 @@ function start(first: JoinMsg) {
       widget.showToast(message, 6000);
       panel.setNotice(`${message} Trying again in ${Math.round(retryInMs / 1000)} s.`);
     },
+    onPending() {
+      // Keep the code in the address, so a reload keeps waiting for the same team.
+      if (params.get('team') !== teamCode) {
+        params.set('team', teamCode);
+        replaceUrl();
+      }
+      widget.root.hidden = true;
+      panel.setWaiting(teamCode);
+    },
     onStatus: (s) => panel.setStatus(s),
-  });
+  }, hub);
 
   const look = loadAppearance();
   const widget = new Widget(desktop, {
@@ -115,6 +128,13 @@ function start(first: JoinMsg) {
       };
       return [teammateTab];
     },
+    onCancelWaiting() {
+      net.close();
+      platform.leaveTeam(hub);
+      params.delete('team');
+      replaceUrl();
+      onboard();
+    },
   });
   net.connect();
 }
@@ -127,7 +147,7 @@ if (window.top !== window.self) {
   const name = platform.savedName();
   const teamCode = linkedTeam();
   if (name && teamCode) {
-    start({ type: 'hello', teamCode, clientId: platform.clientId(), name });
+    void platform.clientId().then((clientId) => start({ type: 'hello', teamCode, clientId, name }));
   } else {
     onboard();
   }

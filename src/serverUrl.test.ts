@@ -1,5 +1,38 @@
 import { describe, expect, it } from 'vitest';
-import { checkServerUrl } from './serverUrl.ts';
+import { checkServerUrl, hubKey } from './serverUrl.ts';
+
+describe('hubKey', () => {
+  it('files spellings of the same hub together', () => {
+    const key = 'wss://breaks.example.com/ws';
+    for (const raw of [
+      'wss://breaks.example.com/ws',
+      ' WSS://Breaks.Example.com/ws ',
+      'wss://breaks.example.com:443/ws',
+      'wss://breaks.example.com/ws#x',
+    ]) {
+      expect(hubKey(raw)).toBe(key);
+    }
+  });
+
+  it('keeps different hubs apart', () => {
+    const keys = new Set(
+      [
+        'wss://breaks.example.com/ws',
+        'wss://breaks.example.com:8443/ws',
+        'wss://breaks.example.com/other',
+        'wss://evil.example/ws',
+        'ws://localhost:8787/ws',
+        'ws://localhost:8788/ws',
+      ].map(hubKey),
+    );
+    expect(keys.size).toBe(6);
+  });
+
+  it('agrees with the address the app connects to', () => {
+    const r = checkServerUrl(' WSS://Breaks.Example.com:443/ws ');
+    expect('url' in r && hubKey(r.url)).toBe(hubKey('wss://breaks.example.com/ws'));
+  });
+});
 
 describe('checkServerUrl', () => {
   it.each([

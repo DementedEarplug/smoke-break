@@ -16,3 +16,13 @@ tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-ap
 tauri-plugin-opener = "2"
 tauri-plugin-autostart = "2"
 tauri-plugin-single-instance = "2"
+
+# Hub access tokens in the login Keychain (src/token.rs). No default features:
+# only the Keychain item API is used.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3", default-features = false }
+
+[dev-dependencies]
+# Reads the meeting-link cases shared with the TypeScript tests. Already part of
+# the build through tauri; not shipped in the app.
+serde_json = "1"

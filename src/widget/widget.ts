@@ -2,24 +2,22 @@
 // dragging, and click handling. Runs inside a page (browser prototype) or as
 // the whole content of the transparent desktop overlay window.
 
-import {
-  type Break,
-  type ClientMsg,
-  type TeamView,
-  clampLength,
-  normalizeMeetingLink,
-} from '../../shared/protocol.ts';
+import { type Break, type ClientMsg, type TeamView, clampLength } from '../../shared/protocol.ts';
 import { drawText, textWidth, wrap } from './font.ts';
+import {
+  type LightWait,
+  isParticipant,
+  lightWaitStep,
+  meetingTarget,
+  pendingLinkStep,
+  startLightWait,
+} from './meetingFlow.ts';
 import { type Hit, Scene, type SceneInput } from './scene.ts';
 import { type LighterSkin, type PackSkin, LIGHTER_SKINS, PACK_SKINS } from './skins.ts';
 import { COPY, type Theme } from './theme.ts';
 import { H, MOUTH_Y, PACK_W, PACK_X, W } from './sprites.ts';
 
 const BUBBLE_MAX_CHARS = 15;
-/** How long the freshly lit cigarette shows before the call opens. */
-const LIT_PAUSE_MS = 700;
-/** Open the call anyway if the animation never gets there (e.g. a slow server). */
-const MAX_LIGHT_WAIT_MS = 4000;
 /** Gap (art pixels) between the bubble's tail and whatever is tallest in the scene. */
 const BUBBLE_GAP = 3;
 const DRAG_THRESHOLD = 4;
@@ -54,14 +52,6 @@ const fmtClock = (ms: number) => {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 };
 
-/**
- * The break's meeting link in canonical form, if it's one we're willing to
- * open. Only this output is ever opened, never the hub's raw string.
- */
-function safeMeetingUrl(team: TeamView): string | null {
-  return normalizeMeetingLink(team.brk?.meetingUrl) || null;
-}
-
 function joinNames(names: string[]): string {
   if (names.length <= 1) return names[0] ?? '';
   if (names.length === 2) return `${names[0]} & ${names[1]}`;
@@ -81,8 +71,11 @@ export class Widget {
   private flickAt: number | null = null;
   /** My public member id; empty until the first state arrives. */
   private me = '';
-  /** Lit but waiting for the light-up animation to finish before opening the call. */
-  private meetingAfterLight: { since: number; litSeen: number | null } | null = null;
+  /**
+   * Lit (or joined and lit) and waiting for the hub to take us in and the
+   * light-up animation to finish before opening the call.
+   */
+  private meetingAfterLight: LightWait | null = null;
   /** Browser: the delayed popup was blocked, so the next click on the pack opens it. */
   private meetingBlocked = false;
   private toast: { text: string; until: number } | null = null;
@@ -207,15 +200,22 @@ export class Widget {
     this.team = team;
     this.me = you;
     this.wake();
-    const url = safeMeetingUrl(team);
-    if (url && this.pendingMeetingWindow) {
-      this.pendingMeetingWindow.location.href = url;
-      this.pendingMeetingWindow = null;
+    // The link reaches participants only, so it can turn up a state or two after we joined.
+    if (!isParticipant(team, you)) this.meetingBlocked = false;
+    if (!this.pendingMeetingOpen && !this.pendingMeetingWindow) return;
+    const next = pendingLinkStep(team, you);
+    if (next === 'wait') return;
+    const tab = this.pendingMeetingWindow;
+    const open = this.pendingMeetingOpen;
+    this.pendingMeetingWindow = null;
+    this.pendingMeetingOpen = false;
+    if (next === 'drop') {
+      // We left (or the break ended) before the link came: don't leave a blank tab behind.
+      tab?.close();
+      return;
     }
-    if (url && this.pendingMeetingOpen) {
-      this.pendingMeetingOpen = false;
-      this.opts.host?.openUrl(url);
-    }
+    if (tab) tab.location.href = next.url;
+    if (open) this.opts.host?.openUrl(next.url);
   }
 
   setScale(scale: number) {
@@ -463,22 +463,20 @@ export class Widget {
   /** Let people watch their cigarette catch before the call takes focus. */
   private openMeetingAfterLight() {
     this.meetingBlocked = false;
-    this.meetingAfterLight = { since: performance.now(), litSeen: null };
+    this.meetingAfterLight = startLightWait(performance.now());
   }
 
   private maybeOpenMeeting() {
     const wait = this.meetingAfterLight;
     if (!wait) return;
-    if (!this.myParticipant) {
-      this.meetingAfterLight = null;
-      return;
-    }
-    const now = performance.now();
-    if (wait.litSeen === null && this.scene.isLit(this.me)) wait.litSeen = now;
-    if ((wait.litSeen !== null && now - wait.litSeen >= LIT_PAUSE_MS) || now - wait.since >= MAX_LIGHT_WAIT_MS) {
-      this.meetingAfterLight = null;
-      this.openMeeting();
-    }
+    // A late joiner isn't a participant (and has no link) until the hub accepts the join.
+    const step = lightWaitStep(wait, performance.now(), {
+      participant: isParticipant(this.team, this.me),
+      lit: this.scene.isLit(this.me),
+    });
+    if (step === 'wait') return;
+    this.meetingAfterLight = null;
+    if (step === 'open') this.openMeeting();
   }
 
   /**
@@ -487,27 +485,23 @@ export class Widget {
    */
   private openMeeting() {
     const team = this.team;
-    const url = team && safeMeetingUrl(team);
+    const target = meetingTarget(team);
     const host = this.opts.host;
-    // Only the owner receives the link itself, so ask `hasZoomLink`.
-    const noLink = team?.meetingProvider === 'fixed-link' && !team.hasZoomLink;
-    const noLinkToast = () =>
+    if (target === 'no-link') {
       this.showToast(
         team?.ownerId === this.me ? 'No Zoom link yet. Add one in settings' : 'No Zoom link yet. Ask the team owner',
         4000,
       );
-    if (host) {
-      if (url) host.openUrl(url);
-      else if (noLink) noLinkToast();
-      else this.pendingMeetingOpen = true;
-    } else if (url) {
-      const w = window.open(url, '_blank');
+    } else if (host) {
+      if (target === 'later') this.pendingMeetingOpen = true;
+      else host.openUrl(target.url);
+    } else if (target !== 'later') {
+      const w = window.open(target.url, '_blank');
       if (w) w.opener = null;
       else this.popupBlocked();
-    } else if (noLink) {
-      noLinkToast();
     } else {
-      // The link is still being created: open a tab now and point it there when it arrives.
+      // The link isn't here yet: open a tab while the click still allows it, and
+      // point it at the call when the link arrives (`setTeam`).
       const w = window.open('about:blank', '_blank');
       if (w) w.opener = null;
       else this.popupBlocked();

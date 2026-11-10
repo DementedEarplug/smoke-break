@@ -1,7 +1,7 @@
 // WebSocket client with auto-reconnect and a server-synced clock.
 
 import { type ClientMsg, type ServerMsg, parseServerMsg } from '../shared/protocol.ts';
-import { serverProblem, serverUrl } from './platform.ts';
+import { serverProblem } from './platform.ts';
 
 export type NetStatus = 'connecting' | 'open' | 'closed';
 
@@ -15,6 +15,12 @@ const RETRY_MAX_MS = 5000;
  */
 const REFUSED_MIN_MS = 15_000;
 const REFUSED_MAX_MS = 5 * 60_000;
+/**
+ * Waiting for the team owner to let us in: ask again at a steady pace (10-15 s
+ * with the jitter in `schedule`), not a growing one, so the wait ends soon
+ * after they click Allow.
+ */
+export const PENDING_RETRY_MS = 12_500;
 
 export class Net {
   private ws: WebSocket | null = null;
@@ -27,8 +33,14 @@ export class Net {
   private samples: number[] = [];
 
   constructor(
+    /**
+     * The hub to talk to, fixed for the life of this connection: the hello
+     * carries a client id and token meant for this hub only, so a changed
+     * server setting must never send them somewhere else.
+     */
+    readonly url: string,
     /** First message on every (re)connect. */
-    public hello: () => ClientMsg,
+    public hello: () => ClientMsg | Promise<ClientMsg>,
     private readonly onMessage: (msg: ServerMsg) => void,
     private readonly onStatus: (s: NetStatus) => void,
     /** The configured hub address isn't acceptable (e.g. plain ws:// to another machine). */
@@ -37,7 +49,7 @@ export class Net {
 
   connect() {
     clearTimeout(this.retryTimer);
-    const problem = serverProblem();
+    const problem = serverProblem(this.url);
     if (problem) {
       this.ws = null;
       this.onStatus('closed');
@@ -45,12 +57,14 @@ export class Net {
       return;
     }
     this.onStatus('connecting');
-    const ws = new WebSocket(serverUrl());
+    const ws = new WebSocket(this.url);
     this.ws = ws;
-    ws.onopen = () => {
+    ws.onopen = async () => {
       this.samples = [];
       this.onStatus('open');
-      ws.send(JSON.stringify(this.hello()));
+      // The hello may need a moment (the token comes from the Keychain).
+      const hello = await this.hello();
+      if (this.ws === ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(hello));
     };
     ws.onmessage = (e) => {
       const msg = parseServerMsg(e.data);
@@ -81,10 +95,17 @@ export class Net {
     return delay;
   }
 
+  /** Waiting for the owner's OK: drop the connection and ask again in 10-15 s. Returns the delay. */
+  retryPending(): number {
+    this.close();
+    this.schedule(PENDING_RETRY_MS);
+    return PENDING_RETRY_MS;
+  }
+
   private schedule(ms: number) {
     clearTimeout(this.retryTimer);
     // Jitter, so a hub restart doesn't get every app back in the same instant.
-    this.retryTimer = setTimeout(() => this.connect(), ms * (0.8 + Math.random() * 0.4));
+    this.retryTimer = setTimeout(() => this.connect(), Math.round(ms * (0.8 + Math.random() * 0.4)));
   }
 
   /**

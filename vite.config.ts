@@ -1,9 +1,15 @@
 import { resolve } from 'node:path';
 import type { Server as HttpServer } from 'node:http';
-import { defineConfig, type Plugin } from 'vite';
+import { type Connect, defineConfig, type Plugin } from 'vite';
 import { createHub, dataFileFromEnv } from './server/hub.ts';
 
 const dataFile = dataFileFromEnv();
+
+/** Sent with every dev and preview response: no framing by other pages, no content sniffing. */
+const SECURITY_HEADERS = {
+  'Content-Security-Policy': "frame-ancestors 'none'",
+  'X-Content-Type-Options': 'nosniff',
+};
 
 // Runs the realtime hub inside the Vite dev/preview server on /ws, so a single
 // `npm run dev` (or `npm run share`) is all the prototype needs. This is for
@@ -19,12 +25,20 @@ function smokeBreakHub(): Plugin {
     });
     httpServer.once('close', () => hub?.close());
   };
+  // Vite's `headers` options don't reach every response (e.g. some errors), so set them first thing.
+  const headers = (server: { middlewares: Connect.Server }) =>
+    server.middlewares.use((_req, res, next) => {
+      for (const [k, v] of Object.entries(SECURITY_HEADERS)) res.setHeader(k, v);
+      next();
+    });
   return {
     name: 'smoke-break-hub',
     configureServer(server) {
+      headers(server);
       attach(server.httpServer as HttpServer | null);
     },
     configurePreviewServer(server) {
+      headers(server);
       attach(server.httpServer as HttpServer);
     },
   };
@@ -36,6 +50,7 @@ export default defineConfig({
     // Fixed port so the desktop app (tauri.conf.json devUrl) can find it.
     port: 5173,
     strictPort: true,
+    headers: SECURITY_HEADERS,
     fs: {
       // The team file holds every invite code and Zoom link: never serve it.
       // Setting `deny` replaces Vite's defaults, so they're repeated here.
@@ -47,8 +62,13 @@ export default defineConfig({
         '.yarnrc.yml',
         '**/.git/**',
         '**/.data/**',
-        // Wherever SMOKE_BREAK_DATA_DIR puts it, plus its temp and .corrupt-* copies.
+        // Wherever SMOKE_BREAK_DATA_DIR puts it, plus its temp, backup and .corrupt-* copies.
         `${dataFile}*`,
+        // Security reviews describe weaknesses; nobody browsing the dev server needs them.
+        '*audit*.md',
+        '*AUDIT*.md',
+        '**/AUDIT.md',
+        '**/SECURITY-AUDIT.md',
       ],
     },
   },
@@ -64,5 +84,5 @@ export default defineConfig({
     },
   },
   // `npm run share` serves on the network for a quick test with teammates. Not a deployment.
-  preview: { allowedHosts: true },
+  preview: { allowedHosts: true, headers: SECURITY_HEADERS },
 });
