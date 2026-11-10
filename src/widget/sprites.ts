@@ -140,10 +140,10 @@ function packBodyColor(skin: PackSkin, r: number, c: number): string {
   return base;
 }
 
-export function drawShadow(pen: Pen, spread: number) {
+export function drawShadow(pen: Pen, spread: number, x = PACK_X, w = PACK_W) {
   const y = MOUTH_Y + BODY_H + 1;
-  const half = Math.round(PACK_W / 2 - 1 + spread);
-  const cx = PACK_X + PACK_W / 2;
+  const half = Math.round(w / 2 - 1 + spread);
+  const cx = x + w / 2;
   pen.rect(cx - half, y, half * 2, 1, 'rgba(0,0,0,0.22)');
   pen.rect(cx - half + 3, y + 1, half * 2 - 6, 1, 'rgba(0,0,0,0.14)');
 }

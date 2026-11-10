@@ -93,6 +93,8 @@ export interface BreakStyle {
   readonly travels: boolean;
   /** Nothing of the style's own is still animating. */
   readonly settled: boolean;
+  /** Span of the ground shadow, if it isn't the pack's. */
+  readonly shadow?: { x: number; w: number };
   /** Where `n` items sit in the container. */
   layout(n: number): { start: number; spacing: number };
   /** Where the `slot`th of `count` lit items stands. */

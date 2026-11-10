@@ -18,18 +18,33 @@ import {
 } from './style.ts';
 
 const GROUND = MOUTH_Y + BODY_H;
-const X0 = PACK_X;
-const X1 = PACK_X + PACK_W - 1;
+/** A wide bakery box, centered where the pack would be. */
+const BOX_W = 32;
+const X0 = PACK_X + Math.floor((PACK_W - BOX_W) / 2);
+const X1 = X0 + BOX_W - 1;
 /** Top edge of the open box; donuts peek out above it. */
 const BOX_TOP = GROUND - 14;
 const LID_H = 4;
 
-// Donuts: 9×7, seen from the front.
-const DONUT_W = 9;
-const DONUT_H = 7;
-const DONUT = ['..FFFFF..', '.FhFFFFF.', 'FhFF.FFFF', 'DFF...FDD', 'DDDD.DDDD', '.DDDDDDD.', '..sssss..'];
-const HOLE = { c: 4, r: 3 };
-const DOUGH = { D: '#e0a050', s: '#b07830' };
+// Donuts: 11×10, seen from a little above, frosting dripping over the dough.
+const DONUT_W = 11;
+const DONUT_H = 10;
+const DONUT = [
+  '...KKKKK...',
+  '.KKFFFFFKK.',
+  '.KFhhFFFFK.',
+  'KFhFDDDFFFK',
+  'KFFF...FFFK',
+  'KFFF...FFDK',
+  'KDFFFFFDFDK',
+  '.KDFDFFDDK.',
+  '..KsDDDsK..',
+  '...KKKKK...',
+];
+const MID_R = 4.5;
+const DOUGH = { D: '#e0a050', s: '#b07830', K };
+/** Inside of a bitten donut. */
+const CRUMB_IN = '#f4d48c';
 const FROSTINGS: [string, string][] = [
   ['#ff7ab0', '#ffc0dc'],
   ['#6a3a1a', '#9a6a40'],
@@ -40,20 +55,31 @@ const FROSTINGS: [string, string][] = [
 const SPRINKLES = ['#ff4a4a', '#4ad0ff', '#ffe040', '#6ae06a', '#ffffff', '#ff8ad0'];
 /** Where sprinkles land on the frosting, in the order they appear. */
 const SPRINKLE_AT: [number, number][] = [
-  [3, 0],
-  [6, 1],
-  [2, 2],
-  [7, 2],
   [4, 1],
-  [6, 3],
-  [5, 0],
+  [7, 2],
+  [2, 5],
+  [8, 3],
+  [5, 6],
+  [8, 5],
+  [2, 2],
 ];
+/** Eaten a bite at a time from the right, leaving tooth marks. */
+const BITES = 5;
+const MARKS = [1.5, 4.5, 7.5];
+const bitesTaken = (bitten: number) => (bitten >= 1 ? BITES + 1 : Math.min(BITES, Math.floor(bitten * (BITES + 1))));
+/** How far in from the right the bites reach. */
+const biteLine = (bites: number) => DONUT_W - (bites * DONUT_W) / (BITES + 1);
+const isEaten = (c: number, r: number, bites: number) => {
+  if (bites === 0) return false;
+  const line = biteLine(bites) + 1;
+  return c > line || MARKS.some((m) => (c - line) ** 2 + (r - m) ** 2 < 1.8 ** 2);
+};
 const CRUMB = '#d09040';
 /** Peeking out of the box. */
-const POP_H = 3;
+const POP_H = 6;
 /** Where my donut is held up to be sprinkled. */
-const HOLD = { x: X0 + Math.floor((PACK_W - DONUT_W) / 2), top: BOX_TOP - 22 };
-/** Lit donuts sit in a little pyramid on the ground to the right of the box. */
+const HOLD = { x: X0 + Math.floor((BOX_W - DONUT_W) / 2), top: BOX_TOP - 24 };
+/** Lit donuts stack up on the ground to the right of the box. */
 const STAND_X = X1 + 3;
 
 // The sprinkle shaker: 6×12, cap on top.
@@ -79,21 +105,19 @@ class Donut implements BreakStyle {
   readonly puffColors: string[] = [];
   readonly travels = true;
   readonly settled = true;
+  readonly shadow = { x: X0, w: BOX_W };
 
   layout(n: number) {
-    const spacing = n <= 2 ? DONUT_W : Math.max(2, Math.floor((PACK_W - 2 - DONUT_W) / (n - 1)));
-    return { start: Math.round(X0 + PACK_W / 2 - ((n - 1) * spacing + DONUT_W) / 2), spacing };
+    const spacing = n <= 2 ? DONUT_W : Math.max(2, Math.floor((BOX_W - 2 - DONUT_W) / (n - 1)));
+    return { start: Math.round(X0 + BOX_W / 2 - ((n - 1) * spacing + DONUT_W) / 2), spacing };
   }
 
   stand(slot: number): [number, number] {
-    // Rows of three, then two on top offset by half, and so on.
-    let row = 0;
-    let i = slot;
-    while (i >= (row % 2 ? 2 : 3)) {
-      i -= row % 2 ? 2 : 3;
-      row++;
-    }
-    return [STAND_X + i * (DONUT_W - 1) + (row % 2 ? 4 : 0), GROUND - row * (DONUT_H - 1)];
+    // Two side by side, then one on top between them, and so on.
+    const k = slot % 3;
+    const row = Math.floor(slot / 3) * 2 + (k === 2 ? 1 : 0);
+    const i = k === 2 ? 0 : k;
+    return [STAND_X + i * (DONUT_W - 1) + (row % 2 ? 5 : 0), GROUND - row * (DONUT_H - 1)];
   }
 
   animate(v: Item, mine: boolean, view: SceneView, dt: number) {
@@ -188,12 +212,10 @@ class Donut implements BreakStyle {
   private drawOne(view: SceneView, pen: Pen, v: Item, g: Pose) {
     const bitten = this.bitten(v, view);
     // A few crumbs fall with every bite.
-    const bites = Math.floor(bitten * 12);
-    if (v.lit && bites > v.lastAsh) {
-      const a = bitten * Math.PI * 2;
-      const cx = g.x + HOLE.c + Math.sin(a) * 4;
-      const cy = g.top + HOLE.r - Math.cos(a) * 3;
-      for (let i = 0; i < 2; i++) view.bit(cx + i, cy, (Math.random() - 0.5) * 6, CRUMB);
+    const bites = bitesTaken(bitten);
+    if (v.lit && bites > v.lastAsh && bites <= BITES) {
+      const c = biteLine(bites) + 1;
+      for (let i = 0; i < 3; i++) view.bit(g.x + c, g.top + MID_R + (i - 1) * 2, (Math.random() - 0.5) * 6, CRUMB);
     }
     v.lastAsh = bites;
     drawDonut(pen, g.x, g.top, frostingOf(v.id), Math.round(v.ignite * SPRINKLE_AT.length), bitten, v.seed);
@@ -225,7 +247,7 @@ class Donut implements BreakStyle {
   }
 
   body(oy: number): Rect {
-    return { x: X0, y: BOX_TOP - LID_H + oy, w: PACK_W, h: GROUND - BOX_TOP + LID_H };
+    return { x: X0, y: BOX_TOP - LID_H + oy, w: BOX_W, h: GROUND - BOX_TOP + LID_H };
   }
 }
 
@@ -234,7 +256,7 @@ class Donut implements BreakStyle {
 /** The open lid, standing up behind the donuts. */
 function drawLidBack(pen: Pen, flap: number, oy: number, skin: PackSkin) {
   if (flap < 0.34) return;
-  const h = flap < 0.67 ? 4 : 8;
+  const h = flap < 0.67 ? 5 : 10;
   const top = BOX_TOP - h + oy;
   for (let y = top; y < BOX_TOP + oy; y++) {
     for (let x = X0 + 1; x < X1; x++) {
@@ -274,7 +296,7 @@ function drawBox(pen: Pen, flap: number, oy: number, skin: PackSkin) {
     }
   }
   const textW = skin.monogram.length * ADVANCE - 1;
-  drawGlyphs(pen, skin.monogram, X0 + Math.floor((PACK_W - textW) / 2), BOX_TOP + 6 + oy, skin.label);
+  drawGlyphs(pen, skin.monogram, X0 + Math.floor((BOX_W - textW) / 2), BOX_TOP + 6 + oy, skin.label);
 }
 
 function drawDonut(pen: Pen, x: number, top: number, [frost, shine]: [string, string], sprinkles: number, bitten: number, seed: number) {
@@ -283,17 +305,19 @@ function drawDonut(pen: Pen, x: number, top: number, [frost, shine]: [string, st
     const [c, r] = SPRINKLE_AT[i];
     sprinkled.set(`${c},${r}`, SPRINKLES[(i + Math.floor(seed * SPRINKLES.length)) % SPRINKLES.length]);
   }
+  const bites = bitesTaken(bitten);
+  if (bites > BITES) return;
   for (let r = 0; r < DONUT_H; r++) {
     for (let c = 0; c < DONUT_W; c++) {
       const ch = DONUT[r][c];
-      if (ch === '.') continue;
-      // Eaten clockwise from the top.
-      if (bitten > 0) {
-        const a = Math.atan2(c - HOLE.c, -(r - HOLE.r));
-        const turn = (a < 0 ? a + Math.PI * 2 : a) / (Math.PI * 2);
-        if (turn < bitten || bitten >= 1) continue;
-      }
-      const color = sprinkled.get(`${c},${r}`) ?? (ch === 'F' ? frost : ch === 'h' ? shine : DOUGH[ch as 'D' | 's']);
+      if (ch === '.' || isEaten(c, r, bites)) continue;
+      // The bitten edge shows the inside.
+      const edge = isEaten(c + 1, r, bites) || isEaten(c, r - 1, bites) || isEaten(c, r + 1, bites);
+      const color = edge
+        ? ch === 'K'
+          ? K
+          : CRUMB_IN
+        : (sprinkled.get(`${c},${r}`) ?? (ch === 'F' ? frost : ch === 'h' ? shine : DOUGH[ch as 'D' | 's' | 'K']));
       pen.px(x + c, top + r, color);
     }
   }
@@ -313,7 +337,7 @@ function shakerCell(c: number, r: number, skin: LighterSkin): string | null {
 
 export const donut: StyleModule = {
   create: () => new Donut(),
-  previewBox: { x: X0, y: BOX_TOP - LID_H, w: PACK_W, h: GROUND - BOX_TOP + LID_H },
+  previewBox: { x: X0, y: BOX_TOP - LID_H, w: BOX_W, h: GROUND - BOX_TOP + LID_H },
   drawPreview: (pen, skin) => drawBox(pen, 0, 0, skin),
   toolBox: { w: SHAKER_W, h: SHAKER_H },
   drawToolPreview: (pen, skin) =>

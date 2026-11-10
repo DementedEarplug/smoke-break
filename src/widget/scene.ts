@@ -262,7 +262,7 @@ export class Scene implements SceneView {
     const pen = new S.Pen(ctx);
 
     this.oy = this.idle ? Math.round(Math.sin(this.t * 2.2)) : 0;
-    S.drawShadow(pen, -this.oy);
+    S.drawShadow(pen, -this.oy, style.shadow?.x, style.shadow?.w);
     this.itemRects = [];
     this.contentTop = style.top + this.oy;
     style.draw(this, packPen, pen, packSkin);
