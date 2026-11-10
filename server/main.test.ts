@@ -153,7 +153,7 @@ describe('standalone hub startup (item 6)', () => {
   it('in strict mode (SMOKE_BREAK_ENTERPRISE=1) refuses to start with exit status 78, listing everything missing (review 4, item 5)', async () => {
     const { code, out } = await run({ PORT: '20345', HOST: '0.0.0.0', SMOKE_BREAK_ENTERPRISE: '1', SMOKE_BREAK_ACCESS_TOKEN: 'shared-token-0123456789abcdef' });
     expect(code).toBe(78);
-    expect(out).toMatch(/SMOKE_BREAK_ENTERPRISE=1, but this hub is missing/);
+    expect(out).toMatch(/Strict mode \(SMOKE_BREAK_ENTERPRISE\) is on, but this hub is missing/);
     for (const what of [/instead of the shared SMOKE_BREAK_ACCESS_TOKEN/, /SMOKE_BREAK_PUBLIC_HOST/, /SMOKE_BREAK_PROXY_SECRET or SMOKE_BREAK_SOCKET/, /HOST=0\.0\.0\.0 is not a loopback/]) {
       expect(out).toMatch(what);
     }

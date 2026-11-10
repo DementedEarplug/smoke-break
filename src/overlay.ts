@@ -5,15 +5,7 @@ import './style.css';
 import { type Appearance, loadAppearance, onAppearanceChange, saveAppearance } from './appearance.ts';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import {
-  type Window,
-  availableMonitors,
-  currentMonitor,
-  cursorPosition,
-  getCurrentWindow,
-  LogicalSize,
-  PhysicalPosition,
-} from '@tauri-apps/api/window';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { normalizeMeetingLink } from '../shared/protocol.ts';
 import * as platform from './platform.ts';
 import { createSession } from './session.ts';
@@ -46,7 +38,35 @@ function layoutFor(scale: number) {
 }
 
 document.documentElement.classList.add('sb-overlay');
-const win = getCurrentWindow();
+
+type Point = { x: number; y: number };
+type Size = { width: number; height: number };
+type Monitor = { position: Point; size: Size; scaleFactor: number };
+
+/**
+ * The overlay's own window, through the app's `window_*` commands
+ * (src-tauri/src/lib.rs). They act on the calling window only; Tauri's own
+ * window commands would act on any window a `label` names. Positions and
+ * sizes read back are physical pixels; `setSize` takes logical ones.
+ */
+const win = {
+  show: () => invoke<void>('window_show'),
+  hide: () => invoke<void>('window_hide'),
+  setSize: (width: number, height: number) => invoke<void>('window_set_size', { width, height }),
+  setPosition: (x: number, y: number) => invoke<void>('window_set_position', { x: Math.round(x), y: Math.round(y) }),
+  startDragging: () => invoke<void>('window_start_dragging'),
+  setIgnoreCursorEvents: (ignore: boolean) => invoke<void>('window_set_ignore_cursor_events', { ignore }),
+  outerPosition: () => invoke<Point>('window_outer_position'),
+  outerSize: () => invoke<Size>('window_outer_size'),
+  scaleFactor: () => invoke<number>('window_scale_factor'),
+  currentMonitor: () => invoke<Monitor | null>('window_current_monitor'),
+  availableMonitors: () => invoke<Monitor[]>('window_available_monitors'),
+  cursorPosition: () => invoke<Point>('window_cursor_position'),
+  // Window events only need the event permission.
+  onMoved: (f: (p: Point) => void) => getCurrentWindow().onMoved((e) => f(e.payload)),
+  onScaleChanged: (f: (scale: number) => void) => getCurrentWindow().onScaleChanged((e) => f(e.payload.scaleFactor)),
+};
+type Win = typeof win;
 
 // Joining or leaving a team happens in the settings window; start over when it does.
 void listen('identity-changed', () => location.reload());
@@ -166,7 +186,7 @@ async function start(id: platform.Identity) {
   widget.setTheme(look.theme);
   positionWidget(look.scale);
   const { width, height } = layoutFor(look.scale);
-  await win.setSize(new LogicalSize(width, height));
+  await win.setSize(width, height);
 
   onAppearanceChange(async (next: Appearance) => {
     const prev = look;
@@ -196,11 +216,11 @@ async function start(id: platform.Identity) {
  * The window ignores the mouse except over the pack, lighter, cigarettes, or
  * length buttons. While ignoring, the webview gets no events, so poll the cursor.
  */
-async function clickThrough(win: Window, widget: Widget, isMouseDown: () => boolean) {
+async function clickThrough(win: Win, widget: Widget, isMouseDown: () => boolean) {
   let origin = await win.outerPosition();
   let scale = await win.scaleFactor();
-  void win.onMoved((e) => (origin = e.payload));
-  void win.onScaleChanged((e) => (scale = e.payload.scaleFactor));
+  void win.onMoved((p) => (origin = p));
+  void win.onScaleChanged((s) => (scale = s));
 
   let ignoring: boolean | null = null;
   const setIgnore = (on: boolean) => {
@@ -212,7 +232,7 @@ async function clickThrough(win: Window, widget: Widget, isMouseDown: () => bool
   const poll = async () => {
     let next = CURSOR_POLL_MS;
     try {
-      const p = await cursorPosition();
+      const p = await win.cursorPosition();
       const x = (p.x - origin.x) / scale;
       const y = (p.y - origin.y) / scale;
       const inside = x >= 0 && y >= 0 && x < window.innerWidth && y < window.innerHeight;
@@ -232,25 +252,20 @@ async function clickThrough(win: Window, widget: Widget, isMouseDown: () => bool
 }
 
 /** Resize the window for a new scale, keeping the pack's bottom-center where it was on screen. */
-async function resizeKeepingPack(win: Window, from: number, to: number) {
+async function resizeKeepingPack(win: Win, from: number, to: number) {
   const a = layoutFor(from);
   const b = layoutFor(to);
   const [pos, dpr] = await Promise.all([win.outerPosition(), win.scaleFactor()]);
-  await win.setSize(new LogicalSize(b.width, b.height));
-  await win.setPosition(
-    new PhysicalPosition(
-      Math.round(pos.x + (a.packCenterX - b.packCenterX) * dpr),
-      Math.round(pos.y + (a.packBottom - b.packBottom) * dpr),
-    ),
-  );
+  await win.setSize(b.width, b.height);
+  await win.setPosition(pos.x + (a.packCenterX - b.packCenterX) * dpr, pos.y + (a.packBottom - b.packBottom) * dpr);
 }
 
 /** Restore the last position if it's still on a screen, otherwise bottom-right of the current one. */
-async function placeWindow(win: Window) {
+async function placeWindow(win: Win) {
   const size = await win.outerSize();
   try {
     const saved = JSON.parse(localStorage.getItem(POS_KEY) ?? '') as { x: number; y: number };
-    const monitors = await availableMonitors();
+    const monitors = await win.availableMonitors();
     const onScreen = monitors.some(
       (m) =>
         saved.x + size.width / 2 >= m.position.x &&
@@ -258,24 +273,19 @@ async function placeWindow(win: Window) {
         saved.y + size.height / 2 >= m.position.y &&
         saved.y + size.height / 2 < m.position.y + m.size.height,
     );
-    if (onScreen) await win.setPosition(new PhysicalPosition(saved.x, saved.y));
+    if (onScreen) await win.setPosition(saved.x, saved.y);
     else throw new Error('off screen');
   } catch {
-    const m = await currentMonitor();
+    const m = await win.currentMonitor();
     if (m) {
       const margin = 24 * m.scaleFactor;
-      await win.setPosition(
-        new PhysicalPosition(
-          Math.round(m.position.x + m.size.width - size.width - margin),
-          Math.round(m.position.y + m.size.height - size.height - margin * 3),
-        ),
-      );
+      await win.setPosition(m.position.x + m.size.width - size.width - margin, m.position.y + m.size.height - size.height - margin * 3);
     }
   }
 
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
-  void win.onMoved((e) => {
+  void win.onMoved((p) => {
     clearTimeout(saveTimer);
-    saveTimer = setTimeout(() => localStorage.setItem(POS_KEY, JSON.stringify(e.payload)), 300);
+    saveTimer = setTimeout(() => localStorage.setItem(POS_KEY, JSON.stringify(p)), 300);
   });
 }

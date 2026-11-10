@@ -151,6 +151,8 @@ class FakeSocket {
       brk: null,
     };
     this.onmessage?.({ data: JSON.stringify({ type: 'state', team, you: 'm-sam', serverNow: Date.now() }) });
+    // The next animation frame, where the app handles the newest state (src/net.ts).
+    runFrames();
   }
 }
 
@@ -213,15 +215,15 @@ function command(cmd: string, a: Record<string, unknown>): unknown {
       return (a.pinned && keychain.get(`client-id@${hub}`)) || derive(runSecret, hub);
     case 'plugin:event|listen':
       return calls.length;
-    case 'plugin:window|outer_position':
-    case 'plugin:window|cursor_position':
+    case 'window_outer_position':
+    case 'window_cursor_position':
       // Never answers the cursor: the overlay would poll it for ever.
       return cmd.endsWith('cursor_position') ? new Promise(() => {}) : { x: 100, y: 100 };
-    case 'plugin:window|outer_size':
+    case 'window_outer_size':
       return { width: 240, height: 360 };
-    case 'plugin:window|scale_factor':
+    case 'window_scale_factor':
       return 2;
-    case 'plugin:window|available_monitors':
+    case 'window_available_monitors':
       return [];
     default:
       return null;

@@ -7,8 +7,9 @@ are all done on the build machine or in CI.
 
 **Build with `npm run desktop:build:enterprise`** (section 2). It refuses to
 build until the hub and meeting host are set, locks the app to your hub, pins
-the webviews' CSP to it, signs with your identity and then checks the built app.
-A plain `npm run desktop:build` gives an app that can talk to any `wss:` hub.
+the webviews' CSP `connect-src` to it, signs with your identity (when you give
+one) and then checks the built app. A plain `npm run desktop:build` gives an
+app that can talk to any `wss:` hub (and to a plain `ws:` one on the same Mac).
 **Before handing an app to MDM, check it** with
 `npm run desktop:build:enterprise -- --check <path/to/Smoke Break.app>`
 ([Checking a built app](#checking-a-built-app)).
@@ -36,18 +37,23 @@ A plain `npm run desktop:build` gives an app that can talk to any `wss:` hub.
   the app's native code (see [Where secrets are stored](#where-secrets-are-stored)).
 - In a locked build (the enterprise one) the native side is locked too: every
   command that takes a hub address (reading or saving a token, asking for this
-  device's id) refuses any hub but the built-in one (`src-tauri/src/lock.rs`).
+  device's id, pinning an older id) refuses any hub but the built-in one
+  (`src-tauri/src/lock.rs`).
 - Each window may call only what it needs. `src-tauri/capabilities/overlay.json`
-  (the pack: show, hide, move and size its window, let clicks through, read
-  the cursor position and the screens, open a meeting, ask for the settings
-  window, set the tray's do-not-disturb, read the token and its id) and
-  `capabilities/panel.json` (settings: read and save the token, read its id)
-  list every permission; both may send and listen to events, and move an
-  older version's identity into the Keychain. Nothing else of Tauri's (menus,
-  tray, paths, creating windows or webviews, opening URLs) is granted, the
-  settings window has no window permissions at all, and each command checks
-  the calling window again. Release builds have no web inspector (Tauri's
-  `devtools` feature is off) and `withGlobalTauri` is off.
+  (the pack: show, hide, move and size its own window, let clicks through,
+  read the cursor position and the screens, open a meeting, ask for the
+  settings window, set the tray's do-not-disturb, read the token and its id)
+  and `capabilities/panel.json` (settings: read and save the token, read its
+  id) list every permission; both may send and listen to events (any event
+  name, to or from either window), and move an older version's identity into
+  the Keychain. The pack handles its window only through the app's own
+  `window_*` commands, which act on the window that calls them and no other.
+  Tauri's own window commands act on whichever window their `label` argument
+  names, and a capability can't confine them to the caller, so neither window
+  is granted any of them. Nothing else of Tauri's (menus, tray, paths,
+  creating windows or webviews, opening URLs) is granted, and each of the
+  app's commands checks the calling window again. Release builds have no web
+  inspector (Tauri's `devtools` feature is off) and `withGlobalTauri` is off.
 - One running app per user: a second launch asks the first to open its
   settings window and quits. The lock and the socket for that live in the
   app's data folder (`~/Library/Application Support/<bundle id>`, made
@@ -88,9 +94,12 @@ What the script does:
 1. Refuses to start if a requirement is missing or wrong, and says what to set.
 2. Writes a Tauri config override to
    `src-tauri/target/enterprise-build/tauri.override.json` that pins the CSP
-   `connect-src` (both `csp` and `devCsp`) to exactly your hub's origin, e.g.
-   `'self' ipc: http://ipc.localhost wss://breaks.acme.internal`, and names the
-   signing identity when there is one.
+   `connect-src` (both `csp` and `devCsp`) to exactly the app and your hub's
+   origin, `'self' ipc: http://ipc.localhost wss://breaks.acme.internal`, and
+   names the signing identity when there is one. Each CSP is written as one
+   policy string (`connect-src …; default-src …; …`, the other directives as in
+   `tauri.conf.json`), so `--check` can read where `connect-src` ends in the
+   binary.
 3. Runs `tauri build --config <that file>` with `VITE_LOCK_SERVER=1`, plus any
    arguments you give after `--` (e.g. `-- --target universal-apple-darwin`).
 4. Checks the built app, with the same checks as `--check` (below) plus one:
@@ -264,11 +273,18 @@ the token field says so. Don't use such builds where that matters.
   it can read the token for a hub and ask for this device's id for a hub,
   because the app itself needs both. It can't get the device secret, so it
   can't derive ids later, elsewhere. In a locked build it can do either only
-  for your hub (the native commands refuse any other), and the CSP only lets
-  it talk to your hub. In the pack's window it can't save a token at all. It
-  could replace this device's pinned id for your hub (the once-only move from
-  older versions needs that command), which loses the person's place but
-  tells it nothing it couldn't already read.
+  for your hub (the native commands refuse any other), and the CSP lets it
+  open connections (WebSockets, `fetch`) to your hub only and load scripts,
+  styles, images and frames from the app itself only. The CSP by itself would
+  not stop it from navigating its own window to another site, taking what it
+  read along in the address, so the app refuses every navigation except to
+  its own pages (`own_page` in `src-tauri/src/lib.rs`; a dev build also
+  allows the Vite dev server). In the
+  pack's window it can't save a token at all, and can show, hide, move or
+  resize the pack's window but not the settings window. It could replace this
+  device's pinned id for your hub (the once-only move from older versions
+  needs that command), which loses the person's place but tells it nothing it
+  couldn't already read.
 
 #### Limits
 
@@ -312,19 +328,26 @@ Trade-offs and checks:
 `tauri.conf.json` lets the webviews open WebSockets to any `wss:` host (plus
 localhost for development), because in a general build the Server field can
 point anywhere. A locked build doesn't need that, so `desktop:build:enterprise`
-pins `connect-src` to your hub, and even injected script can't talk to another
-server. Tauri merges the override into `tauri.conf.json` (JSON Merge Patch:
-only the keys given are replaced) and compiles the CSP into the app's
-executable. `devCsp` is only used by `tauri dev`, but it is pinned too so the
-wide list isn't in the binary at all.
+pins `connect-src` to your hub, and even injected script can't open a
+connection to another server or send its window to another site (see
+"Script running in the webview" under
+[What is stored where on the Mac](#what-is-stored-where-on-the-mac)). Tauri
+merges the override into `tauri.conf.json` (JSON Merge Patch: only the keys given are
+replaced, here each CSP as a whole by its pinned policy string) and compiles
+the CSP into the app's executable. `devCsp` is only used by `tauri dev`, but it
+is pinned too so the wide list isn't in the binary at all.
 
-The script checks the result itself. To look by hand (`$APP` is set in
-step 3), every line this prints should end in your hub, none in a bare
-`wss:` (string literals sit back to back in the binary, so the hub may run
-straight into the next one, e.g. `wss://breaks.acme.internaldefault-src`):
+The script checks the result itself: every `connect-src` in the executable
+must end at its `;` and allow exactly the app and your hub, in any order,
+nothing more; a `connect-src` whose end can't be told (Tauri's form for a CSP
+given as directives instead of one string, the default build's) fails, and so
+does the default's source list anywhere. To look by hand (`$APP` is set in
+step 3), this should print one line: a count (one per CSP, `csp` and
+`devCsp`, in each architecture of the binary) and
+`connect-src 'self' ipc: http://ipc.localhost wss://breaks.acme.internal;`:
 
 ```sh
-grep -a -o "http://ipc.localhost [^ ;']*" "$APP"/Contents/MacOS/* | sort -u
+grep -a -o -i "connect-src[^;]*;" "$APP"/Contents/MacOS/* | sort | uniq -c
 ```
 
 If `cargo` builds the app without the Tauri CLI, the same override (the file
@@ -413,10 +436,10 @@ It prints a table and exits non-zero if any line says FAIL:
 |---|---|
 | Build record | the executable carries the record `src-tauri/build.rs` writes at build time (hub, server lock, whether a shared token was set, meeting host; never the token itself) |
 | Hub address | it is a `wss://` hub, and the one in `VITE_SERVER_URL` if you set it |
-| Server lock | the app was built with `VITE_LOCK_SERVER=1`, and the hub address is in the native code that refuses other hubs (not only in the record: an app built from older sources fails) |
+| Server lock | the app was built with `VITE_LOCK_SERVER=1`, and the hub lock the native commands obey (the marker `sb-lock:v1:on:<hub> :end` that `src-tauri/src/lock.rs` reads at run time) is on and names the same hub as the record (an app built from older sources has no marker and fails) |
 | Shared access token | `VITE_HUB_TOKEN` was empty |
 | Meeting host pinned | a Zoom host is pinned, is in the code that checks links (not only in the record), and matches `SMOKE_BREAK_MEETING_HOST` if set |
-| CSP connect-src | every `connect-src` compiled into the executable is exactly `'self' ipc: http://ipc.localhost <your hub origin>`, with nothing of the wide default left (checked against `VITE_SERVER_URL` when the record has no usable hub) |
+| CSP connect-src | there is a `connect-src` in the executable, every one is a complete directive (ended by `;`) whose sources are exactly `'self' ipc: http://ipc.localhost <your hub origin>` in any order, the hub compared as a whole, and nothing of the wide default is left (checked against `VITE_SERVER_URL` when the record has no usable hub) |
 | Signed | signed with a real identity (not unsigned or ad-hoc; `--allow-unsigned` turns this into a warning, for test builds only) |
 | `codesign --verify --deep --strict` | the signature is valid for everything in the bundle |
 | Hardened runtime | the code directory flags include `runtime` |

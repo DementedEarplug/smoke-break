@@ -88,6 +88,100 @@ fn open_meeting<R: Runtime>(window: Window<R>, url: String) -> Result<(), String
     tauri_plugin_opener::open_url(url.as_str(), None::<&str>).map_err(|e| e.to_string())
 }
 
+// The overlay's own window. Tauri's `core:window:*` commands act on whichever
+// window their `label` argument names, and a capability can't confine them to
+// the caller; these act on the calling window only, and only the overlay may
+// call them. Async, like Tauri's own window commands.
+
+fn win_err(e: tauri::Error) -> String {
+    e.to_string()
+}
+
+#[tauri::command]
+async fn window_show<R: Runtime>(window: Window<R>) -> Result<(), String> {
+    caller(&window, &[OVERLAY])?;
+    window.show().map_err(win_err)
+}
+
+#[tauri::command]
+async fn window_hide<R: Runtime>(window: Window<R>) -> Result<(), String> {
+    caller(&window, &[OVERLAY])?;
+    window.hide().map_err(win_err)
+}
+
+/// Largest window side the pack asks for, in logical pixels (it needs a few hundred).
+const MAX_WINDOW_SIDE: f64 = 4096.0;
+
+/// Sets the calling window's size in logical pixels.
+#[tauri::command]
+async fn window_set_size<R: Runtime>(window: Window<R>, width: f64, height: f64) -> Result<(), String> {
+    caller(&window, &[OVERLAY])?;
+    let ok = |v: f64| v.is_finite() && v >= 1.0 && v <= MAX_WINDOW_SIDE;
+    if !ok(width) || !ok(height) {
+        return Err("not a window size".into());
+    }
+    window.set_size(tauri::LogicalSize::new(width, height)).map_err(win_err)
+}
+
+/// Moves the calling window to a point in physical pixels.
+#[tauri::command]
+async fn window_set_position<R: Runtime>(window: Window<R>, x: i32, y: i32) -> Result<(), String> {
+    caller(&window, &[OVERLAY])?;
+    window.set_position(tauri::PhysicalPosition::new(x, y)).map_err(win_err)
+}
+
+#[tauri::command]
+async fn window_start_dragging<R: Runtime>(window: Window<R>) -> Result<(), String> {
+    caller(&window, &[OVERLAY])?;
+    window.start_dragging().map_err(win_err)
+}
+
+#[tauri::command]
+async fn window_set_ignore_cursor_events<R: Runtime>(window: Window<R>, ignore: bool) -> Result<(), String> {
+    caller(&window, &[OVERLAY])?;
+    window.set_ignore_cursor_events(ignore).map_err(win_err)
+}
+
+#[tauri::command]
+async fn window_outer_position<R: Runtime>(window: Window<R>) -> Result<tauri::PhysicalPosition<i32>, String> {
+    caller(&window, &[OVERLAY])?;
+    window.outer_position().map_err(win_err)
+}
+
+#[tauri::command]
+async fn window_outer_size<R: Runtime>(window: Window<R>) -> Result<tauri::PhysicalSize<u32>, String> {
+    caller(&window, &[OVERLAY])?;
+    window.outer_size().map_err(win_err)
+}
+
+#[tauri::command]
+async fn window_scale_factor<R: Runtime>(window: Window<R>) -> Result<f64, String> {
+    caller(&window, &[OVERLAY])?;
+    window.scale_factor().map_err(win_err)
+}
+
+/// The screen the calling window is on, if any.
+#[tauri::command]
+async fn window_current_monitor<R: Runtime>(window: Window<R>) -> Result<Option<tauri::Monitor>, String> {
+    caller(&window, &[OVERLAY])?;
+    window.current_monitor().map_err(win_err)
+}
+
+/// Every screen, to tell whether a saved position is still on one.
+#[tauri::command]
+async fn window_available_monitors<R: Runtime>(window: Window<R>) -> Result<Vec<tauri::Monitor>, String> {
+    caller(&window, &[OVERLAY])?;
+    window.available_monitors().map_err(win_err)
+}
+
+/// Where the mouse pointer is on the screen, in physical pixels: while the
+/// overlay lets clicks through it gets no mouse events.
+#[tauri::command]
+async fn window_cursor_position<R: Runtime>(window: Window<R>) -> Result<tauri::PhysicalPosition<f64>, String> {
+    caller(&window, &[OVERLAY])?;
+    window.cursor_position().map_err(win_err)
+}
+
 /// What this build was configured with (see `build.rs`), kept in the binary
 /// so `scripts/enterprise-build.ts --check` can read it from a built app.
 #[used]
@@ -195,7 +289,19 @@ fn commands<R: Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Syn
         token_set,
         identity_init,
         client_id_pin,
-        client_id
+        client_id,
+        window_show,
+        window_hide,
+        window_set_size,
+        window_set_position,
+        window_start_dragging,
+        window_set_ignore_cursor_events,
+        window_outer_position,
+        window_outer_size,
+        window_scale_factor,
+        window_current_monitor,
+        window_available_monitors,
+        window_cursor_position
     ]
 }
 
@@ -233,6 +339,19 @@ fn first_instance(identifier: &str) -> (bool, Option<single_instance::Guard>) {
     }
 }
 
+/// Whether a window may navigate to `url`: the bundled pages (`tauri://localhost` on macOS and
+/// Linux, `http(s)://tauri.localhost` on Windows), plus the Vite dev server in dev builds.
+fn own_page(url: &tauri::Url, dev: bool) -> bool {
+    let host = url.host_str().unwrap_or("");
+    let no_login = url.username().is_empty() && url.password().is_none();
+    match url.scheme() {
+        "tauri" => no_login && host == "localhost",
+        "http" | "https" if host == "tauri.localhost" => no_login && url.port().is_none(),
+        "http" => dev && no_login && host == "localhost" && url.port() == Some(5173),
+        _ => false,
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let context = tauri::generate_context!();
@@ -244,6 +363,13 @@ pub fn run() {
     };
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))
+        // The windows only ever show the app's own pages. Without this, script that got into a
+        // window could send it to another site and take what it had read along in the address.
+        .plugin(
+            tauri::plugin::Builder::<Wry>::new("own-pages")
+                .on_navigation(|_webview, url| own_page(url, cfg!(dev)))
+                .build(),
+        )
         .invoke_handler(commands())
         .setup(move |app| {
             #[cfg(unix)]
@@ -318,6 +444,33 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn windows_only_navigate_to_the_apps_own_pages() {
+        let ok = |u: &str, dev: bool| own_page(&tauri::Url::parse(u).unwrap(), dev);
+        assert!(ok("tauri://localhost/panel.html", false));
+        assert!(ok("tauri://localhost/overlay.html?x=1", false));
+        assert!(ok("http://tauri.localhost/panel.html", false));
+        assert!(ok("https://tauri.localhost/panel.html", false));
+        assert!(ok("http://localhost:5173/panel.html", true));
+        // The dev server only counts in dev builds.
+        assert!(!ok("http://localhost:5173/panel.html", false));
+        for bad in [
+            "https://evil.example/?stolen=1",
+            "https://tauri.localhost.evil.example/",
+            "https://tauri.localhost:8443/",
+            "https://user@tauri.localhost/",
+            "tauri://evil.example/panel.html",
+            "http://localhost:8787/",
+            "http://localhost/",
+            "file:///etc/passwd",
+            "data:text/html,<script>1</script>",
+            "javascript:alert(1)",
+            "about:blank",
+        ] {
+            assert!(!ok(bad, true), "{bad}");
+        }
+    }
+
     use super::*;
     use serde_json::json;
     use tauri::ipc::{CallbackFn, InvokeBody};
@@ -421,9 +574,56 @@ mod tests {
         refused_by_capability(call(&panel, "show_panel", json!({})));
         assert_eq!(call(&overlay, "set_dnd", json!({ "on": true })), Ok(json!(null)));
 
-        // Nothing else of Tauri's: no menus, tray icons, paths, other windows' APIs.
-        refused_by_capability(call(&panel, "plugin:window|set_position", json!({ "label": PANEL, "value": { "Physical": { "x": 0, "y": 0 } } })));
-        refused_by_capability(call(&panel, "plugin:window|cursor_position", json!({ "label": PANEL })));
+        // Only the overlay handles its window, and only its own: the app's
+        // window_* commands take no label and act on the caller.
+        let own_window = [
+            ("window_show", json!({})),
+            ("window_hide", json!({})),
+            ("window_set_size", json!({ "width": 240.0, "height": 360.0 })),
+            ("window_set_position", json!({ "x": 10, "y": 20 })),
+            ("window_start_dragging", json!({})),
+            ("window_set_ignore_cursor_events", json!({ "ignore": true })),
+            ("window_outer_position", json!({})),
+            ("window_outer_size", json!({})),
+            ("window_scale_factor", json!({})),
+            ("window_current_monitor", json!({})),
+            ("window_available_monitors", json!({})),
+            ("window_cursor_position", json!({})),
+        ];
+        for (cmd, args) in &own_window {
+            refused_by_capability(call(&panel, cmd, args.clone()));
+            assert!(call(&overlay, cmd, args.clone()).is_ok(), "{cmd}");
+        }
+        assert_eq!(call(&overlay, "window_outer_position", json!({})), Ok(json!({ "x": 0, "y": 0 })));
+        reached(call(&overlay, "window_set_size", json!({ "width": 0.0, "height": 360.0 })), "not a window size");
+        reached(call(&overlay, "window_set_size", json!({ "width": 240.0, "height": 1e9 })), "not a window size");
+        // Tauri's own window commands, which act on whatever window `label`
+        // names, are granted to neither window.
+        for cmd in [
+            "show",
+            "hide",
+            "set_size",
+            "set_position",
+            "start_dragging",
+            "set_ignore_cursor_events",
+            "outer_position",
+            "outer_size",
+            "scale_factor",
+            "current_monitor",
+            "available_monitors",
+            "cursor_position",
+            "set_focus",
+            "minimize",
+            "close",
+        ] {
+            for w in [&overlay, &panel] {
+                for label in [OVERLAY, PANEL] {
+                    refused_by_capability(call(w, &format!("plugin:window|{cmd}"), json!({ "label": label })));
+                }
+            }
+        }
+
+        // Nothing else of Tauri's: no menus, tray icons, paths, opening URLs, creating webviews.
         for w in [&overlay, &panel] {
             refused_by_capability(call(w, "plugin:menu|new", json!({ "kind": "Menu", "options": {} })));
             refused_by_capability(call(w, "plugin:path|resolve_directory", json!({ "directory": 1 })));
@@ -432,7 +632,6 @@ mod tests {
             refused_by_capability(call(w, "plugin:window|close", json!({ "label": OVERLAY })));
             refused_by_capability(call(w, "plugin:webview|create_webview_window", json!({ "options": { "label": "x", "url": "https://evil.example/" } })));
         }
-        assert!(call(&overlay, "plugin:window|cursor_position", json!({ "label": OVERLAY })).is_ok());
 
         // A locked build answers for its built-in hub only, before the Keychain is asked anything.
         if lock::locked_hub().is_some() {

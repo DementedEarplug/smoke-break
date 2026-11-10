@@ -88,11 +88,11 @@ function started() {
   console.log(
     `[smoke-break] data file: ${dataFile} | access token: ${access}` +
       ` | proxy secret: ${s.proxySecret ? 'required' : 'not set'}` +
-      ` | trusted proxies: ${socketPath ? 'the socket' : process.env.SMOKE_BREAK_TRUST_PROXY?.trim() || 'none'}` +
+      ` | trusted proxies: ${socketPath ? 'the socket' : s.loopbackProxyDefault ? 'loopback (strict mode default)' : process.env.SMOKE_BREAK_TRUST_PROXY?.trim() || 'none'}` +
       ` | public host: ${process.env.SMOKE_BREAK_PUBLIC_HOST || 'not set'}` +
       ` | strict mode: ${s.enterprise ? 'on' : 'off'}`,
   );
-  // One line per recommended protection this hub runs without (SMOKE_BREAK_ENTERPRISE=1 refuses to start instead).
+  // One line per recommended protection this hub runs without (strict mode refuses to start instead), and for a non-loopback HOST.
   for (const w of s.warnings) console.warn(`[smoke-break] WARNING: ${w}`);
 }
 

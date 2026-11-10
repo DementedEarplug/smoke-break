@@ -8,7 +8,10 @@
 // ids for one.
 //
 // `build.rs` passes the lock and the hub address in (the same environment the
-// frontend is built with, and the build record says).
+// frontend is built with, and the build record says) as one marker string,
+// `sb-lock:v1:<on|off>:<hub> :end`. It stays in the binary as is and is read
+// from there at run time, so `npm run desktop:build:enterprise -- --check`,
+// which reads the same marker in a built app, sees the lock the commands obey.
 
 use std::sync::OnceLock;
 use tauri::Url;
@@ -17,12 +20,31 @@ use tauri::Url;
 /// a build is locked without `VITE_SERVER_URL`.
 const DEFAULT_SERVER: &str = "ws://localhost:8787/ws";
 
+/// The lock as `build.rs` compiled it in.
+#[used]
+static LOCK_MARKER: &str = env!("SMOKE_BREAK_LOCK_MARKER");
+
 /// The hub this build is locked to, in the form the webview files per-hub data
 /// under (`hubKey` in src/serverUrl.ts), or None for an unlocked build. A
 /// locked build whose address can't be parsed is locked to "" (no hub at all).
 pub fn locked_hub() -> Option<&'static str> {
     static HUB: OnceLock<Option<String>> = OnceLock::new();
-    HUB.get_or_init(|| built_in_hub(env!("SMOKE_BREAK_LOCK") == "on", env!("SMOKE_BREAK_SERVER"))).as_deref()
+    // Read through `black_box` so the compiler can't fold the marker away:
+    // what is in the binary is what decides.
+    HUB.get_or_init(|| from_marker(std::hint::black_box(LOCK_MARKER))).as_deref()
+}
+
+/// The built-in hub from a lock marker. Anything but a well-formed marker
+/// locks the build to no hub at all.
+fn from_marker(marker: &str) -> Option<String> {
+    // Split rather than matched against a "sb-lock:v1:" prefix, so that text
+    // is in the binary only as part of the marker itself.
+    let fields = marker.strip_suffix(" :end").map(|m| m.splitn(4, ':').collect::<Vec<_>>());
+    match fields.as_deref() {
+        Some(["sb-lock", "v1", "off", _]) => None,
+        Some(["sb-lock", "v1", "on", server]) => built_in_hub(true, server),
+        _ => Some(String::new()),
+    }
 }
 
 fn built_in_hub(locked: bool, server: &str) -> Option<String> {
@@ -95,6 +117,25 @@ mod tests {
         assert_eq!(built_in.as_deref(), Some(""));
         assert!(check(HUB, built_in.as_deref()).is_err());
         assert!(check(DEFAULT_SERVER, built_in.as_deref()).is_err());
+    }
+
+    #[test]
+    fn the_marker_decides_the_lock() {
+        assert_eq!(from_marker("sb-lock:v1:off: :end"), None);
+        assert_eq!(from_marker("sb-lock:v1:off:wss://breaks.acme.example/ws :end"), None);
+        assert_eq!(from_marker("sb-lock:v1:on:wss://breaks.acme.example/ws :end").as_deref(), Some(HUB));
+        assert_eq!(from_marker("sb-lock:v1:on:wss://breaks.acme.example:8443/ws :end").as_deref(), Some("wss://breaks.acme.example:8443/ws"));
+        assert_eq!(from_marker("sb-lock:v1:on: :end").as_deref(), Some(DEFAULT_SERVER));
+        // Anything else: locked to no hub at all.
+        for bad in ["", "sb-lock:v1:on:wss://breaks.acme.example/ws", "sb-lock:v2:off: :end", "sb-lock:v1:maybe:x :end"] {
+            assert_eq!(from_marker(bad).as_deref(), Some(""), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn this_build_carries_its_marker() {
+        assert!(LOCK_MARKER.starts_with("sb-lock:v1:") && LOCK_MARKER.ends_with(" :end"), "{LOCK_MARKER}");
+        assert_eq!(locked_hub().map(str::to_owned), from_marker(LOCK_MARKER));
     }
 
     #[test]

@@ -11,6 +11,8 @@ import {
   checkEnv,
   checkHubUrl,
   connectSrc,
+  connectSrcDirectives,
+  cspDirectives,
   failed,
   formatTable,
   inCodeOutsideRecord,
@@ -18,7 +20,9 @@ import {
   makeOverride,
   parseCodesignDisplay,
   parseSpctl,
+  pinnedPolicy,
   readBuildRecord,
+  readLockMarker,
   targetOf,
 } from './enterprise-build.ts';
 import * as fx from './fixtures/check-app.ts';
@@ -111,26 +115,48 @@ describe('isMeetingHost', () => {
   });
 });
 
-describe('makeOverride', () => {
-  it('pins connect-src to exactly the hub in both CSPs', () => {
-    const o = makeOverride(planOf(GOOD)) as { app: { security: Record<string, Record<string, string>> }; bundle?: unknown };
-    const pinned = "'self' ipc: http://ipc.localhost wss://breaks.acme.internal";
-    expect(o.app.security.csp).toEqual({ 'connect-src': pinned });
-    expect(o.app.security.devCsp).toEqual({ 'connect-src': pinned });
-    expect(JSON.stringify(o)).not.toMatch(/wss: |localhost:\*|127\.0\.0\.1/);
-    expect(o.bundle).toBeUndefined();
-  });
+const CONF = JSON.parse(readFileSync(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
 
-  it('keeps the rest of the CSP from tauri.conf.json, whose connect-src it replaces', () => {
-    const conf = JSON.parse(readFileSync(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
-    for (const key of ['csp', 'devCsp']) {
-      // The base is what the app's own connect-src starts with, so nothing it needs is lost.
-      expect(conf.app.security[key]['connect-src'].startsWith(`${CSP_BASE} wss:`)).toBe(true);
+describe('makeOverride', () => {
+  const override = (env = GOOD) =>
+    makeOverride(planOf(env), CONF.app.security) as { app: { security: Record<string, string> }; bundle?: { macOS: { signingIdentity: string } } };
+
+  it('pins connect-src to exactly the hub in both CSPs, each one policy string with connect-src first', () => {
+    const o = override();
+    const pinned = "connect-src 'self' ipc: http://ipc.localhost wss://breaks.acme.internal; ";
+    expect(o.app.security.csp.startsWith(pinned)).toBe(true);
+    expect(o.app.security.devCsp.startsWith(pinned)).toBe(true);
+    expect(JSON.stringify(o)).not.toMatch(/wss: |wss:;|localhost:\*|127\.0\.0\.1/);
+    expect(o.bundle).toBeUndefined();
+    // What --check reads in the binary.
+    for (const policy of [o.app.security.csp, o.app.security.devCsp]) {
+      expect(checkEmbeddedCsp([{ name: 'x', data: Buffer.from(`\0${policy}\0`) }], 'wss://breaks.acme.internal')).toEqual([]);
     }
   });
 
+  it('keeps the rest of each CSP from tauri.conf.json, whose connect-src it replaces', () => {
+    const o = override();
+    for (const key of ['csp', 'devCsp']) {
+      // The base is what the app's own connect-src starts with, so nothing it needs is lost.
+      expect(CONF.app.security[key]['connect-src'].startsWith(`${CSP_BASE} wss:`)).toBe(true);
+      const want = cspDirectives(CONF.app.security[key]);
+      want.set('connect-src', [...CSP_BASE.split(' '), 'wss://breaks.acme.internal']);
+      expect(cspDirectives(o.app.security[key])).toEqual(want);
+    }
+    expect(o.app.security.devCsp).toMatch(/style-src 'self' 'unsafe-inline'/);
+    expect(o.app.security.csp).not.toMatch(/unsafe-inline/);
+  });
+
+  it('takes a policy string as the base too, and refuses one with nothing but connect-src', () => {
+    expect(pinnedPolicy("default-src 'self'; connect-src *; img-src data:", 'wss://h.example')).toBe(
+      "connect-src 'self' ipc: http://ipc.localhost wss://h.example; default-src 'self'; img-src data:",
+    );
+    expect(() => pinnedPolicy({ 'connect-src': '*' }, 'wss://h.example')).toThrow(/no CSP/);
+    expect(() => pinnedPolicy(null, 'wss://h.example')).toThrow(/no CSP/);
+  });
+
   it('names the signing identity when there is one', () => {
-    const o = makeOverride(planOf({ ...GOOD, APPLE_SIGNING_IDENTITY: 'Developer ID Application: Acme' })) as {
+    const o = makeOverride(planOf({ ...GOOD, APPLE_SIGNING_IDENTITY: 'Developer ID Application: Acme' }), CONF.app.security) as {
       bundle: { macOS: { signingIdentity: string } };
     };
     expect(o.bundle.macOS.signingIdentity).toBe('Developer ID Application: Acme');
@@ -163,27 +189,69 @@ describe('checkEmbeddedCsp', () => {
   const origin = 'wss://breaks.acme.internal';
   const bin = (...strings: string[]) => [{ name: 'smoke-break', data: Buffer.from(`\x7fELF…${strings.join('')}…more`) }];
   const DEFAULT = "'self' ipc: http://ipc.localhost wss: ws://localhost:* ws://127.0.0.1:* ws://[::1]:*";
+  /** A policy string as Tauri compiles it: one string literal, packed against others. */
+  const policy = (sources: string) => `connect-src ${sources}; default-src 'self'; object-src 'none'`;
 
-  it('accepts a binary with only the pinned connect-src (string literals packed back to back)', () => {
-    expect(checkEmbeddedCsp(bin(connectSrc(origin), "object-src'none'", connectSrc(origin)), origin)).toEqual([]);
+  it('accepts a binary whose every connect-src is exactly the app and the hub, in any order', () => {
+    expect(checkEmbeddedCsp(bin(policy(connectSrc(origin)), 'object-src', policy(connectSrc(origin))), origin)).toEqual([]);
+    expect(checkEmbeddedCsp(bin(`default-src 'self'; connect-src  ${origin} http://ipc.localhost 'self'\tipc:; img-src data:`), origin)).toEqual([]);
+  });
+
+  // The reviewers' cases: each one starts with the pinned sources and goes on.
+  it.each([
+    [`${connectSrc(origin)} wss:`, 'wss:'],
+    [`${connectSrc(origin)} https://x wss://*`, 'https://x wss://*'],
+    [`'self' ipc: http://ipc.localhost wss://breaks.acme.internal.attacker.example`, 'wss://breaks.acme.internal.attacker.example'],
+    [`${connectSrc(origin)} *`, '*'],
+  ])('refuses connect-src %s', (sources, extra) => {
+    const problems = checkEmbeddedCsp(bin(policy(sources)), origin);
+    expect(problems).toContain(`smoke-break: a connect-src also allows ${extra}`);
+    // And as the reviewers built it: a JSON-ish string, not a complete directive.
+    expect(checkEmbeddedCsp(bin(`xx"connect-src":"${sources}"yy`), origin).length).toBeGreaterThan(0);
+  });
+
+  it('refuses a connect-src that lacks the hub, or is pinned to another one', () => {
+    expect(checkEmbeddedCsp(bin(policy(CSP_BASE)), origin)).toEqual([`smoke-break: a connect-src lacks ${origin}`]);
+    expect(checkEmbeddedCsp(bin(policy(connectSrc('wss://other.example'))), origin)).toEqual([
+      'smoke-break: a connect-src also allows wss://other.example',
+      `smoke-break: a connect-src lacks ${origin}`,
+    ]);
+  });
+
+  it('refuses a connect-src whose end can’t be told, whatever follows it', () => {
+    // Last in a policy, or a directive map's name and value as separate strings.
+    for (const packed of [`default-src 'self'; connect-src ${connectSrc(origin)}`, `connect-src${connectSrc(origin)}default-src'self'`]) {
+      const problems = checkEmbeddedCsp(bin(packed), origin);
+      expect(problems.some((p) => /isn't a complete directive/.test(p))).toBe(true);
+    }
+    // Upper case is still connect-src.
+    expect(checkEmbeddedCsp(bin(policy(connectSrc(origin)), 'CONNECT-SRC *'), origin).some((p) => /isn't a complete directive/.test(p))).toBe(true);
   });
 
   it('refuses the default, wide CSP', () => {
-    const problems = checkEmbeddedCsp(bin(DEFAULT), origin);
-    expect(problems.some((p) => /isn't in it/.test(p))).toBe(true);
+    const problems = checkEmbeddedCsp(bin('connect-src', DEFAULT, "default-src'self'"), origin);
+    expect(problems.some((p) => /isn't a complete directive/.test(p))).toBe(true);
     expect(problems.some((p) => /ws:\/\/localhost:\*/.test(p))).toBe(true);
-    expect(problems.some((p) => /"wss: ws:\/\/loc/.test(p))).toBe(true);
+    expect(problems.some((p) => /sources outside any complete directive/.test(p))).toBe(true);
   });
 
   it('refuses a binary with the pinned CSP and a wide one left over (e.g. devCsp)', () => {
-    expect(checkEmbeddedCsp(bin(connectSrc(origin), DEFAULT), origin)).not.toEqual([]);
+    expect(checkEmbeddedCsp(bin(policy(connectSrc(origin)), DEFAULT), origin)).not.toEqual([]);
+    expect(checkEmbeddedCsp(bin(policy(connectSrc(origin)), `${CSP_BASE} wss:`), origin)).toEqual([
+      `smoke-break: connect-src sources outside any complete directive: "${CSP_BASE} wss:...more"`,
+    ]);
   });
 
-  it('refuses a binary pinned to another hub', () => {
-    expect(checkEmbeddedCsp(bin(connectSrc('wss://other.example')), origin)).not.toEqual([]);
+  it('refuses a binary without any connect-src', () => {
+    expect(checkEmbeddedCsp(bin("default-src 'self';"), origin)).toEqual([`smoke-break: no connect-src in it (the pinned one is ${connectSrc(origin)})`]);
   });
 
   it('refuses an empty bundle', () => expect(checkEmbeddedCsp([], origin)).toEqual(['no executable found in the app bundle']));
+
+  it('reads each connect-src up to its own ;', () => {
+    const found = connectSrcDirectives(`..connect-src a b;c connect-src\x00d;`);
+    expect(found.map((d) => d.sources)).toEqual([['a', 'b'], null]);
+  });
 });
 
 // ── --check ──────────────────────────────────────────────────────────────────
@@ -193,9 +261,14 @@ const ORIGIN = 'wss://breaks.acme.internal';
 const DEFAULT_CSP = "'self' ipc: http://ipc.localhost wss: ws://localhost:* ws://127.0.0.1:* ws://[::1]:*";
 const record = (fields: string) => `smoke-break-build-info:v1 ${fields} :end`;
 const GOOD_RECORD = record(`server=${HUB} lock=on token=none meeting-host=acme.zoom.us`);
+/** The hub lock src-tauri/src/lock.rs obeys, as build.rs compiles it in. */
+const lockMarker = (state: string, hub: string) => `sb-lock:v1:${state}:${hub} :end`;
+const LOCK = lockMarker('on', HUB);
+/** The pinned CSP as the enterprise build writes it (one policy string). */
+const POLICY = (origin = ORIGIN) => `connect-src ${connectSrc(origin)}; default-src 'self'; object-src 'none'`;
 /** An executable as the linker lays it out: string literals back to back, among other bytes. */
 const exe = (...strings: string[]) => [{ name: 'Contents/MacOS/smoke-break', data: Buffer.from(`\xcf\xfa\xed\xfe…${strings.join('')}…`, 'latin1') }];
-const GOOD_EXE = () => exe(connectSrc(ORIGIN), "object-src'none'", connectSrc(ORIGIN), 'acme.zoom.us', HUB, GOOD_RECORD);
+const GOOD_EXE = () => exe(POLICY(), "object-src'none'", POLICY(), 'acme.zoom.us', LOCK, GOOD_RECORD);
 const ok = (output: string) => ({ status: 0, output });
 
 /** A notarized Developer ID build of the right config; each test changes one thing. */
@@ -283,17 +356,50 @@ describe('checkApp', () => {
     ['no hub', record('server= lock=on token=none meeting-host=acme.zoom.us'), 'Hub address'],
     ['a plain ws hub', record('server=ws://breaks.acme.internal/ws lock=on token=none meeting-host=acme.zoom.us'), 'Hub address'],
   ])('fails an app built %s', (_what, rec, check) => {
-    const facts = { ...goodFacts(), binaries: exe(connectSrc(ORIGIN), 'acme.zoom.us', 'evil.example', HUB, rec) };
+    const facts = { ...goodFacts(), binaries: exe(POLICY(), 'acme.zoom.us', 'evil.example', LOCK, rec) };
     const rows = checkApp(facts);
     expect(verdicts(rows)[check]).toBe('fail');
     expect(failed(rows)).toBe(true);
   });
 
+  it('reads the hub lock the native code obeys', () => {
+    expect(readLockMarker(GOOD_EXE())).toEqual({ lock: { on: true, hub: HUB } });
+    expect(readLockMarker(exe(LOCK, LOCK))).toEqual({ lock: { on: true, hub: HUB } });
+    expect(readLockMarker(exe(lockMarker('off', '')))).toEqual({ lock: { on: false, hub: '' } });
+    expect(readLockMarker(exe(lockMarker('on', 'wss://h.example:8443/ws')))).toEqual({ lock: { on: true, hub: 'wss://h.example:8443/ws' } });
+    expect(readLockMarker(exe('nothing'))).toMatchObject({ error: expect.stringMatching(/older sources/) });
+    expect(readLockMarker(exe(LOCK, lockMarker('off', HUB)))).toMatchObject({ error: expect.stringMatching(/2 different/) });
+    expect(readLockMarker(exe(lockMarker('maybe', HUB)))).toMatchObject({ error: expect.stringMatching(/unreadable/) });
+  });
+
   it('fails a locked app whose native commands are not locked to the hub (built from older sources)', () => {
-    const old = { ...goodFacts(), binaries: exe(connectSrc(ORIGIN), 'acme.zoom.us', GOOD_RECORD) };
+    const old = { ...goodFacts(), binaries: exe(POLICY(), 'acme.zoom.us', HUB, GOOD_RECORD) };
     const rows = checkApp(old);
     expect(verdicts(rows)['Server lock']).toBe('fail');
     expect(rows.find((r) => r.check === 'Server lock')?.detail).toMatch(/older sources/);
+  });
+
+  it('checks the native lock even when the hub has no path, so its address is in the CSP too', () => {
+    // The CSP names the hub origin, which is the whole address here: finding the
+    // address in the binary would prove nothing. Only the lock marker counts.
+    const hub = 'wss://breaks.acme.internal';
+    const rec = record(`server=${hub} lock=on token=none meeting-host=acme.zoom.us`);
+    const old = { ...goodFacts(), binaries: exe(POLICY(), 'acme.zoom.us', rec) };
+    expect(verdicts(checkApp(old))['Server lock']).toBe('fail');
+    const unlockedNative = { ...goodFacts(), binaries: exe(POLICY(), 'acme.zoom.us', lockMarker('off', hub), rec) };
+    expect(checkApp(unlockedNative).find((r) => r.check === 'Server lock')).toMatchObject({ verdict: 'fail', detail: expect.stringMatching(/unlocked/) });
+    const good = { ...goodFacts(), binaries: exe(POLICY(), 'acme.zoom.us', lockMarker('on', hub), rec) };
+    expect(checkApp(good).find((r) => r.check === 'Server lock')).toMatchObject({ verdict: 'pass', detail: expect.stringContaining('wss://breaks.acme.internal/ only') });
+  });
+
+  it('fails an app whose native lock is for another hub than the one it was built for', () => {
+    for (const other of ['wss://other.example/ws', 'wss://breaks.acme.internal/other', '', 'ws://breaks.acme.internal/ws']) {
+      const facts = { ...goodFacts(), binaries: exe(POLICY(), 'acme.zoom.us', lockMarker('on', other), GOOD_RECORD) };
+      expect(verdicts(checkApp(facts))['Server lock'], other).toBe('fail');
+    }
+    // The same hub written differently is the same hub.
+    const same = { ...goodFacts(), binaries: exe(POLICY(), 'acme.zoom.us', lockMarker('on', 'WSS://Breaks.acme.internal:443/ws'), GOOD_RECORD) };
+    expect(verdicts(checkApp(same))['Server lock']).toBe('pass');
   });
 
   it('fails an app whose meeting host is only named in the build record', () => {
@@ -301,7 +407,7 @@ describe('checkApp', () => {
     expect(inCodeOutsideRecord(Buffer.from(`${GOOD_RECORD}panelacme.zoom.userror`), 'acme.zoom.us')).toBe(true);
     expect(inCodeOutsideRecord(Buffer.from(`x${GOOD_RECORD}y`), 'acme.zoom.us')).toBe(false);
     expect(inCodeOutsideRecord(Buffer.from(`${GOOD_RECORD}${GOOD_RECORD}`), 'acme.zoom.us')).toBe(false);
-    const recordOnly = { ...goodFacts(), binaries: exe(connectSrc(ORIGIN), "object-src'none'", GOOD_RECORD) };
+    const recordOnly = { ...goodFacts(), binaries: exe(POLICY(), "object-src'none'", LOCK, GOOD_RECORD) };
     const rows = checkApp(recordOnly);
     expect(verdicts(rows)['Meeting host pinned']).toBe('fail');
     expect(rows.find((r) => r.check === 'Meeting host pinned')?.detail).toMatch(/only in the build record/);
@@ -313,19 +419,26 @@ describe('checkApp', () => {
   });
 
   it('fails a wide or missing CSP, and a missing build record', () => {
-    const wide = { ...goodFacts(), binaries: exe(connectSrc(ORIGIN), DEFAULT_CSP, 'acme.zoom.us', GOOD_RECORD) };
+    const wide = { ...goodFacts(), binaries: exe(POLICY(), DEFAULT_CSP, 'acme.zoom.us', LOCK, GOOD_RECORD) };
     expect(verdicts(checkApp(wide))['CSP connect-src']).toBe('fail');
-    const unpinned = { ...goodFacts(), binaries: exe(DEFAULT_CSP, 'acme.zoom.us', GOOD_RECORD) };
+    const unpinned = { ...goodFacts(), binaries: exe('connect-src', DEFAULT_CSP, 'acme.zoom.us', LOCK, GOOD_RECORD) };
     expect(verdicts(checkApp(unpinned))['CSP connect-src']).toBe('fail');
-    const old = { ...goodFacts(), binaries: exe(connectSrc(ORIGIN), 'acme.zoom.us') };
+    // The reviewers' wider lists that start like the pinned one.
+    for (const extra of [' wss:', ' https://x wss://*', '.attacker.example']) {
+      const wider = { ...goodFacts(), binaries: exe(`connect-src ${connectSrc(ORIGIN)}${extra}; default-src 'self'`, 'acme.zoom.us', LOCK, GOOD_RECORD) };
+      const row = checkApp(wider).find((r) => r.check === 'CSP connect-src')!;
+      expect(row.verdict, extra).toBe('fail');
+      expect(row.detail).not.toMatch(/^only/);
+    }
+    const old = { ...goodFacts(), binaries: exe(POLICY(), 'acme.zoom.us') };
     expect(verdicts(checkApp(old))).toMatchObject({ 'Build record': 'fail', 'CSP connect-src': 'fail' });
     // Built without a hub: the CSP is still checked against the expected one, and says what's wrong.
-    const plain = { ...goodFacts(), binaries: exe(DEFAULT_CSP, record('server= lock=off token=none meeting-host=')) };
+    const plain = { ...goodFacts(), binaries: exe('connect-src', DEFAULT_CSP, record('server= lock=off token=none meeting-host=')) };
     const row = checkApp(plain, { serverUrl: HUB }).find((r) => r.check === 'CSP connect-src')!;
     expect(row.verdict).toBe('fail');
     expect(row.detail).toMatch(/still allows ws:\/\/localhost:\*/);
     // And it passes a pinned CSP against the expected hub even when the record's hub is missing.
-    const noHub = { ...goodFacts(), binaries: exe(connectSrc(ORIGIN), record('server= lock=on token=none meeting-host=acme.zoom.us')) };
+    const noHub = { ...goodFacts(), binaries: exe(POLICY(), LOCK, record('server= lock=on token=none meeting-host=acme.zoom.us')) };
     expect(verdicts(checkApp(noHub, { serverUrl: HUB }))).toMatchObject({ 'Hub address': 'fail', 'CSP connect-src': 'pass' });
   });
 

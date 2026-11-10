@@ -4,8 +4,10 @@
 //   embedded by `lib.rs`), so `npm run desktop:build:enterprise -- --check
 //   <app>` can verify a built app without rebuilding it. The token itself is
 //   never recorded, only whether one was set;
-// - hands the server lock to the native side (`lock.rs`), so a locked build's
-//   commands answer for the built-in hub only;
+// - hands the server lock to the native side (`lock.rs`) as a marker string
+//   (`sb-lock:v1:<on|off>:<hub> :end`) that stays in the binary, so a locked
+//   build's commands answer for the built-in hub only, and `--check` reads
+//   the very lock they obey;
 // - declares the app's own commands, so each one needs a permission in
 //   `capabilities/` (see `overlay.json` and `panel.json`): a window can call
 //   only the commands its capability file lists.
@@ -24,6 +26,18 @@ const COMMANDS: &[&str] = &[
     "identity_init",
     "client_id_pin",
     "client_id",
+    "window_show",
+    "window_hide",
+    "window_set_size",
+    "window_set_position",
+    "window_start_dragging",
+    "window_set_ignore_cursor_events",
+    "window_outer_position",
+    "window_outer_size",
+    "window_scale_factor",
+    "window_current_monitor",
+    "window_available_monitors",
+    "window_cursor_position",
 ];
 
 /// Values are space-separated in the record; a checked hub address or host has
@@ -49,11 +63,15 @@ fn main() {
         field(&env("SMOKE_BREAK_MEETING_HOST")),
     );
     println!("cargo:rustc-env=SMOKE_BREAK_BUILD_INFO={info}");
-    // For `lock.rs`: the same lock and hub the frontend is built with.
-    println!("cargo:rustc-env=SMOKE_BREAK_LOCK={}", if locked { "on" } else { "off" });
-    // `hubKey` (src/serverUrl.ts) trims it too; an address with whitespace
+    // For `lock.rs`: the same lock and hub the frontend is built with, as the
+    // marker it reads at run time and `--check` reads in the built app.
+    // `hubKey` (src/serverUrl.ts) trims the address too; one with whitespace
     // inside can't be a hub, and its escaped form matches none.
-    println!("cargo:rustc-env=SMOKE_BREAK_SERVER={}", field(env("VITE_SERVER_URL").trim()));
+    println!(
+        "cargo:rustc-env=SMOKE_BREAK_LOCK_MARKER=sb-lock:v1:{}:{} :end",
+        if locked { "on" } else { "off" },
+        field(env("VITE_SERVER_URL").trim()),
+    );
     tauri_build::try_build(
         tauri_build::Attributes::new().app_manifest(tauri_build::AppManifest::new().commands(COMMANDS)),
     )

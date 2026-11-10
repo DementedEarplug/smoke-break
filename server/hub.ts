@@ -32,6 +32,7 @@ import {
 } from './addresses.ts';
 import { type AuditClass, type AuditLimits, createAuditLog } from './audit.ts';
 import * as machine from './breakMachine.ts';
+import { envBool } from './env.ts';
 import { TokenBucket, WindowLimiter } from './limits.ts';
 import { fixedLinkProvider, getProvider } from './meeting.ts';
 import { cleanName, nameKey, uniqueName } from './names.ts';
@@ -287,7 +288,7 @@ export interface HubOptions {
   log?: (line: string) => void;
   /**
    * Strict mode: refuse to start without the recommended protections, and keep
-   * owner approval on for every team. Default: SMOKE_BREAK_ENTERPRISE=1.
+   * owner approval on for every team. Default: SMOKE_BREAK_ENTERPRISE (an on/off setting, see env.ts).
    */
   enterprise?: boolean;
   /** The TCP address the hub listens on (not with a Unix socket), checked in strict mode. */
@@ -301,21 +302,41 @@ export interface Deployment {
   publicHosts: readonly string[];
   proxySecret: boolean;
   unixSocket: boolean;
-  /** SMOKE_BREAK_TRUST_PROXY is set: X-Forwarded-For is believed from some peers. */
+  /**
+   * X-Forwarded-For is believed from some peers: SMOKE_BREAK_TRUST_PROXY is
+   * set, or strict mode trusts loopback by default (see `defaultsToLoopbackProxy`).
+   */
   trustsProxy: boolean;
   listenHost?: string;
 }
 
-const isLoopbackHost = (host: string) => {
+export const isLoopbackHost = (host: string) => {
   const h = host.replace(/^\[|\]$/g, '').toLowerCase();
   return h === 'localhost' || h === '::1' || (isIP(h) === 4 && h.startsWith('127.')) || h.startsWith('::ffff:127.');
 };
 
 /**
+ * Strict mode on a loopback TCP address with a proxy secret and no
+ * SMOKE_BREAK_TRUST_PROXY: the proxy is on this machine, so its
+ * X-Forwarded-For is believed from loopback (otherwise every audit line and
+ * per-address limit would name the proxy instead of the client).
+ */
+export function defaultsToLoopbackProxy(d: Omit<Deployment, 'tokenMode' | 'publicHosts'>): boolean {
+  return d.enterprise && d.listenHost !== undefined && !d.unixSocket && d.proxySecret && !d.trustsProxy && isLoopbackHost(d.listenHost);
+}
+
+/**
  * The recommended protections a deployment lacks. In strict mode they're
  * `missing` (the hub won't start); otherwise each is one startup `warning`.
+ * A non-loopback `HOST` is a warning in both: the hop from the proxy is plain ws://.
  */
 export function checkDeployment(d: Deployment): { missing: string[]; warnings: string[] } {
+  const remoteHost = d.listenHost !== undefined && !d.unixSocket && !isLoopbackHost(d.listenHost);
+  const plainHop = remoteHost
+    ? [
+        `HOST=${d.listenHost} is not a loopback address: connections reach the hub as plain ws:// (unencrypted), so anyone on the network between the proxy and the hub can read every access token, the proxy secret, invite codes and meeting links. Keep the proxy on this machine (HOST=127.0.0.1 or SMOKE_BREAK_SOCKET), or encrypt that hop (a private link, WireGuard, or TLS terminated on this host).`,
+      ]
+    : [];
   if (d.enterprise) {
     const missing: string[] = [];
     if (d.tokenMode !== 'file') {
@@ -327,12 +348,16 @@ export function checkDeployment(d: Deployment): { missing: string[]; warnings: s
     }
     if (!d.publicHosts.length) missing.push("the hub's name: set SMOKE_BREAK_PUBLIC_HOST");
     if (!d.proxySecret && !d.unixSocket) missing.push('a way to keep out connections around the proxy: set SMOKE_BREAK_PROXY_SECRET or SMOKE_BREAK_SOCKET');
-    if (d.listenHost !== undefined && !d.unixSocket && !isLoopbackHost(d.listenHost) && !d.proxySecret) {
+    if (remoteHost && !d.proxySecret) {
       missing.push(`HOST=${d.listenHost} is not a loopback address: set SMOKE_BREAK_PROXY_SECRET, or listen on 127.0.0.1 or SMOKE_BREAK_SOCKET`);
     }
-    return { missing, warnings: [] };
+    // Without it every audit line names the proxy, not where a token was used from.
+    if (remoteHost && !d.trustsProxy) {
+      missing.push(`the proxy's address: set SMOKE_BREAK_TRUST_PROXY to it (HOST=${d.listenHost} is not a loopback address, so it isn't assumed)`);
+    }
+    return { missing, warnings: plainHop };
   }
-  const warnings: string[] = [];
+  const warnings: string[] = [...plainHop];
   if (!d.publicHosts.length) {
     warnings.push('SMOKE_BREAK_PUBLIC_HOST is not set: connections for any Host name are accepted (no protection against DNS rebinding). Set it to the hub\'s name.');
   }
@@ -510,7 +535,8 @@ export function createHub(opts: HubOptions) {
   const log = opts.log ?? ((line: string) => console.log(line));
   // Anything misconfigured throws here, before any timer starts or socket is accepted.
   checkDataDir(dirname(opts.dataFile));
-  const trusted: TrustedProxies = parseTrustedProxies(opts.trustProxy ?? process.env.SMOKE_BREAK_TRUST_PROXY);
+  const enterprise = opts.enterprise ?? envBool('SMOKE_BREAK_ENTERPRISE');
+  let trusted: TrustedProxies = parseTrustedProxies(opts.trustProxy ?? process.env.SMOKE_BREAK_TRUST_PROXY);
   const proxySecret = opts.proxySecret ?? process.env.SMOKE_BREAK_PROXY_SECRET?.trim() ?? '';
   if (proxySecret && !PROXY_SECRET.test(proxySecret)) {
     throw new Error('SMOKE_BREAK_PROXY_SECRET must be 16-512 printable characters without spaces (e.g. openssl rand -hex 32).');
@@ -530,20 +556,15 @@ export function createHub(opts: HubOptions) {
     allowedOrigins: opts.allowedOrigins ?? envList(process.env.SMOKE_BREAK_ALLOWED_ORIGINS),
     allowLocalhostPages: opts.allowLocalhostPages ?? false,
   };
-  const enterprise = opts.enterprise ?? process.env.SMOKE_BREAK_ENTERPRISE?.trim() === '1';
-  const deployment = checkDeployment({
-    enterprise,
-    tokenMode: tokens.mode,
-    publicHosts: policy.publicHosts ?? [],
-    proxySecret: !!proxyDigest,
-    unixSocket: opts.unixSocket ?? false,
-    trustsProxy: trusted !== null,
-    listenHost: opts.listenHost,
-  });
+  const setup = { enterprise, proxySecret: !!proxyDigest, unixSocket: opts.unixSocket ?? false, trustsProxy: trusted !== null, listenHost: opts.listenHost };
+  /** Strict mode's default: a proxy secret on loopback means the proxy is on this machine. */
+  const loopbackProxyDefault = defaultsToLoopbackProxy(setup);
+  if (loopbackProxyDefault) trusted = parseTrustedProxies(true);
+  const deployment = checkDeployment({ ...setup, trustsProxy: trusted !== null, tokenMode: tokens.mode, publicHosts: policy.publicHosts ?? [] });
   if (deployment.missing.length) {
     tokens.close();
     auditLog.close();
-    throw new Error(`SMOKE_BREAK_ENTERPRISE=1, but this hub is missing:\n${deployment.missing.map((m) => `  - ${m}`).join('\n')}`);
+    throw new Error(`Strict mode (SMOKE_BREAK_ENTERPRISE) is on, but this hub is missing:\n${deployment.missing.map((m) => `  - ${m}`).join('\n')}`);
   }
 
   const teams = new Set<Team>();
@@ -782,13 +803,16 @@ export function createHub(opts: HubOptions) {
       if (backup('pre-roster')) save();
       else persist = false;
     }
+    // Strict mode: roster entries from before per-person tokens, each to be bound (the owner's) or re-approved on first use.
+    let unlabeled = 0;
+    if (enterprise) for (const team of teams) for (const m of team.roster.values()) if (!m.label) unlabeled++;
     if (approvalOn) {
-      console.warn(`[smoke-break] SMOKE_BREAK_ENTERPRISE=1: switched owner approval back on for ${approvalOn} team(s).`);
+      console.warn(`[smoke-break] Strict mode: switched owner approval back on for ${approvalOn} team(s).`);
       save(); // (not if a copy the save would need couldn't be kept: see above)
     }
     audit(
       'load',
-      { teams: teams.size, invalid, invalidRefs: invalid ? invalidRefs.slice(0, 50) : undefined, expired, droppedLinks, migrated, upgradedCodes: upgraded, enterprise, approvalSwitchedOn: approvalOn || undefined },
+      { teams: teams.size, invalid, invalidRefs: invalid ? invalidRefs.slice(0, 50) : undefined, expired, droppedLinks, migrated, upgradedCodes: upgraded, enterprise, approvalSwitchedOn: approvalOn || undefined, unlabeledMembers: enterprise ? unlabeled : undefined },
       CRITICAL,
     );
   }
@@ -1251,8 +1275,10 @@ export function createHub(opts: HubOptions) {
       save();
     }
     if (conn.label && !entry.label) {
+      // An entry from before per-person tokens takes the label of the first token it's used with.
       entry.label = conn.label;
       save();
+      audit('unlabeled-member', { ...who(conn), team: team.ref, member: id, outcome: 'bound', owner: id === team.ownerId || undefined }, CRITICAL);
     }
     touch(team);
     sendState(team, ws, id);
@@ -1449,18 +1475,43 @@ export function createHub(opts: HubOptions) {
     // from before the upgrade get back in instead of being told their team is gone.
     const legacyRequest =
       !!team && team.requireApproval && code.length < CODE_LENGTH && team.aliases.length === 1 && team.aliases[0] === code;
-    if (!team || (!current && !onRoster && !legacyRequest)) {
+    // Someone already waiting keeps waiting with an old code (say, a device from before per-person
+    // tokens that was moved from the roster to the waiting list): only the owner's OK lets them in.
+    const waiting = !!team && !current && !onRoster && team.pending.has(id);
+    if (!team || (!current && !onRoster && !legacyRequest && !waiting)) {
       badCodes.take(conn.limitKey);
       return refuse(conn, ws, 'No team with that invite code.', 'bad-code', 'bad-code', limits.badCodeDelayMs);
     }
     const now = Date.now();
     const banned = activeBan(team.banned, id, now);
     if (banned) return refuseBanned(conn, ws, banned.reason);
-    // A label that was removed (or, for a while, turned away) can't come back as a "new device".
-    const labelBan = conn.label && !onRoster ? activeBan(team.labelBans, conn.label, now) : null;
-    if (labelBan) return refuseBanned(conn, ws, labelBan.reason);
+    // A roster entry without a label is from before per-person tokens: it gets the label of
+    // the first token it's used with, so until then it's checked like someone new.
+    const unlabeled = !!entry && !entry.label && !!conn.label;
+    // A label that was removed (or, for a while, turned away) can't come back as a "new device",
+    // nor through a device of theirs that hasn't connected since the hub switched to per-person tokens.
+    const labelBan = conn.label && (!onRoster || unlabeled) ? activeBan(team.labelBans, conn.label, now) : null;
+    if (labelBan) {
+      // That device is theirs: it goes the way their labelled ones went (never the owner's entry, so the team keeps its owner).
+      if (unlabeled && id !== team.ownerId) {
+        team.roster.delete(id);
+        ban(team, id, conn.label, labelBan.reason, labelBan.until);
+        save();
+        broadcast(team);
+        audit('unlabeled-member', { ...who(conn), team: team.ref, member: id, outcome: 'dropped', reason: labelBan.reason }, CRITICAL);
+      }
+      return refuseBanned(conn, ws, labelBan.reason);
+    }
+    if (waiting) {
+      if (team.ownerId === null) return refuseOwnerless(conn, ws, team);
+      return refuse(conn, ws, "The team's owner needs to let you in. Ask them, then try again.", 'pending', 'pending');
+    }
     if (onRoster) {
       if (team.ownerId === null) return refuseOwnerless(conn, ws, team);
+      // Where the owner decides who joins, that first token isn't taken on trust (it may be a revoked
+      // person's device with a colleague's token): the owner approves it with its label in view. The
+      // owner's own entry binds on first use, so that someone can approve the rest.
+      if (unlabeled && id !== team.ownerId && (enterprise || team.requireApproval)) return rejoinRequest(conn, ws, team, id, entry.name || name);
       join(conn, ws, team, id, name);
       return audit('join', { ...who(conn), team: team.ref, member: id, name: team.roster.get(id)!.name }, { key: `join|${team.ref}|${id}` });
     }
@@ -1486,6 +1537,25 @@ export function createHub(opts: HubOptions) {
     addToRoster(team, id, name, conn.label);
     join(conn, ws, team, id, name);
     audit('join', { ...who(conn), team: team.ref, member: id, name: team.roster.get(id)!.name, first: true });
+  }
+
+  /**
+   * Moves a roster entry from before per-person tokens to the waiting list,
+   * under the label of the token it was just used with, for the owner to
+   * approve (or turn away) like anyone new.
+   */
+  function rejoinRequest(conn: Conn, ws: WebSocket, team: Team, id: string, name: string) {
+    if (identitiesOf(team, conn.label!, id) >= limits.identitiesPerLabel) {
+      limitHit('identities-per-label', conn, `${team.ref}|${conn.label}`);
+      return refuse(conn, ws, 'Too many devices on this team for your access token. Ask the owner to remove an old one.', 'full', 'identities-per-label');
+    }
+    // The entry stays on the roster if the request is refused for being over a limit.
+    if (!recordRequest(conn, ws, team, id, name)) return;
+    team.roster.delete(id);
+    save();
+    broadcast(team);
+    audit('unlabeled-member', { ...who(conn), team: team.ref, member: id, outcome: 'waiting' }, CRITICAL);
+    return refuse(conn, ws, "The team's owner needs to let you in. Ask them, then try again.", 'pending', 'pending');
   }
 
   function refuseBanned(conn: Conn, ws: WebSocket, reason: BanReason) {
@@ -1527,7 +1597,8 @@ export function createHub(opts: HubOptions) {
       return false;
     }
     // Waiting names can't pass for someone on the roster (or another waiting person) either.
-    const taken = rosterNames(team);
+    // (Not their own roster name: someone moved from the roster to the waiting list keeps it.)
+    const taken = rosterNames(team, id);
     for (const p of team.pending.values()) taken.add(nameKey(p.name));
     const entry = { id, name: uniqueName(taken, name), label: conn.label, at: now, addr: conn.limitKey };
     team.pending.set(id, entry);
@@ -1976,8 +2047,10 @@ export function createHub(opts: HubOptions) {
       tokenMode: tokens.mode,
       tokensBroken: tokens.broken !== null,
       proxySecret: !!proxyDigest,
+      /** Strict mode believes X-Forwarded-For from loopback, SMOKE_BREAK_TRUST_PROXY being unset (see `defaultsToLoopbackProxy`). */
+      loopbackProxyDefault,
       enterprise,
-      /** Recommended protections this hub runs without (never in strict mode): one startup warning each. */
+      /** One startup warning each: recommended protections this hub runs without (never in strict mode, which refuses to start instead), and a non-loopback HOST. */
       warnings: deployment.warnings,
     }),
     /** Stops timers, closes every socket and writes any pending save. */

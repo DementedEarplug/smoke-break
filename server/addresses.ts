@@ -2,6 +2,7 @@
 
 import type { IncomingMessage } from 'node:http';
 import { BlockList, isIP } from 'node:net';
+import { OFF_WORDS, ON_WORDS } from './env.ts';
 
 /** IPv4-mapped IPv6 addresses (::ffff:1.2.3.4) count as the IPv4 address. */
 function plainIp(ip: string): string {
@@ -11,13 +12,11 @@ function plainIp(ip: string): string {
 /** The proxies whose X-Forwarded-For is believed; null means none. */
 export type TrustedProxies = BlockList | null;
 
-const LOOPBACK_WORDS = /^(1|true|yes|on)$/i;
-const OFF_WORDS = /^(|0|false|no|off)$/i;
-
 /**
  * Parses SMOKE_BREAK_TRUST_PROXY: comma-separated IPs and CIDR ranges of the
- * reverse proxies in front of the hub. `1`/`true` means loopback only (a proxy
- * on the same machine). Anything that isn't an address or range is an error,
+ * reverse proxies in front of the hub. An on word (`1`, `true`, `yes`, `on`)
+ * means loopback only (a proxy on the same machine); an off word (or nothing)
+ * means none, as for every on/off setting (see env.ts). Anything that isn't an address or range is an error,
  * so a typo can't silently trust (or distrust) the wrong peers.
  */
 export function parseTrustedProxies(v: string | boolean | readonly string[] | undefined): TrustedProxies {
@@ -26,7 +25,7 @@ export function parseTrustedProxies(v: string | boolean | readonly string[] | un
   if (v === true) return loopback(list);
   const entries = typeof v === 'string' ? v.split(',').map((s) => s.trim()) : v.map((s) => s.trim());
   if (entries.length === 1 && OFF_WORDS.test(entries[0])) return null;
-  if (entries.length === 1 && LOOPBACK_WORDS.test(entries[0])) return loopback(list);
+  if (entries.length === 1 && ON_WORDS.test(entries[0])) return loopback(list);
   for (const entry of entries.filter(Boolean)) {
     const [addr, prefix, extra] = entry.split('/');
     const ip = plainIp(addr ?? '');

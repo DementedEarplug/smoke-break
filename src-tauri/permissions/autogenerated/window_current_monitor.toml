@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-window-current-monitor"
+description = "Enables the window_current_monitor command without any pre-configured scope."
+commands.allow = ["window_current_monitor"]
+
+[[permission]]
+identifier = "deny-window-current-monitor"
+description = "Denies the window_current_monitor command without any pre-configured scope."
+commands.deny = ["window_current_monitor"]

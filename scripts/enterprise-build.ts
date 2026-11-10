@@ -8,9 +8,10 @@
 //
 // It refuses to build unless the hub address and the meeting host are set,
 // locks the app to that hub (VITE_LOCK_SERVER=1), pins the webviews' CSP
-// `connect-src` to exactly that hub (release and dev CSP alike), runs
-// `tauri build` with that config, and then checks the CSP compiled into the
-// app before printing what was pinned. Arguments after `--` go to `tauri build`.
+// `connect-src` to exactly that hub (release and dev CSP alike, each written
+// as one policy string), runs `tauri build` with that config, and then checks
+// the built app before printing what was pinned. Arguments after `--` go to
+// `tauri build`.
 //
 // A shared access token (VITE_HUB_TOKEN) is refused: it is in every copy of
 // the app and can't be revoked for one person. People enter their own token
@@ -23,9 +24,9 @@
 //   npm run desktop:build:enterprise -- --check "src-tauri/target/…/Smoke Break.app"
 //
 // It reads the build record the app carries (`src-tauri/build.rs`: hub, server
-// lock, whether a shared token was set, meeting host), the CSP compiled into
-// the executable, and asks `codesign`, `spctl` and `stapler` about the
-// signature. VITE_SERVER_URL / SMOKE_BREAK_MEETING_HOST, if set, must match
+// lock, whether a shared token was set, meeting host), the hub lock the native
+// code obeys (`src-tauri/src/lock.rs`), the CSP compiled into the executable,
+// and asks `codesign`, `spctl` and `stapler` about the signature. VITE_SERVER_URL / SMOKE_BREAK_MEETING_HOST, if set, must match
 // what the app was built with. `--allow-unsigned` turns a missing signature
 // into a warning (for a test build only).
 
@@ -131,15 +132,55 @@ export function isMeetingHost(host: string): boolean {
 }
 
 export const connectSrc = (hubOrigin: string) => `${CSP_BASE} ${hubOrigin}`;
+/** Everything the pinned `connect-src` allows, and nothing else: the app itself and the hub. */
+export const pinnedSources = (hubOrigin: string) => [...CSP_BASE.split(' '), hubOrigin];
+
+/** A CSP as tauri.conf.json gives it: one policy string, or directive → sources. */
+export type CspConfig = string | Record<string, string | string[]>;
+
+/** Directive → sources, from either form (Tauri's rule: `;` between directives, spaces between sources). */
+export function cspDirectives(csp: CspConfig): Map<string, string[]> {
+  const map = new Map<string, string[]>();
+  const add = (name: string, sources: string[]) => {
+    const key = name.trim().toLowerCase();
+    if (key && !map.has(key)) map.set(key, sources.filter(Boolean));
+  };
+  if (typeof csp === 'string') {
+    for (const d of csp.split(';')) {
+      const [name = '', ...sources] = d.trim().split(/\s+/);
+      add(name, sources);
+    }
+  } else {
+    for (const [name, v] of Object.entries(csp)) add(name, Array.isArray(v) ? v : v.split(/\s+/));
+  }
+  return map;
+}
+
+/**
+ * `base` (a CSP from tauri.conf.json) with `connect-src` replaced by exactly
+ * the app and the hub, as one policy string with `connect-src` first. Tauri
+ * compiles a policy string into the executable as one piece, so `--check`
+ * can find every `connect-src` there and see where its sources end (at the
+ * `;` after them). A directive map would be compiled as separate strings,
+ * packed against unrelated ones, where nobody can tell where a list ends.
+ */
+export function pinnedPolicy(base: CspConfig | null | undefined, hubOrigin: string): string {
+  const rest = [...cspDirectives(base ?? {})].filter(([name]) => name !== 'connect-src');
+  if (!rest.length) throw new Error('tauri.conf.json has no CSP besides connect-src to pin it in');
+  return [['connect-src', pinnedSources(hubOrigin)] as const, ...rest].map(([name, sources]) => [name, ...sources].join(' ')).join('; ');
+}
 
 /**
  * The config Tauri merges into tauri.conf.json (JSON Merge Patch: only these
- * keys change). `devCsp` is only used by `tauri dev`, but pinning it too keeps
- * the wide list out of the binary altogether.
+ * keys change; each CSP is replaced as a whole by its pinned policy string).
+ * `security` is tauri.conf.json's `app.security`. `devCsp` is only used by
+ * `tauri dev`, but pinning it too keeps the wide list out of the binary
+ * altogether.
  */
-export function makeOverride(plan: Plan): object {
-  const pinned = { 'connect-src': connectSrc(plan.hubOrigin) };
-  const out: Record<string, unknown> = { app: { security: { csp: pinned, devCsp: pinned } } };
+export function makeOverride(plan: Plan, security: { csp?: CspConfig | null; devCsp?: CspConfig | null }): object {
+  const csp = pinnedPolicy(security.csp, plan.hubOrigin);
+  const devCsp = pinnedPolicy(security.devCsp ?? security.csp, plan.hubOrigin);
+  const out: Record<string, unknown> = { app: { security: { csp, devCsp } } };
   if (plan.signingIdentity) out.bundle = { macOS: { signingIdentity: plan.signingIdentity } };
   return out;
 }
@@ -165,26 +206,82 @@ export function targetOf(args: string[]): string | null {
   return null;
 }
 
+/** The longest `connect-src` source list read; the pinned one is far shorter. */
+const MAX_SOURCE_LIST = 4096;
+
+/** A `connect-src` directive found in an executable. */
+export interface FoundConnectSrc {
+  /** Where its name starts and its `;` is (the text's end if none was found). */
+  at: number;
+  end: number;
+  /** Its sources, or null when where they end can't be told (no `;` after them). */
+  sources: string[] | null;
+  /** The start of it, to show. */
+  text: string;
+}
+
+const printable = (c: number) => (c >= 0x20 && c < 0x7f) || c === 0x09;
+
 /**
- * Problems with the CSP compiled into the app's executables: the pinned
- * `connect-src` must be there, and nothing of the default wide one.
+ * Every `connect-src` directive in an executable (`text` is it read as
+ * latin1), in any case, with its sources: the printable text after the name
+ * up to the `;` that ends the directive. A list with no `;` after it (a
+ * directive map compiled into separate strings, or `connect-src` last in a
+ * policy) runs straight into whatever string the linker put next, so it is
+ * never guessed at: its sources are null.
+ */
+export function connectSrcDirectives(text: string): FoundConnectSrc[] {
+  const found: FoundConnectSrc[] = [];
+  for (const m of text.matchAll(/connect-src/gi)) {
+    const at = m.index;
+    const from = at + m[0].length;
+    let end = from;
+    while (end < text.length && end - from <= MAX_SOURCE_LIST && printable(text.charCodeAt(end)) && text[end] !== ';') end++;
+    const complete = text[end] === ';' && (text[from] === ' ' || text[from] === '\t');
+    found.push({
+      at,
+      end,
+      sources: complete ? text.slice(from, end).trim().split(/[ \t]+/).filter(Boolean) : null,
+      text: text.slice(at, Math.min(end + 1, at + 160)).replace(/[^\x20-\x7e]/g, '.'),
+    });
+  }
+  return found;
+}
+
+/**
+ * Problems with the CSP compiled into the app's executables. Every
+ * `connect-src` in them must be a complete directive (ended by `;`) whose
+ * sources are exactly `'self' ipc: http://ipc.localhost <hub origin>`, in any
+ * order, the hub compared as a whole; at least one must be there; and nothing
+ * that looks like a connect-src source list may sit anywhere else.
  */
 export function checkEmbeddedCsp(binaries: { name: string; data: Buffer }[], hubOrigin: string): string[] {
   if (!binaries.length) return ['no executable found in the app bundle'];
   const problems: string[] = [];
-  const pinned = connectSrc(hubOrigin);
+  const want = pinnedSources(hubOrigin);
   for (const { name, data } of binaries) {
-    if (!data.includes(pinned)) problems.push(`${name}: the pinned connect-src (${pinned}) isn't in it`);
+    const text = data.toString('latin1');
+    const found = connectSrcDirectives(text);
+    if (!found.length) problems.push(`${name}: no connect-src in it (the pinned one is ${connectSrc(hubOrigin)})`);
+    for (const d of found) {
+      if (!d.sources) {
+        problems.push(`${name}: a connect-src that isn't a complete directive of a policy string, so what it allows can't be read: ${JSON.stringify(d.text)}`);
+        continue;
+      }
+      const extra = d.sources.filter((s) => !want.includes(s));
+      const missing = want.filter((s) => !d.sources!.includes(s));
+      if (extra.length) problems.push(`${name}: a connect-src also allows ${extra.join(' ')}`);
+      if (missing.length) problems.push(`${name}: a connect-src lacks ${missing.join(' ')}`);
+    }
+    // A connect-src value compiled on its own (from a directive map) has no
+    // name in front of it; the app's own sources start every one it has had.
+    for (let at = text.indexOf(CSP_BASE); at >= 0; at = text.indexOf(CSP_BASE, at + 1)) {
+      if (!found.some((d) => d.sources && at > d.at && at < d.end)) {
+        problems.push(`${name}: connect-src sources outside any complete directive: ${JSON.stringify(text.slice(at, at + 120).replace(/[^\x20-\x7e]/g, '.'))}`);
+      }
+    }
     for (const wide of WIDE_SOURCES) {
       if (data.includes(wide)) problems.push(`${name}: still allows ${wide}`);
-    }
-    // Every connect-src the app carries starts the same way; each must go on to
-    // the hub, not to a bare `wss:` (any host).
-    let at = data.indexOf(`${CSP_BASE} `);
-    while (at >= 0) {
-      const rest = data.subarray(at + CSP_BASE.length + 1, at + CSP_BASE.length + 1 + hubOrigin.length).toString('latin1');
-      if (rest !== hubOrigin) problems.push(`${name}: a connect-src goes on with ${JSON.stringify(rest)} instead of the hub`);
-      at = data.indexOf(`${CSP_BASE} `, at + 1);
     }
   }
   return [...new Set(problems)];
@@ -241,6 +338,33 @@ function recordSpans(data: Buffer): [number, number][] {
     at = data.indexOf(RECORD_START, end);
   }
   return spans;
+}
+
+const LOCK_START = 'sb-lock:v1:';
+const LOCK_END = ' :end';
+
+/**
+ * The hub lock the native code obeys: `src-tauri/src/lock.rs` reads it at run
+ * time from the marker `sb-lock:v1:<on|off>:<hub> :end` that `build.rs`
+ * compiles in, so what this reads is what the commands do. Exactly one, the
+ * same in every executable (a universal binary has it once per slice).
+ */
+export function readLockMarker(binaries: { name: string; data: Buffer }[]): { lock: { on: boolean; hub: string } } | { error: string } {
+  const found = new Set<string>();
+  for (const { data } of binaries) {
+    for (let at = data.indexOf(LOCK_START); at >= 0; at = data.indexOf(LOCK_START, at + 1)) {
+      const end = data.indexOf(LOCK_END, at);
+      if (end < 0 || end - at > 2048) return { error: 'a hub lock marker without its end in the executable' };
+      found.add(data.subarray(at + LOCK_START.length, end).toString('latin1'));
+    }
+  }
+  if (found.size === 0) return { error: 'no hub lock in the native code: built from older sources? Rebuild it' };
+  if (found.size > 1) return { error: `${found.size} different hub locks in the app` };
+  const marker = [...found][0];
+  const colon = marker.indexOf(':');
+  const state = marker.slice(0, colon);
+  if (colon < 0 || (state !== 'on' && state !== 'off')) return { error: `the hub lock marker is unreadable: ${JSON.stringify(marker)}` };
+  return { lock: { on: state === 'on', hub: marker.slice(colon + 1) } };
 }
 
 /**
@@ -336,6 +460,7 @@ export function checkApp(facts: AppFacts, expected: Expected = {}): Row[] {
 
   // The hub: as built, and (if given) as expected.
   let hubOrigin: string | null = null;
+  let hubUrl: string | null = null;
   if (record) {
     const built = record.server ? checkHubUrl(record.server) : { error: 'none set (VITE_SERVER_URL was empty)' };
     if ('error' in built) {
@@ -344,14 +469,21 @@ export function checkApp(facts: AppFacts, expected: Expected = {}): Row[] {
       row('Hub address', 'fail', `built for ${built.url}, expected ${expected.serverUrl}`);
     } else {
       hubOrigin = built.origin;
+      hubUrl = built.url;
       row('Hub address', 'pass', built.url);
     }
-    // The native side keeps the hub address in its code (src-tauri/src/lock.rs);
-    // an app built from older sources has it in the record only.
+    // The lock the native commands obey is their own marker (src-tauri/src/lock.rs),
+    // not the record; an app built from older sources has none.
+    const native = readLockMarker(facts.binaries);
+    const nativeHub = 'lock' in native ? checkHubUrl(native.lock.hub) : null;
     if (record.lock !== 'on') row('Server lock', 'fail', 'off: built without VITE_LOCK_SERVER=1');
-    else if (!record.server || !facts.binaries.some((b) => inCodeOutsideRecord(b.data, record.server))) {
-      row('Server lock', 'fail', 'on in the build record, but the native commands aren’t locked to the hub: built from older sources? Rebuild it');
-    } else row('Server lock', 'pass', 'on: the Server field is hidden and the native commands answer for this hub only');
+    else if ('error' in native) row('Server lock', 'fail', `on in the build record, but ${native.error}`);
+    else if (!native.lock.on) row('Server lock', 'fail', 'on in the build record, but the native commands are unlocked');
+    else if (!nativeHub || 'error' in nativeHub) {
+      row('Server lock', 'fail', `the native commands are locked to ${JSON.stringify(native.lock.hub)}, which ${nativeHub?.error ?? 'isn’t a hub'}`);
+    } else if (nativeHub.url !== (hubUrl ?? expected.serverUrl)) {
+      row('Server lock', 'fail', `the native commands answer for ${nativeHub.url}, not ${hubUrl ?? expected.serverUrl ?? 'a usable hub'}`);
+    } else row('Server lock', 'pass', `on: the Server field is hidden and the native commands answer for ${nativeHub.url} only`);
     row(
       'Shared access token',
       record.token === 'none' ? 'pass' : 'fail',
@@ -498,7 +630,8 @@ function main() {
   const outDir = join(TAURI_DIR, 'target', 'enterprise-build');
   mkdirSync(outDir, { recursive: true });
   const overridePath = join(outDir, 'tauri.override.json');
-  writeFileSync(overridePath, `${JSON.stringify(makeOverride(plan), null, 2)}\n`);
+  const conf = JSON.parse(readFileSync(join(TAURI_DIR, 'tauri.conf.json'), 'utf8')) as { app: { security: Parameters<typeof makeOverride>[1] } };
+  writeFileSync(overridePath, `${JSON.stringify(makeOverride(plan, conf.app.security), null, 2)}\n`);
 
   if (!plan.signingIdentity && !plan.certificateFromEnv) {
     console.warn('\nNote: neither APPLE_SIGNING_IDENTITY nor APPLE_CERTIFICATE is set, so the app will be unsigned. Fine for a test, not for MDM.\n');

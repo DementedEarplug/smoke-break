@@ -3,7 +3,7 @@ import { WS_PROTOCOL, tokenFromProtocols } from '../shared/protocol.ts';
 
 vi.mock('./platform.ts', () => ({ serverProblem: () => null }));
 
-const { MAX_MESSAGE_CHARS, Net, PENDING_RETRY_MS, protocolsFor } = await import('./net.ts');
+const { BURST_CHARS, FLOOD_MESSAGE, MAX_MESSAGE_CHARS, Net, PENDING_RETRY_MS, STATE_EVERY_MS, protocolsFor } = await import('./net.ts');
 const { MAX_CLOCK_OFFSET_MS } = await import('./widget/limits.ts');
 
 class FakeSocket {
@@ -22,10 +22,13 @@ class FakeSocket {
     FakeSocket.opened.push({ url, protocols });
     FakeSocket.last = this;
   }
+  closed = false;
   send(data: string) {
     this.sent.push(data);
   }
-  close() {}
+  close() {
+    this.closed = true;
+  }
   /** The hub accepted the upgrade. */
   open() {
     this.readyState = FakeSocket.OPEN;
@@ -185,14 +188,16 @@ describe('Net', () => {
   });
 
   describe('against a hostile hub', () => {
+    /** A valid state; `pad` makes it bigger (a field the app ignores). */
     const state = (serverNow: number, pad = '') =>
       JSON.stringify({
         type: 'state',
         you: 'me',
         serverNow,
+        pad,
         team: {
           code: 'ABCDE23456',
-          name: pad,
+          name: 'T',
           defaultLengthMin: 12,
           zoomLink: '',
           meetingProvider: 'fixed-link',
@@ -204,23 +209,30 @@ describe('Net', () => {
 
     async function connected() {
       vi.stubGlobal('WebSocket', FakeSocket);
-      const got: unknown[] = [];
-      const net = new Net('wss://hub.example/ws', hello, (m) => got.push(m), () => {});
+      const got: { type: string; serverNow?: number; message?: string }[] = [];
+      const statuses: string[] = [];
+      const net = new Net('wss://hub.example/ws', hello, (m) => got.push(m), (s) => statuses.push(s));
       net.connect();
-      await flush();
-      FakeSocket.last.open();
-      return { net, got, deliver: (data: string) => FakeSocket.last.onmessage!({ data }) };
+      if (vi.isFakeTimers()) await vi.advanceTimersByTimeAsync(0);
+      else await flush();
+      const socket = FakeSocket.last;
+      socket.open();
+      return { net, got, statuses, socket, deliver: (data: string) => socket.onmessage!({ data }) };
     }
+    /** Lets a scheduled state be handled (no animation frames here). */
+    const handled = () => new Promise((r) => setTimeout(r, STATE_EVERY_MS + 10));
 
     it("can't move the clock more than a week", async () => {
       const { net, got, deliver } = await connected();
       deliver(state(1e300));
+      await handled();
       expect(got).toHaveLength(1);
       expect(net.now() - Date.now()).toBeLessThanOrEqual(MAX_CLOCK_OFFSET_MS + 1000);
       expect(Number.isFinite(net.now())).toBe(true);
       net.close();
       const again = await connected();
       again.deliver(state(0));
+      await handled();
       expect(Date.now() - again.net.now()).toBeLessThanOrEqual(MAX_CLOCK_OFFSET_MS + 1000);
       again.net.close();
     });
@@ -229,11 +241,113 @@ describe('Net', () => {
       const { net, got, deliver } = await connected();
       const parse = vi.spyOn(JSON, 'parse');
       deliver(state(Date.now(), 'x'.repeat(MAX_MESSAGE_CHARS)));
+      await handled();
       expect(parse).not.toHaveBeenCalled();
       expect(got).toEqual([]);
       // A real-sized one still goes through.
       deliver(state(Date.now()));
+      await handled();
       expect(got).toHaveLength(1);
+      net.close();
+    });
+
+    it('parses and handles only the newest of many states that come at once', async () => {
+      vi.useFakeTimers();
+      const { net, got, deliver } = await connected();
+      const parse = vi.spyOn(JSON, 'parse');
+      for (let i = 1; i <= 1000; i++) deliver(state(Date.now() + i));
+      expect(got).toEqual([]);
+      await vi.advanceTimersByTimeAsync(STATE_EVERY_MS);
+      expect(got).toHaveLength(1);
+      expect(got[0]).toMatchObject({ type: 'state', serverNow: Date.now() - STATE_EVERY_MS + 1000 });
+      expect(parse).toHaveBeenCalledTimes(1);
+      // Nothing more is pending.
+      await vi.advanceTimersByTimeAsync(STATE_EVERY_MS * 4);
+      expect(got).toHaveLength(1);
+      net.close();
+    });
+
+    it('handles states once per animation frame where there are frames', async () => {
+      const frames: FrameRequestCallback[] = [];
+      vi.stubGlobal('requestAnimationFrame', (f: FrameRequestCallback) => frames.push(f));
+      vi.stubGlobal('cancelAnimationFrame', () => {});
+      const { net, got, deliver } = await connected();
+      for (let i = 0; i < 100; i++) deliver(state(Date.now()));
+      expect(frames).toHaveLength(1);
+      frames.shift()!(0);
+      expect(got).toHaveLength(1);
+      net.close();
+    });
+
+    it('still delivers every error, in order and at once, between states', async () => {
+      vi.useFakeTimers();
+      const { net, got, deliver } = await connected();
+      const error = (message: string) => JSON.stringify({ type: 'error', message });
+      deliver(state(1));
+      deliver(error('first'));
+      deliver(state(2));
+      deliver(error('second'));
+      deliver(state(3));
+      expect(got.map((m) => m.message)).toEqual(['first', 'second']);
+      await vi.advanceTimersByTimeAsync(STATE_EVERY_MS);
+      expect(got.map((m) => m.message ?? m.serverNow)).toEqual(['first', 'second', 3]);
+      net.close();
+    });
+
+    it('handles a state that doesn’t look like one until parsed the same way', async () => {
+      vi.useFakeTimers();
+      const { net, got, deliver } = await connected();
+      for (let i = 1; i <= 50; i++) deliver(` ${state(i)}`);
+      await vi.advanceTimersByTimeAsync(STATE_EVERY_MS);
+      expect(got.map((m) => m.serverNow)).toEqual([50]);
+      net.close();
+    });
+
+    it('drops a state not handled yet when the connection is closed, and handles it when the hub hangs up', async () => {
+      vi.useFakeTimers();
+      const first = await connected();
+      first.deliver(state(1));
+      first.net.close();
+      await vi.advanceTimersByTimeAsync(STATE_EVERY_MS);
+      expect(first.got).toEqual([]);
+      const second = await connected();
+      second.deliver(state(2));
+      second.socket.drop();
+      expect(second.got.map((m) => m.serverNow)).toEqual([2]);
+      second.net.close();
+    });
+
+    it('hangs up on a hub that sends more than its budget, says so, and reconnects with the usual backoff', async () => {
+      vi.useFakeTimers();
+      const { net, got, statuses, socket, deliver } = await connected();
+      const big = state(Date.now(), 'x'.repeat(MAX_MESSAGE_CHARS - 1000));
+      const n = Math.ceil(BURST_CHARS / big.length) + 1;
+      for (let i = 0; i < n && !socket.closed; i++) deliver(big);
+      expect(socket.closed).toBe(true);
+      expect(statuses.at(-1)).toBe('closed');
+      expect(got).toEqual([{ type: 'error', message: FLOOD_MESSAGE }]);
+      // What is left of that connection is ignored, and nothing is handled late.
+      deliver(state(Date.now()));
+      await vi.advanceTimersByTimeAsync(STATE_EVERY_MS);
+      expect(got).toHaveLength(1);
+      // The usual quick reconnect.
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(FakeSocket.opened).toHaveLength(2);
+      net.close();
+    });
+
+    it('lets a hub send at a real hub’s pace for as long as it likes', async () => {
+      vi.useFakeTimers();
+      const { net, got, socket, deliver } = await connected();
+      // A full-size state 6 times a second (one every broadcast interval) is
+      // more than a real hub sends one app; it stays connected.
+      const big = state(Date.now(), 'x'.repeat(500_000));
+      for (let i = 0; i < 60; i++) {
+        deliver(big);
+        await vi.advanceTimersByTimeAsync(150);
+      }
+      expect(socket.closed).toBe(false);
+      expect(got.length).toBeGreaterThan(50);
       net.close();
     });
   });
