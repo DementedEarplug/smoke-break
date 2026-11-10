@@ -7,13 +7,15 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import {
+  type IdentityVault,
   type KeyValue,
   LEGACY_ID_KEY,
   SECRET_KEY,
-  type SecretVault,
   clientIdFor,
+  isHubKey,
   migrateLegacyId,
-  vaultSecret,
+  moveToKeychain,
+  vaultClientId,
 } from './identity.ts';
 import { checkServerUrl, hubKey } from './serverUrl.ts';
 
@@ -115,24 +117,86 @@ export function leaveTeam(hub = currentHub()) {
   store.removeItem(teamKey(hub));
 }
 
-/** This device's client id for a hub (by default the configured one). */
-export async function clientId(hub = currentHub()): Promise<string> {
-  await ready;
-  return clientIdFor(store, hub, undefined, deviceSecret);
+// ── Keychain ────────────────────────────────────────────────────────────────
+
+/**
+ * Desktop on macOS: access tokens, the device secret and pinned ids live in
+ * the login Keychain (`src-tauri/src/token.rs`), never in web storage. Set by
+ * `ready`. Elsewhere (the browser version, other platforms) web storage holds
+ * them, which `tokenStorageHint` says.
+ */
+let keychain = false;
+
+async function keychainAvailable(): Promise<boolean> {
+  if (!isDesktop) return false;
+  try {
+    return await invoke<boolean>('keychain_available');
+  } catch {
+    // Can't tell: assume there is one, so nothing secret goes to web storage.
+    return true;
+  }
+}
+
+/** The message of a refused Tauri command (a string) or an Error. */
+const reason = (e: unknown) => (typeof e === 'string' ? e : e instanceof Error ? e.message : String(e));
+
+/** Where tokens are kept, for the hint under the token field. */
+export function tokenStorageHint(): string {
+  if (keychain) return 'Kept in your login Keychain.';
+  if (isDesktop) return 'There’s no Keychain on this system, so it’s kept in the app’s own storage, which other programs running as you can read.';
+  return 'Kept in this browser’s storage for this server.';
+}
+
+// ── Identity ────────────────────────────────────────────────────────────────
+
+/**
+ * The Keychain refused to give out (or store) this device's identity. Nothing
+ * is made up instead: a new identity would silently lose the person's place
+ * and team ownership. Show `message` and let them try again.
+ */
+export class IdentityUnavailable extends Error {
+  constructor(why: string) {
+    super(
+      `Couldn’t get your identity from the Keychain (${why}). Smoke Break keeps who you are there and won’t make up a new identity, which would lose your place in your team. Unlock the Keychain or allow access when macOS asks, then try again.`,
+    );
+    this.name = 'IdentityUnavailable';
+  }
+}
+
+/** The `identity_*` / `client_id*` commands: the device secret never comes back out of Rust. */
+const keychainIdentity: IdentityVault = {
+  init: (legacySecret, storedBefore) => invoke('identity_init', { legacySecret, storedBefore }),
+  pin: (hub, id) => invoke('client_id_pin', { hub, id }),
+  clientId: (hub, pinned) => invoke<string>('client_id', { hub, pinned }),
+};
+
+/** The move into the Keychain, while it runs or once it worked; null after a failure, so the next call tries again. */
+let identityMoved: Promise<void> | null = null;
+
+function keychainIdentityReady(): Promise<void> {
+  identityMoved ??= moveToKeychain(store, keychainIdentity).catch((e) => {
+    identityMoved = null;
+    throw new IdentityUnavailable(reason(e));
+  });
+  return identityMoved;
 }
 
 /**
- * Desktop on macOS: the device secret (the key every client id is derived
- * from, so the proof of who you are and of team ownership) lives in the login
- * Keychain, like access tokens. The commands only ever touch that one item.
+ * This device's client id for a hub (by default the configured one). Throws
+ * `IdentityUnavailable` if the Keychain refuses; call again to retry.
  */
-const keychainVault: SecretVault = {
-  get: () => invoke<string | null>('device_secret_get'),
-  create: (secret) => invoke<string>('device_secret_create', { secret }),
-};
-/** The secret from the Keychain, once `ready`; null where web storage holds it instead. */
-let deviceSecret: string | null = null;
+export async function clientId(hub = currentHub()): Promise<string> {
+  await ready;
+  if (!keychain) return clientIdFor(store, hub);
+  await keychainIdentityReady();
+  try {
+    return await vaultClientId(store, keychainIdentity, hub);
+  } catch (e) {
+    throw new IdentityUnavailable(reason(e));
+  }
+}
 
+/** Throws `IdentityUnavailable` if the Keychain refuses (see `clientId`). */
 export async function loadIdentity(): Promise<Identity | null> {
   await ready;
   const hub = currentHub();
@@ -156,8 +220,13 @@ export function resetTabIdentity() {
 
 const DEFAULT_TOKEN = import.meta.env.VITE_HUB_TOKEN || '';
 const TOKEN_MAX = 512;
-/** Fallback storage where the Keychain isn't available (browser, non-macOS, Keychain refused). */
+/**
+ * Where there is no Keychain (browser, other platforms), tokens are kept here.
+ * On macOS this only ever holds what an older version left behind, until it
+ * has been moved to the Keychain.
+ */
 const tokenKey = (hub: string) => `sb:token@${hub}`;
+const TOKEN_KEY_PREFIX = tokenKey('');
 const LEGACY_TOKEN_KEY = 'sb:token';
 
 /** The built-in token belongs to the built-in hub and is never sent anywhere else. */
@@ -168,43 +237,66 @@ function builtInToken(hub: string): string {
   return hub === hubKey(DEFAULT_SERVER) ? DEFAULT_TOKEN : '';
 }
 
+/** Problems keeping a hub's token in the Keychain this run, by hub (this window only). */
+const tokenProblems = new Map<string, { reading: boolean; message: string }>();
+
 /**
- * Desktop on macOS: tokens live in the login Keychain (see `src-tauri/src/token.rs`),
- * not in the webview's storage. Returns undefined where that isn't available.
+ * Why the token for `hub` isn't safely saved, or '' if it is (or there's
+ * nothing to say). Shown in onboarding and the team panel.
  */
-async function keychainGet(hub: string): Promise<string | null | undefined> {
-  if (!isDesktop) return undefined;
-  try {
-    return await invoke<string | null>('token_get', { hub });
-  } catch {
-    return undefined;
-  }
+export function tokenNotice(hub = currentHub()): string {
+  return tokenProblems.get(hub)?.message ?? '';
 }
 
-/** Stores (or with '' deletes) a hub's token in the Keychain; false if that didn't work. */
-async function keychainSet(hub: string, token: string): Promise<boolean> {
-  if (!isDesktop) return false;
+const notSavedMessage = (why: string) =>
+  `Couldn’t save your access token to the Keychain (${why}). It’s kept only until you quit Smoke Break: you’ll need to enter it again next time.`;
+
+/**
+ * Stores (or with '' deletes) a hub's token in the Keychain. If the Keychain
+ * refuses, the Rust side keeps it in memory until the app quits (never in web
+ * storage), and this returns why.
+ */
+async function keychainSet(hub: string, token: string): Promise<string | null> {
   try {
-    await invoke('token_set', { hub, token });
-    return true;
-  } catch {
-    return false;
+    return (await invoke<string | null>('token_set', { hub, token })) ?? null;
+  } catch (e) {
+    return reason(e);
   }
 }
 
 async function readToken(hub: string): Promise<string> {
-  return (await keychainGet(hub)) || localStorage.getItem(tokenKey(hub)) || '';
+  if (!keychain) return localStorage.getItem(tokenKey(hub)) || '';
+  try {
+    const t = await invoke<string | null>('token_get', { hub });
+    if (tokenProblems.get(hub)?.reading) tokenProblems.delete(hub);
+    return t || '';
+  } catch (e) {
+    tokenProblems.set(hub, {
+      reading: true,
+      message: `Couldn’t read your saved access token from the Keychain (${reason(e)}). Allow access when macOS asks, or enter the token again.`,
+    });
+    return '';
+  }
 }
 
-async function writeToken(token: string, hub: string) {
+/** Returns why the token couldn't be saved for good, or null. */
+async function writeToken(token: string, hub: string): Promise<string | null> {
   const t = token.trim().slice(0, TOKEN_MAX);
-  if (await keychainSet(hub, t)) {
-    localStorage.removeItem(tokenKey(hub));
-  } else if (t) {
-    localStorage.setItem(tokenKey(hub), t);
-  } else {
-    localStorage.removeItem(tokenKey(hub));
+  if (!keychain) {
+    if (t) localStorage.setItem(tokenKey(hub), t);
+    else localStorage.removeItem(tokenKey(hub));
+    return null;
   }
+  const problem = await keychainSet(hub, t);
+  // Whatever an older version left in web storage is replaced either way.
+  localStorage.removeItem(tokenKey(hub));
+  if (problem === null) {
+    tokenProblems.delete(hub);
+    return null;
+  }
+  const message = t ? notSavedMessage(problem) : `Couldn’t remove your access token from the Keychain (${problem}).`;
+  tokenProblems.set(hub, { reading: false, message });
+  return message;
 }
 
 /** The saved token for a hub only (for the onboarding field; the built-in one isn't shown). */
@@ -213,9 +305,10 @@ export async function savedHubToken(hub = currentHub()): Promise<string> {
   return readToken(hub);
 }
 
-export async function saveHubToken(token: string, hub = currentHub()) {
+/** Saves a hub's token; returns a message for the person if it couldn't be saved for good. */
+export async function saveHubToken(token: string, hub = currentHub()): Promise<string | null> {
   await ready;
-  await writeToken(token, hub);
+  return writeToken(token, hub);
 }
 
 /** A hub's access token: one entered in onboarding, else the built-in one if this is its hub, else none. */
@@ -223,19 +316,42 @@ export async function hubToken(hub: string): Promise<string> {
   return (await savedHubToken(hub)) || builtInToken(hub);
 }
 
+/**
+ * macOS: tokens an older version kept in web storage (before the Keychain, or
+ * when it refused) move to the Keychain. Each leaves web storage only once the
+ * Keychain has it; until then the Rust side holds it in memory for this run.
+ */
+async function moveTokensToKeychain() {
+  const keys: string[] = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (k?.startsWith(TOKEN_KEY_PREFIX)) keys.push(k);
+  }
+  for (const k of keys) {
+    const hub = k.slice(TOKEN_KEY_PREFIX.length);
+    const token = localStorage.getItem(k);
+    if (token === null) continue;
+    if (!token || !isHubKey(hub)) {
+      localStorage.removeItem(k);
+      continue;
+    }
+    const problem = await keychainSet(hub, token.slice(0, TOKEN_MAX));
+    if (problem === null) localStorage.removeItem(k);
+    else tokenProblems.set(hub, { reading: false, message: notSavedMessage(problem) });
+  }
+}
 
 // ── Upgrade from one identity for every hub ─────────────────────────────────
 
 /**
  * Before per-hub data the client id, team and token were saved once for
  * whatever hub was configured. They now belong to the hub configured at
- * upgrade time, and are never sent to any other.
+ * upgrade time, and are never sent to any other. Then, on macOS, whatever
+ * secret is still in web storage moves to the Keychain.
  */
 async function migrate(kv: KeyValue) {
   const hub = currentHub();
   migrateLegacyId(kv, hub);
-  // The browser version keeps one teammate per tab in session storage.
-  deviceSecret = await vaultSecret(kv, isDesktop ? keychainVault : null);
   const team = kv.getItem(LEGACY_TEAM_KEY);
   if (team !== null) {
     if (team && !kv.getItem(teamKey(hub))) kv.setItem(teamKey(hub), team);
@@ -243,9 +359,15 @@ async function migrate(kv: KeyValue) {
   }
   const token = localStorage.getItem(LEGACY_TOKEN_KEY);
   if (token !== null) {
-    if (token && !(await readToken(hub))) await writeToken(token, hub);
+    if (token && !localStorage.getItem(tokenKey(hub))) localStorage.setItem(tokenKey(hub), token);
     localStorage.removeItem(LEGACY_TOKEN_KEY);
   }
+  // The browser version keeps one teammate per tab in session storage.
+  keychain = await keychainAvailable();
+  if (!keychain) return;
+  await moveTokensToKeychain();
+  // Started here so it's under way early; `clientId` waits for it (and retries it).
+  keychainIdentityReady().catch(() => {});
 }
 
 /** Await before reading identity or tokens; every entry point does. */

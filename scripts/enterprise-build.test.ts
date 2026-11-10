@@ -1,16 +1,26 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
+  type AppFacts,
   CSP_BASE,
+  type Row,
   buildEnv,
+  checkApp,
+  checkArgs,
   checkEmbeddedCsp,
   checkEnv,
   checkHubUrl,
   connectSrc,
+  failed,
+  formatTable,
   isMeetingHost,
   makeOverride,
+  parseCodesignDisplay,
+  parseSpctl,
+  readBuildRecord,
   targetOf,
 } from './enterprise-build.ts';
+import * as fx from './fixtures/check-app.ts';
 
 const GOOD = { VITE_SERVER_URL: 'wss://breaks.acme.internal/ws', SMOKE_BREAK_MEETING_HOST: 'acme.zoom.us' };
 
@@ -173,4 +183,185 @@ describe('checkEmbeddedCsp', () => {
   });
 
   it('refuses an empty bundle', () => expect(checkEmbeddedCsp([], origin)).toEqual(['no executable found in the app bundle']));
+});
+
+// ── --check ──────────────────────────────────────────────────────────────────
+
+const HUB = 'wss://breaks.acme.internal/ws';
+const ORIGIN = 'wss://breaks.acme.internal';
+const DEFAULT_CSP = "'self' ipc: http://ipc.localhost wss: ws://localhost:* ws://127.0.0.1:* ws://[::1]:*";
+const record = (fields: string) => `smoke-break-build-info:v1 ${fields} :end`;
+const GOOD_RECORD = record(`server=${HUB} lock=on token=none meeting-host=acme.zoom.us`);
+/** An executable as the linker lays it out: string literals back to back, among other bytes. */
+const exe = (...strings: string[]) => [{ name: 'Contents/MacOS/smoke-break', data: Buffer.from(`\xcf\xfa\xed\xfe…${strings.join('')}…`, 'latin1') }];
+const GOOD_EXE = () => exe(connectSrc(ORIGIN), "object-src'none'", connectSrc(ORIGIN), 'acme.zoom.us', GOOD_RECORD);
+const ok = (output: string) => ({ status: 0, output });
+
+/** A notarized Developer ID build of the right config; each test changes one thing. */
+const goodFacts = (): AppFacts => ({
+  binaries: GOOD_EXE(),
+  codesignDisplay: ok(fx.CODESIGN_DEVELOPER_ID),
+  codesignVerify: ok(fx.VERIFY_OK),
+  spctl: ok(fx.SPCTL_NOTARIZED),
+  stapler: ok(fx.STAPLER_OK),
+});
+const verdicts = (rows: Row[]) => Object.fromEntries(rows.map((r) => [r.check, r.verdict]));
+
+describe('readBuildRecord', () => {
+  it('reads the record build.rs embeds', () => {
+    expect(readBuildRecord(GOOD_EXE())).toEqual({ record: { server: HUB, lock: 'on', token: 'none', meetingHost: 'acme.zoom.us' } });
+  });
+
+  it('refuses none, several different, or an incomplete one', () => {
+    expect(readBuildRecord(exe('nothing here'))).toMatchObject({ error: expect.stringMatching(/no build record/) });
+    expect(readBuildRecord(exe(GOOD_RECORD, record('server= lock=off token=none meeting-host=')))).toMatchObject({
+      error: expect.stringMatching(/2 different/),
+    });
+    expect(readBuildRecord(exe(record('server=x')))).toMatchObject({ error: expect.stringMatching(/incomplete/) });
+    // The same record twice (e.g. a universal binary's two slices) is fine.
+    expect(readBuildRecord(exe(GOOD_RECORD, GOOD_RECORD))).toHaveProperty('record');
+  });
+});
+
+describe('parseCodesignDisplay', () => {
+  it('reads a Developer ID signature with the hardened runtime', () => {
+    expect(parseCodesignDisplay(ok(fx.CODESIGN_DEVELOPER_ID))).toEqual({
+      signed: true,
+      adhoc: false,
+      hardenedRuntime: true,
+      authority: 'Developer ID Application: Acme Inc (TEAMID1234)',
+      teamId: 'TEAMID1234',
+      stapled: true,
+    });
+    expect(parseCodesignDisplay(ok(fx.CODESIGN_NO_RUNTIME))).toMatchObject({ signed: true, hardenedRuntime: false, stapled: false });
+  });
+
+  it('tells ad-hoc and unsigned apart from signed', () => {
+    expect(parseCodesignDisplay(ok(fx.CODESIGN_ADHOC))).toMatchObject({ signed: true, adhoc: true, hardenedRuntime: false, teamId: null });
+    expect(parseCodesignDisplay({ status: 1, output: fx.CODESIGN_UNSIGNED })).toMatchObject({ signed: false, adhoc: false });
+    expect(parseCodesignDisplay({ status: null, output: 'spawnSync codesign ENOENT' }).signed).toBe(false);
+  });
+});
+
+describe('parseSpctl', () => {
+  it('reads accepted, rejected, and a Mac with Gatekeeper off', () => {
+    expect(parseSpctl(ok(fx.SPCTL_NOTARIZED))).toEqual({ accepted: true, source: 'Notarized Developer ID', gatekeeperOff: false });
+    expect(parseSpctl({ status: 3, output: fx.SPCTL_REJECTED })).toEqual({ accepted: false, source: 'Unnotarized Developer ID', gatekeeperOff: false });
+    expect(parseSpctl(ok(fx.SPCTL_GATEKEEPER_OFF)).gatekeeperOff).toBe(true);
+  });
+});
+
+describe('checkApp', () => {
+  it('passes a notarized Developer ID build of the right config', () => {
+    const rows = checkApp(goodFacts(), { serverUrl: HUB, meetingHost: 'acme.zoom.us' });
+    expect(rows.filter((r) => r.verdict !== 'pass')).toEqual([]);
+    expect(failed(rows)).toBe(false);
+    expect(Object.keys(verdicts(rows))).toEqual([
+      'Build record',
+      'Hub address',
+      'Server lock',
+      'Shared access token',
+      'Meeting host pinned',
+      'CSP connect-src',
+      'Signed',
+      'codesign --verify --deep --strict',
+      'Hardened runtime',
+      'Notarization',
+    ]);
+  });
+
+  it('checks against what the app was built with when nothing is expected', () => {
+    expect(failed(checkApp(goodFacts()))).toBe(false);
+  });
+
+  it.each([
+    ['unlocked', record(`server=${HUB} lock=off token=none meeting-host=acme.zoom.us`), 'Server lock'],
+    ['a shared token', record(`server=${HUB} lock=on token=set meeting-host=acme.zoom.us`), 'Shared access token'],
+    ['no meeting host', record(`server=${HUB} lock=on token=none meeting-host=`), 'Meeting host pinned'],
+    ['a non-Zoom meeting host', record(`server=${HUB} lock=on token=none meeting-host=evil.example`), 'Meeting host pinned'],
+    ['no hub', record('server= lock=on token=none meeting-host=acme.zoom.us'), 'Hub address'],
+    ['a plain ws hub', record('server=ws://breaks.acme.internal/ws lock=on token=none meeting-host=acme.zoom.us'), 'Hub address'],
+  ])('fails an app built %s', (_what, rec, check) => {
+    const facts = { ...goodFacts(), binaries: exe(connectSrc(ORIGIN), 'acme.zoom.us', 'evil.example', rec) };
+    const rows = checkApp(facts);
+    expect(verdicts(rows)[check]).toBe('fail');
+    expect(failed(rows)).toBe(true);
+  });
+
+  it('fails an app built for another hub or meeting host than expected', () => {
+    expect(verdicts(checkApp(goodFacts(), { serverUrl: 'wss://other.example/ws' }))['Hub address']).toBe('fail');
+    expect(verdicts(checkApp(goodFacts(), { meetingHost: 'other.zoom.us' }))['Meeting host pinned']).toBe('fail');
+  });
+
+  it('fails a wide or missing CSP, and a missing build record', () => {
+    const wide = { ...goodFacts(), binaries: exe(connectSrc(ORIGIN), DEFAULT_CSP, 'acme.zoom.us', GOOD_RECORD) };
+    expect(verdicts(checkApp(wide))['CSP connect-src']).toBe('fail');
+    const unpinned = { ...goodFacts(), binaries: exe(DEFAULT_CSP, 'acme.zoom.us', GOOD_RECORD) };
+    expect(verdicts(checkApp(unpinned))['CSP connect-src']).toBe('fail');
+    const old = { ...goodFacts(), binaries: exe(connectSrc(ORIGIN), 'acme.zoom.us') };
+    expect(verdicts(checkApp(old))).toMatchObject({ 'Build record': 'fail', 'CSP connect-src': 'fail' });
+  });
+
+  it('fails an unsigned or ad-hoc app unless asked to allow it, and skips the signature checks', () => {
+    for (const codesignDisplay of [{ status: 1, output: fx.CODESIGN_UNSIGNED }, ok(fx.CODESIGN_ADHOC)]) {
+      const facts = { ...goodFacts(), codesignDisplay, spctl: null, stapler: null };
+      expect(verdicts(checkApp(facts)).Signed).toBe('fail');
+      const allowed = checkApp(facts, { allowUnsigned: true });
+      expect(verdicts(allowed)).toMatchObject({
+        Signed: 'warn',
+        'codesign --verify --deep --strict': 'skip',
+        'Hardened runtime': 'skip',
+        Notarization: 'skip',
+      });
+      expect(failed(allowed)).toBe(false);
+    }
+  });
+
+  it('fails a signature that does not verify, or lacks the hardened runtime', () => {
+    expect(verdicts(checkApp({ ...goodFacts(), codesignVerify: { status: 1, output: fx.VERIFY_MODIFIED } }))['codesign --verify --deep --strict']).toBe(
+      'fail',
+    );
+    const noRuntime = { ...goodFacts(), codesignDisplay: ok(fx.CODESIGN_NO_RUNTIME), stapler: { status: 65, output: fx.STAPLER_NONE } };
+    expect(verdicts(checkApp(noRuntime))['Hardened runtime']).toBe('fail');
+  });
+
+  it('warns about a signed app that is not notarized, and fails a notarized one spctl refuses', () => {
+    const unnotarized = {
+      ...goodFacts(),
+      codesignDisplay: ok(fx.CODESIGN_DEVELOPER_ID.replace('Notarization Ticket=stapled\n', '')),
+      spctl: { status: 3, output: fx.SPCTL_REJECTED },
+      stapler: { status: 65, output: fx.STAPLER_NONE },
+    };
+    const rows = checkApp(unnotarized);
+    expect(verdicts(rows).Notarization).toBe('warn');
+    expect(failed(rows)).toBe(false);
+    expect(verdicts(checkApp({ ...goodFacts(), spctl: { status: 3, output: fx.SPCTL_REJECTED } })).Notarization).toBe('fail');
+  });
+
+  it('does not trust spctl on a Mac with Gatekeeper turned off', () => {
+    const rows = checkApp({ ...goodFacts(), spctl: ok(fx.SPCTL_GATEKEEPER_OFF) });
+    expect(verdicts(rows).Notarization).toBe('fail');
+    expect(rows.find((r) => r.check === 'Notarization')!.detail).toMatch(/Gatekeeper is turned off/);
+  });
+});
+
+describe('formatTable', () => {
+  it('prints one aligned line per check', () => {
+    const table = formatTable([
+      { check: 'Short', verdict: 'pass', detail: 'fine' },
+      { check: 'A longer check', verdict: 'fail', detail: 'broken' },
+    ]);
+    expect(table.split('\n')).toEqual(['  PASS  Short           fine', '  FAIL  A longer check  broken']);
+  });
+});
+
+describe('checkArgs', () => {
+  it('finds --check and its app, and nothing else', () => {
+    expect(checkArgs(['--target', 'universal-apple-darwin'])).toBeNull();
+    expect(checkArgs(['--check', 'Smoke Break.app'])).toEqual({ app: 'Smoke Break.app', allowUnsigned: false });
+    expect(checkArgs(['--check', 'a.app', '--allow-unsigned'])).toEqual({ app: 'a.app', allowUnsigned: true });
+    expect(checkArgs(['--check'])).toMatchObject({ error: expect.any(String) });
+    expect(checkArgs(['--check', '--allow-unsigned'])).toMatchObject({ error: expect.any(String) });
+    expect(checkArgs(['--check', 'a.app', '--target', 'x'])).toMatchObject({ error: expect.any(String) });
+  });
 });

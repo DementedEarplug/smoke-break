@@ -91,6 +91,13 @@ export function showOnboarding(
     autocomplete: 'off',
   });
   const showToken = platform.isDesktop || !!opts.askToken;
+  /** Where the token is kept, and anything wrong with keeping it there. */
+  const tokenHint = h('p', { class: 'sb-hint', textContent: '' });
+  const tokenWarn = h('p', { class: 'sb-warn', textContent: '' });
+  const showTokenNotes = (hub: string) => {
+    tokenHint.textContent = platform.tokenStorageHint();
+    tokenWarn.textContent = platform.tokenNotice(hub);
+  };
 
   /**
    * Tokens are saved per hub. The field shows the saved one for the address in
@@ -100,6 +107,7 @@ export function showOnboarding(
   let shown = { hub: platform.currentHub(), token: '' };
   const fillToken = async (hub: string) => {
     const saved = await platform.savedHubToken(hub);
+    showTokenNotes(hub);
     // Leave it alone if the person has typed over it meanwhile.
     if (token.value !== shown.token) return;
     token.value = saved;
@@ -132,9 +140,16 @@ export function showOnboarding(
     }
     const hub = platform.currentHub();
     // Only save what was typed for this hub (or its own saved token, unchanged).
+    // If the Keychain won't keep it, it's used for this run only; the team panel says so.
     if (showToken && (token.value !== shown.token || shown.hub === hub)) await platform.saveHubToken(token.value, hub);
     platform.saveName(n);
-    return { name: n, clientId: await platform.clientId(hub) };
+    try {
+      return { name: n, clientId: await platform.clientId(hub) };
+    } catch (e) {
+      // The Keychain refused the identity: say why; pressing the button again retries.
+      errorEl.textContent = e instanceof Error ? e.message : String(e);
+      return null;
+    }
   };
   /** Runs a submit once at a time (saving the token and making the id take a moment). */
   const submit = (make: (f: { name: string; clientId: string }) => JoinMsg | null) => async () => {
@@ -194,7 +209,7 @@ export function showOnboarding(
     );
   }
   if (platform.serverIsConfigurable) card.append(h('label', {}, 'Server', server));
-  if (showToken) card.append(h('label', {}, 'Access token', token));
+  if (showToken) card.append(h('label', {}, 'Access token', token), tokenHint, tokenWarn);
   card.append(errorEl);
   container.replaceChildren(h('div', { class: 'sb-center' }, card));
   name.focus();
@@ -233,6 +248,8 @@ export function createTeamPanel(
     hint: string;
     /** "Cancel" on the waiting screen: stop asking and forget the team. */
     onCancelWaiting(): void;
+    /** A standing warning, e.g. the access token is only kept until the app quits ('' for none). */
+    storageNotice?(): string;
   },
 ): TeamPanel {
   let team: TeamView | null = null;
@@ -283,6 +300,8 @@ export function createTeamPanel(
       b.onclick = () => act.run();
       problems.splice(1, 0, h('div', { class: 'sb-row sb-notice-action' }, b));
     }
+    const stored = opts.storageNotice?.() ?? '';
+    if (stored) problems.push(h('p', { class: 'sb-warn', textContent: stored }));
     if (waitingFor) {
       const cancel = h('button', { textContent: 'Cancel', className: 'secondary' });
       cancel.onclick = () => opts.onCancelWaiting();

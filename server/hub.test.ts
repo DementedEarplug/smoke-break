@@ -238,15 +238,15 @@ describe('hub limits', () => {
     expect(await create('2001:db8:1:3::1', 3)).toBe('state');
   });
 
-  it('never forgets a recently used team to make room; refuses the new one instead (H4)', async () => {
+  it('never forgets a really used team to make room, however long idle; refuses the new one instead (H4, review 3 item 3)', async () => {
     const day = 86_400_000;
-    // Teams other people have used (several on the roster), so they aren't junk.
+    // Teams from before hadGroupBreak was saved, several on the roster: taken to be really used.
     const roster = [{ id: 'aaaaaaaaaaaaaaaa', name: 'A' }, { id: 'bbbbbbbbbbbbbbbb', name: 'B' }];
     const ownerId = 'aaaaaaaaaaaaaaaa';
     writeFileSync(
       h.dataFile,
       JSON.stringify([
-        saved({ code: 'OLDONE2345', roster, ownerId, requireApproval: false, lastActive: Date.now() - 10 * day }),
+        saved({ code: 'OLDONE2345', roster, ownerId, requireApproval: false, lastActive: Date.now() - 60 * day }),
         saved({ code: 'RECENT2345', roster, ownerId, requireApproval: false, lastActive: Date.now() - 2 * day }),
         saved({ code: 'GONEEE2345', roster, ownerId, requireApproval: false, lastActive: Date.now() - 365 * day }),
       ]),
@@ -254,11 +254,9 @@ describe('hub limits', () => {
     startHub({ limits: { maxTeams: 2 } });
     // A year-old team was dropped on load.
     expect((await hello('GONEEE2345', 'joiner-client-id-GONEEE')).msg).toMatchObject({ type: 'error', code: 'bad-code' });
-    expect((await h.create('fresh-client-id-00000', 'F', 'Fresh')).msg).toMatchObject({ type: 'state', team: { name: 'Fresh' } });
-    // OLDONE was idle for 10 days, so it made room.
-    expect((await hello('OLDONE2345', 'joiner-client-id-OLDONE')).msg.type).toBe('error');
-    // RECENT was used two days ago, and nobody is in it right now, but it isn't forgotten.
-    expect((await h.create('more-client-id-000000', 'M', 'More')).msg).toMatchObject({ type: 'error', fatal: true, code: 'full' });
+    // Idle for 60 days, nobody in it right now, but it isn't forgotten for a new team.
+    expect((await h.create('fresh-client-id-00000', 'F', 'Fresh')).msg).toMatchObject({ type: 'error', fatal: true, code: 'full' });
+    expect((await hello('OLDONE2345', 'joiner-client-id-OLDONE')).msg.type).toBe('state');
     expect((await hello('RECENT2345', 'joiner-client-id-RECENT')).msg.type).toBe('state');
   });
 
@@ -734,7 +732,10 @@ describe('hub persistence (M5)', () => {
     } finally {
       console.error = orig;
     }
-    expect(String(errors[0])).toMatch(/Skipped 4/);
+    // Each dropped entry is named (by position: none has a ref), and the file as it was is kept.
+    expect(errors.join('\n')).toMatch(/Skipped 4 of 5/);
+    for (const n of [2, 3, 4, 5]) expect(errors.join('\n')).toContain(`Dropped entry ${n} (no ref)`);
+    expect(readdirSync(dirname(h.dataFile)).some((f) => f.startsWith('teams.json.partial-'))).toBe(true);
     // The one good entry was kept (ownerless, so it waits for an admin), fixed up field by field.
     expect((await hello('GOODONE234', 'field-client-id-000000')).msg).toMatchObject({ code: 'pending' });
     h.hub.flush();

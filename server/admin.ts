@@ -7,6 +7,7 @@
 //   node server/admin.ts codes <team-ref>                  a team's current invite code
 //   node server/admin.ts set-owner <team-ref> <id>         hand a team to someone on its roster (or waiting)
 //   node server/admin.ts unban <team-ref> <id|label>       lift a removal or denial
+//   node server/admin.ts delete-team <team-ref> --yes      delete a team (its members' apps forget it)
 //
 // Uses $SMOKE_BREAK_DATA_DIR/teams.json like the hub (or --file <path>).
 // Only `codes` prints an invite code; nothing prints meeting links.
@@ -17,8 +18,8 @@ import { fileURLToPath } from 'node:url';
 import { PUBLIC_ID, dataFileFromEnv, parseSavedTeam, writeAtomic } from './persistence.ts';
 
 const USAGE =
-  'Usage: node server/admin.ts [--file teams.json] list | codes <team-ref> | set-owner <team-ref> <member-id> | unban <team-ref> <member-id|label>\n' +
-  'Run it as the hub\'s user (sudo -u <hub user> …), and stop the hub before set-owner or unban.';
+  'Usage: node server/admin.ts [--file teams.json] list | codes <team-ref> | set-owner <team-ref> <member-id> | unban <team-ref> <member-id|label> | delete-team <team-ref> --yes\n' +
+  'Run it as the hub\'s user (sudo -u <hub user> …), and stop the hub before set-owner, unban or delete-team.';
 
 type Raw = Record<string, unknown>;
 
@@ -35,8 +36,11 @@ export function runAdmin(argv: string[], out: (line: string) => void = console.l
     file = args[fi + 1] ?? '';
     args.splice(fi, 2);
   }
+  const yi = args.indexOf('--yes');
+  const yes = yi >= 0;
+  if (yes) args.splice(yi, 1);
   const [cmd, ref, target] = args;
-  if (!['list', 'codes', 'set-owner', 'unban'].includes(cmd)) {
+  if (!['list', 'codes', 'set-owner', 'unban', 'delete-team'].includes(cmd)) {
     out(USAGE);
     return 2;
   }
@@ -77,7 +81,12 @@ export function runAdmin(argv: string[], out: (line: string) => void = console.l
         out(`team "${team.name}" has no saved ref yet: start the hub once (it saves one), stop it, and list again.`);
         continue;
       }
-      out(`team ${team.ref}  "${team.name}"  owner ${team.ownerId ?? '(none)'}  approval ${team.requireApproval ? 'on' : 'off'}  waiting ${team.pending.length}`);
+      const ownerLabel = team.roster.find((m) => m.id === team.ownerId)?.label;
+      const used = new Date(team.lastActive).toISOString().slice(0, 10);
+      out(
+        `team ${team.ref}  "${team.name}"  owner ${team.ownerId ?? '(none)'}${ownerLabel ? ` [${ownerLabel}]` : ''}  approval ${team.requireApproval ? 'on' : 'off'}` +
+          `  waiting ${team.pending.length}  last used ${used}${team.hadGroupBreak ? '' : '  (never had a group break)'}`,
+      );
       for (const m of team.roster) {
         out(`  ${m.id}  ${m.name || '(name not known yet)'}${m.label ? `  [${m.label}]` : ''}${m.id === team.ownerId ? '  (owner)' : ''}`);
       }
@@ -96,6 +105,19 @@ export function runAdmin(argv: string[], out: (line: string) => void = console.l
 
   if (cmd === 'codes') {
     out(`team ${team.ref}  "${team.name}"  invite code: ${team.code}`);
+    return 0;
+  }
+
+  if (cmd === 'delete-team') {
+    const labels = [...new Set(team.roster.map((m) => m.label).filter(Boolean))];
+    const what = `team ${team.ref} "${team.name}" (${team.roster.length} on the roster${labels.length ? `: ${labels.join(', ')}` : ''}, last used ${new Date(team.lastActive).toISOString()})`;
+    if (!yes) {
+      out(`This deletes ${what}. Its members' apps will forget it. To go ahead, stop the hub and run again with --yes.`);
+      return 2;
+    }
+    data.splice(data.indexOf(found.raw), 1);
+    write();
+    out(`Deleted ${what}. Start the hub again.`);
     return 0;
   }
 

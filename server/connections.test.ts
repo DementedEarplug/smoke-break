@@ -260,8 +260,11 @@ describe('junk teams (item 8)', () => {
     expect((await h.create('fresh-client-id-00000', 'F', 'Fresh')).msg.type).toBe('state');
     expect(h.logs.some((l) => l.includes('"team-forgotten"') && l.includes('unused'))).toBe(true);
     expect((await h.hello('PADDED2345', 'someone-client-id-0000')).msg).toMatchObject({ code: 'bad-code' });
+    // Several devices under one label are one person (review 3, item 3): junk too.
+    expect((await h.create('more-client-id-000000', 'M', 'More')).msg.type).toBe('state');
+    expect((await h.hello('LABELL2345', 'someone-client-id-0000')).msg).toMatchObject({ code: 'bad-code' });
     // Nothing else counts as junk: the next new team is refused.
-    expect((await h.create('more-client-id-000000', 'M', 'More')).msg).toMatchObject({ code: 'full' });
+    expect((await h.create('most-client-id-000000', 'M', 'Most')).msg).toMatchObject({ code: 'full' });
   });
 
   it('remembers once a break had two or more people', async () => {

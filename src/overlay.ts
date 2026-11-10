@@ -51,8 +51,19 @@ const win = getCurrentWindow();
 // Joining or leaving a team happens in the settings window; start over when it does.
 void listen('identity-changed', () => location.reload());
 
+/** The Keychain wouldn't give out the identity; the settings window says so and offers to retry. */
+let identityFailed = false;
+void listen('identity-ready', () => {
+  if (identityFailed) location.reload();
+});
+
 void (async () => {
-  const identity = await platform.loadIdentity();
+  let identity: platform.Identity | null = null;
+  try {
+    identity = await platform.loadIdentity();
+  } catch {
+    identityFailed = true;
+  }
   // A refused server address is explained (and fixed) in the settings window.
   if (identity && !platform.serverProblem(identity.hub)) {
     void start(identity);

@@ -15,10 +15,18 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
 tauri-plugin-opener = "2"
 tauri-plugin-autostart = "2"
-tauri-plugin-single-instance = "2"
+# HMAC-SHA256 for per-hub client ids (src/identity.rs; HMAC itself is the few
+# lines there). Already in the build through tauri-codegen.
+sha2 = "0.10"
 
-# Hub access tokens in the login Keychain (src/token.rs). No default features:
-# only the Keychain item API is used.
+# The per-user single-instance lock (src/single_instance.rs: flock, getpeereid)
+# and the user's home folder from the user database (src/user.rs). Already in
+# the build through tauri and its dependencies.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Hub access tokens and the device identity in the login Keychain
+# (src/token.rs). No default features: only the Keychain item API is used.
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = { version = "3", default-features = false }
 

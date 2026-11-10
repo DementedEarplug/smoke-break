@@ -4,7 +4,7 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
 
-/** Names a person or group in logs, bans and quotas. Never the token itself. */
+/** Names one person (an identity) in logs, bans and quotas: one label per person, never shared. Never the token itself. */
 const LABEL = /^[A-Za-z0-9][A-Za-z0-9._@+-]{0,63}$/;
 /** Printable ASCII without spaces. */
 const TOKEN = /^[\x21-\x7e]{16,512}$/;
@@ -131,6 +131,11 @@ export class AccessTokens {
   /** True when every connection must carry a token. */
   get required(): boolean {
     return !!this.sharedDigest || !!this.opts.file;
+  }
+
+  /** Per-person tokens from a file, one shared token, or none at all. */
+  get mode(): 'file' | 'shared' | 'none' {
+    return this.opts.file ? 'file' : this.sharedDigest ? 'shared' : 'none';
   }
 
   get labels(): number {

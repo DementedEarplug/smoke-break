@@ -1,0 +1,51 @@
+{
+  "//": "HMAC-SHA256(key = the device secret as UTF-8, message = label + hub address), base64url without padding. Checked by src/identity.test.ts (WebCrypto) and src-tauri/src/identity.rs (Rust); both must give these exact ids, or existing installs change identity. Generated with node:crypto createHmac.",
+  "label": "smoke-break client id v1\n",
+  "cases": [
+    {
+      "secret": "SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS",
+      "hub": "wss://breaks.acme.example/ws",
+      "id": "MwB2HZztd6MRsaHQloNz-GUSR0LOyBwECtCTo3fs-bI"
+    },
+    {
+      "secret": "SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS",
+      "hub": "wss://evil.example/ws",
+      "id": "EU5PAfejx1xLBu6kwvICgwfoLIzC9II64dh1rI7aD0M"
+    },
+    {
+      "secret": "Ab0_-Ab0_-Ab0_-Ab0_-Ab0_-Ab0_-Ab",
+      "hub": "ws://localhost:8787/ws",
+      "id": "_MdK58uTY5K5ED4bEuE3Hz0lSejzGjaexFII1td9oSQ"
+    },
+    {
+      "secret": "kQ3x9_ZpL-0aV7mWc2RtYb8nHs4dEf6gJu1iKo5qPlM",
+      "hub": "wss://breaks.acme.example:8443/smoke/ws?team=1",
+      "id": "GKPTWEqWS_1MpVn68cNprDTqHTbLalaBcWppg7IbV2g"
+    },
+    {
+      "secret": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "hub": "wss://h.example/",
+      "id": "7FUDifX3pXecKf3iiQIx69ChsW2cMnkrSm8lqFLEtr0"
+    },
+    {
+      "secret": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+      "hub": "wss://h.example/",
+      "id": "Ya-FfN44Vq6Y12BGrCMMdvD0cYfSi5huuxVkGBhN2yQ"
+    },
+    {
+      "secret": "Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9Z9",
+      "hub": "ws://[::1]:8787/ws",
+      "id": "jLqxT2zGC9T85x_AQ1DBgZRFjrQQHLwyFKTKo8DLPVI"
+    },
+    {
+      "secret": "secret",
+      "hub": "wss://h/ws",
+      "id": "MwWhzNTG11kU1fn6Qkbhyr06hGsoYDQc1q_v9OQxuiE"
+    },
+    {
+      "secret": "kQ3x9_ZpL-0aV7mWc2RtYb8nHs4dEf6gJu1iKo5qPlM",
+      "hub": "wss://xn--brk-6ka.example/ws",
+      "id": "VYJ2VdznfkLqQeRYPpStfXEdlC-6bAYfFSxruyMd7A0"
+    }
+  ]
+}

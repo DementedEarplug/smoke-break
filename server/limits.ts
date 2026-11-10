@@ -33,6 +33,11 @@ export class WindowLimiter {
     return this.recent(key, now).length >= this.max;
   }
 
+  /** Events recorded for the key within the window. */
+  count(key: string, now = Date.now()): number {
+    return this.recent(key, now).length;
+  }
+
   /** Records an event and returns false if the key is over its limit. */
   take(key: string, now = Date.now()): boolean {
     const recent = this.recent(key, now);

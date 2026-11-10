@@ -9,6 +9,9 @@ are all done on the build machine or in CI.
 build until the hub and meeting host are set, locks the app to your hub, pins
 the webviews' CSP to it, signs with your identity and then checks the built app.
 A plain `npm run desktop:build` gives an app that can talk to any `wss:` hub.
+**Before handing an app to MDM, check it** with
+`npm run desktop:build:enterprise -- --check <path/to/Smoke Break.app>`
+([Checking a built app](#checking-a-built-app)).
 
 ## What the config already does
 
@@ -28,9 +31,14 @@ A plain `npm run desktop:build` gives an app that can talk to any `wss:` hub.
 - Each hub gets its own client id (derived from a random per-device secret
   and the hub address), its own saved team and its own access token. A server
   someone talks a user into entering learns nothing that works on yours.
-- On macOS, access tokens typed into onboarding and the device secret the
-  client ids are derived from are kept in the login Keychain (see
-  [Where secrets are stored](#where-secrets-are-stored) below).
+- On macOS, access tokens, the device secret and any client id pinned to a hub
+  are kept in the user's login Keychain, and the device secret never leaves
+  the app's native code (see [Where secrets are stored](#where-secrets-are-stored)).
+- One running app per user: a second launch asks the first to open its
+  settings window and quits. The lock and the socket for that live in the
+  app's data folder (`~/Library/Application Support/<bundle id>`, made
+  readable by the user only), not in `/tmp`, so another account on the Mac
+  can't stop the app from starting.
 
 ## 1. One-time setup
 
@@ -71,11 +79,10 @@ What the script does:
    signing identity when there is one.
 3. Runs `tauri build --config <that file>` with `VITE_LOCK_SERVER=1`, plus any
    arguments you give after `--` (e.g. `-- --target universal-apple-darwin`).
-4. Checks the built app: the pinned `connect-src` must be compiled into the
-   executable and nothing of the default wide one (`wss:` to any host,
-   `ws://localhost:*`…) may be left; the frontend must contain your hub
-   address. If any check fails it says so and exits with an error: don't ship
-   that build.
+4. Checks the built app, with the same checks as `--check` (below) plus one:
+   the frontend in `dist/` must contain your hub address. It prints the
+   pass/fail table; if any check fails it exits with an error: don't ship that
+   build.
 5. Prints a summary of what was pinned.
 
 ### Access tokens
@@ -103,7 +110,9 @@ bob:a71e…
 - Give each person their token privately (or deliver it with your MDM, below).
   They paste it once into the **Access token** field in onboarding. On macOS
   the app stores it in the login Keychain, filed under your hub's address, and
-  sends it only to that hub.
+  sends it only to that hub. If the Keychain won't take it (locked, or the
+  person clicked Deny), the app uses it until it quits, says so, and asks for
+  it again next time; it never writes it anywhere else.
 - **The hub re-reads the tokens file within a few seconds, without a
   restart.** Deleting a person's line cuts them off: their open connections
   are dropped and new ones are refused. Nobody else is affected and no new app
@@ -131,38 +140,113 @@ managed key would be the next step if you'd rather nobody types anything.)
 
 ### Where secrets are stored
 
-On macOS two kinds of secret live in the login Keychain, not in the webview's
-storage (a plain file other processes running as the user, and backups, can
-read):
+**On macOS**, in the user's **login keychain** (`~/Library/Keychains/login.keychain-db`),
+service = the bundle identifier, one generic-password item each:
 
-- each access token: service = the bundle identifier, account = the hub
-  address;
-- the device secret every client id is derived from, i.e. the proof of who
-  someone is to a hub, team ownership included: same service, account
-  `device-secret`. An existing install moves it out of web storage on its
-  first start with this version, keeping every id (and team ownership) as it
-  was.
+| Account | Holds | Goes to the webview? |
+|---|---|---|
+| the hub address, e.g. `wss://breaks.acme.internal/ws` | that hub's access token | yes: it reads it to connect |
+| `device-secret` | the random device secret every client id is derived from | **no**: the app's native code derives the id for a hub (HMAC-SHA256) and hands the webview only that id |
+| `client-id@<hub address>` | an id pinned to that hub: the one id older versions used for every hub, kept for the hub configured at upgrade so nobody loses their place or team ownership | only that id |
 
-The app always creates these items itself: it deletes any existing item and
-adds a new one instead of updating it, so another process can't pre-create
-the item with a lax access list and read what the app later stores. The
-webview reaches them only through narrow commands (fixed service, the account
-a checked hub address or the one fixed name, bounded sizes); it can't read or
-write any other Keychain item. Other apps asking for these items get a
-Keychain prompt. Trade-offs:
+- The app opens the login keychain by its path. It never writes to "the
+  default keychain" or searches the keychain list, which another process
+  running as the user could point at a keychain whose password it knows.
+  If the login keychain can't be opened, the app says so and writes nothing
+  to disk.
+- The app always creates these items itself: it deletes any existing item and
+  adds a new one instead of updating it, so another process can't pre-create
+  an item with a lax access list and read what the app later stores. Each new
+  item's access list names only Smoke Break (by its code signature); other
+  apps asking for it get a Keychain prompt.
+- The webview reaches them only through narrow commands: fixed service, the
+  account a checked hub address (or `client-id@` plus one, or the one fixed
+  name), bounded and checked values. It can't read or write any other item,
+  and has no command that returns the device secret.
+- An existing install moves what older versions kept in web storage (the
+  device secret, pinned ids, access tokens) into the Keychain on its first
+  start with this version. Each piece is deleted from web storage only after
+  the Keychain confirmed it, and every id stays the same, so nobody loses
+  their place or ownership.
+- **If the Keychain refuses** (locked, or the person clicked Deny), the app
+  does not fall back to web storage. A token is used until the app quits and
+  the app says it will have to be entered again. For the identity, it shows
+  the error and a Try again button; it never makes up a new identity, which
+  would silently lose team ownership. Whatever an older version left in web
+  storage stays there until the Keychain takes it: the identity when the
+  person presses Try again, a leftover token on the next start (it is used
+  from memory meanwhile).
 
-- The webview can still read the token and the secret through those
-  commands; that is what it needs them for. The Keychain protects them at
-  rest, not from a compromised app.
+**Still in web storage** (WebKit's storage for the app, under
+`~/Library/WebKit/`, readable by any process running as the user): the name
+someone typed, the hub address (unless locked), the **invite code** of their
+team on each hub, appearance settings, the pack's position, and two
+bookkeeping entries (that the device secret is in the Keychain, and for which
+hubs a pinned id is). Once the move above is done, no token, device secret
+or client id.
+
+**Without a Keychain** (the browser version, and desktop builds for other
+platforms) tokens, the device secret and pinned ids stay in web storage, and
+the token field says so. Don't use such builds where that matters.
+
+**What that protects against, and what it doesn't:**
+
+- **Another user account on the same Mac** (not an administrator) can't read
+  any of it: `~/Library` is readable by its owner only. It also can't stop the
+  app from starting (the single-instance lock is in the user's own data
+  folder) or talk to the running app (the app checks the other end's user id).
+  An administrator can read the user's files and, while the app runs, its
+  memory; the login keychain file is still encrypted with the user's login
+  password.
+- **Another process running as the same user** (malware, a rogue app) is
+  *not* stopped by any of this, only slowed down. It can read web storage
+  (name, invite codes); read the clipboard when a token is pasted; watch or
+  script the UI if the user granted it Accessibility access; make the app
+  lose its identity (e.g. by editing web storage), which is a denial of
+  service, not a takeover; and with an unsigned or ad-hoc-signed build, get
+  its own code into the app and read whatever the app can. What it can't do
+  is read the Keychain items quietly: their access list makes macOS ask the
+  user first. That raises the bar; it is not a boundary against malware
+  running as the user. A Developer ID signature with the hardened runtime
+  (section 3) also makes macOS refuse to let other processes attach to or
+  inject code into the app.
+- **A stolen laptop, locked or off**: with FileVault on, nothing is readable
+  without the user's password; the login keychain is additionally encrypted
+  with the login password. Without FileVault, web storage (name, invite codes)
+  can be read from the disk; the Keychain items can't without the login
+  password. Make FileVault mandatory through MDM.
+- **A stolen laptop that is unlocked**, or a login password the thief knows:
+  assume everything is readable, tokens and device secret included. **Revoke
+  the token** (delete the person's line in the tokens file); the hub then
+  refuses that laptop whatever it holds. See
+  [A stolen laptop or a departed employee](#a-stolen-laptop-or-a-departed-employee).
+- **Script running in the webview** (if a bug ever let a hub inject some):
+  it can read the token for a hub and ask for this device's id for a hub,
+  because the app itself needs both. It can't get the device secret, so it
+  can't derive ids later, elsewhere. In a locked build the CSP only lets it
+  talk to your hub.
+
+Trade-offs and checks:
+
 - The item's access list names the app's code signature. A signed release
   keeps the same identity across updates, so updates don't prompt. Unsigned or
   ad-hoc-signed dev builds change identity with every build, so macOS asks
   "Smoke Break wants to use your confidential information" after a rebuild.
   Click Always Allow, or sign dev builds with a fixed identity.
-- If the Keychain refuses (the person clicked Deny), and on other platforms,
-  the app falls back to web storage, as before.
-- Check it by hand on a Mac: `cd src-tauri && cargo test -- --ignored
-  keychain_round_trip` writes, reads and deletes test items.
+- The Keychain used is the classic file-based login keychain. The newer
+  data-protection keychain would tie the items to the app's signing team, but
+  macOS only lets apps with a keychain-access-group entitlement (that is, a
+  signed app with a provisioning profile) use it, and the app has to work
+  unsigned too.
+- An install whose items an older version wrote to a *different* default
+  keychain (only if someone had changed the default) won't find them in the
+  login keychain: the person enters their token again, and gets a new device
+  secret, so a team they owned needs `server/admin.ts set-owner`.
+- `cd src-tauri && cargo test` checks the derivation against the cases in
+  `shared/client-id-vectors.json` (the TypeScript tests check the same ones)
+  and the single-instance lock. `cargo test -- --ignored temp_keychain_round_trip`
+  exercises the Keychain code against a throwaway keychain file it creates
+  and deletes (macOS adds it to the keychain list while the test runs).
 
 ### How the CSP pin works
 
@@ -240,18 +324,39 @@ the ticket. The script then checks the pinned CSP and prints a summary.
 Output: `src-tauri/target/universal-apple-darwin/release/bundle/macos/Smoke Break.app`
 and `…/bundle/dmg/Smoke Break_<version>_universal.dmg`.
 
-Check the result before shipping:
+### Checking a built app
+
+The last step before handing the app to MDM, and the one to repeat on exactly
+the copy you hand over (it builds nothing and changes nothing):
 
 ```sh
 APP="src-tauri/target/universal-apple-darwin/release/bundle/macos/Smoke Break.app"
-codesign --verify --deep --strict --verbose=2 "$APP"
-codesign -dv --verbose=4 "$APP" 2>&1 | grep -E "Authority|TeamIdentifier|flags"   # expect flags=…(runtime)
-spctl --assess --type execute --verbose "$APP"          # expect: accepted, source=Notarized Developer ID
-xcrun stapler validate "$APP"
+VITE_SERVER_URL="wss://breaks.acme.internal/ws" SMOKE_BREAK_MEETING_HOST="acme.zoom.us" \
+  npm run desktop:build:enterprise -- --check "$APP"
 ```
+
+It prints a table and exits non-zero if any line says FAIL:
+
+| Check | Passes when |
+|---|---|
+| Build record | the executable carries the record `src-tauri/build.rs` writes at build time (hub, server lock, whether a shared token was set, meeting host; never the token itself) |
+| Hub address | it is a `wss://` hub, and the one in `VITE_SERVER_URL` if you set it |
+| Server lock | the app was built with `VITE_LOCK_SERVER=1` |
+| Shared access token | `VITE_HUB_TOKEN` was empty |
+| Meeting host pinned | a Zoom host is pinned and is in the executable (and matches `SMOKE_BREAK_MEETING_HOST` if set) |
+| CSP connect-src | every `connect-src` compiled into the executable is exactly `'self' ipc: http://ipc.localhost <your hub origin>`, with nothing of the wide default left |
+| Signed | signed with a real identity (not unsigned or ad-hoc; `--allow-unsigned` turns this into a warning, for test builds only) |
+| `codesign --verify --deep --strict` | the signature is valid for everything in the bundle |
+| Hardened runtime | the code directory flags include `runtime` |
+| Notarization | if notarized (stapled ticket, or `spctl` says so): `spctl --assess` accepts it. Not notarized is a warning. On a Mac with Gatekeeper turned off `spctl` accepts anything, so this fails there: run the check on a Mac with Gatekeeper on |
+
+The record is what the build was configured with; the frontend itself is
+compressed inside the executable, so `--check` can't read the hub address out
+of it. The enterprise build checks that in `dist/` right after building.
 
 ## 4. Distribute with MDM
 
+- Run `--check` on the app first ([Checking a built app](#checking-a-built-app)).
 - Wrap the app in a signed **.pkg** (most MDMs want one):
   ```sh
   productbuild --component "$APP" /Applications \
@@ -297,8 +402,9 @@ addition to) Apple code signing.
       shared token on the hub either.
 - [ ] You know what to do when a laptop is lost or someone leaves (delete
       their line; reassign their teams with `server/admin.ts set-owner`).
-- [ ] Signed with your Developer ID, notarized and stapled; `spctl --assess`
-      says `accepted, source=Notarized Developer ID`.
+- [ ] Signed with your Developer ID, notarized and stapled, and
+      `npm run desktop:build:enterprise -- --check "$APP"` passes on the copy
+      you hand to the MDM.
 - [ ] Packaged as a signed, notarized `.pkg` and uploaded to the MDM, with the
       Managed Login Items payload if you want "Launch at login" pre-approved.
 - [ ] You know how the next version gets out: bump the version, build, sign,

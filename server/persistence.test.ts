@@ -103,6 +103,23 @@ describe('admin CLI (item 2: ownership recovery)', () => {
     expect(runAdmin(['--file', file, 'codes', 'ffffffff'], () => {})).toBe(1);
   });
 
+  it('deletes a team only with --yes, leaving the others as they were (review 3, item 3)', () => {
+    const { file } = setup();
+    const data = JSON.parse(readFileSync(file, 'utf8'));
+    data.push(saved({ code: 'KEEPTHIS23', ref: '0e0e0e0e', roster: [] }));
+    writeFileSync(file, JSON.stringify(data));
+    const before = readFileSync(file, 'utf8');
+    const out: string[] = [];
+    expect(runAdmin(['--file', file, 'delete-team', '0a0b0c0d'], (l) => out.push(l))).toBe(2);
+    expect(out.join('\n')).toMatch(/This deletes team 0a0b0c0d .*--yes/);
+    expect(readFileSync(file, 'utf8')).toBe(before);
+    expect(runAdmin(['--file', file, 'delete-team', 'ffffffff', '--yes'], () => {})).toBe(1);
+    expect(runAdmin(['--file', file, 'delete-team', '0a0b0c0d', '--yes'], () => {})).toBe(0);
+    const after = JSON.parse(readFileSync(file, 'utf8'));
+    expect(after).toEqual([data[1]]);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+  });
+
   it('lifts removals and denials by id or by label (item 1)', () => {
     const dir = tempDir();
     const file = join(dir, 'teams.json');

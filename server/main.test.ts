@@ -137,6 +137,19 @@ describe('standalone hub startup (item 6)', () => {
     }
   });
 
+  it('warns at startup when it runs with a shared token or none at all (review 3, item 4)', async () => {
+    const open = await run({ PORT: '19904' }, /data file:/);
+    expect(open.out).toMatch(/WARNING: no access token required/);
+    const shared = await run({ PORT: '19905', SMOKE_BREAK_ACCESS_TOKEN: 'shared-token-0123456789abcdef' }, /data file:/);
+    expect(shared.out).toMatch(/WARNING: one shared access token.*block new teams hub-wide/);
+    const file = join(tempDir(), 'tokens');
+    writeFileSync(file, 'alice:alice-token-0123456789abcdef\n');
+    chmodSync(file, 0o600);
+    const perPerson = await run({ PORT: '19906', SMOKE_BREAK_ACCESS_TOKENS_FILE: file }, /data file:/);
+    expect(perPerson.out).toMatch(/per-person tokens \(1 labels\)/);
+    expect(perPerson.out).not.toMatch(/WARNING/);
+  });
+
   it('listens on 127.0.0.1 by default and stops cleanly', async () => {
     const { code, out } = await run({ PORT: '19601' }, /data file:/);
     expect(out).toMatch(/ws:\/\/127\.0\.0\.1:19601/);

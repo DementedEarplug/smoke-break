@@ -62,7 +62,7 @@ export default defineConfig({
         '.yarnrc.yml',
         '**/.git/**',
         '**/.data/**',
-        // Wherever SMOKE_BREAK_DATA_DIR puts it, plus its temp, backup and .corrupt-* copies.
+        // Wherever SMOKE_BREAK_DATA_DIR puts it, plus its temp file and its .corrupt-*, .partial-* and .pre-roster-* copies.
         `${dataFile}*`,
         // Security reviews describe weaknesses; nobody browsing the dev server needs them.
         '*audit*.md',

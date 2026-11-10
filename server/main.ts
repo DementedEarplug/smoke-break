@@ -71,7 +71,7 @@ function started() {
   process.on('uncaughtException', (err) => console.error('[smoke-break] !!! uncaught exception (hub kept running):', err));
   process.on('unhandledRejection', (err) => console.error('[smoke-break] !!! unhandled rejection (hub kept running):', err));
   const s = hub.stats();
-  const access = s.tokenLabels ? `per-person tokens (${s.tokenLabels} labels)` : s.tokensRequired ? 'shared token' : 'NOT required';
+  const access = s.tokenMode === 'file' ? `per-person tokens (${s.tokenLabels} labels)` : s.tokenMode === 'shared' ? 'shared token' : 'NOT required';
   console.log(`Smoke Break hub on ws://${where}/ws (put it behind TLS for anything but local use)`);
   console.log(
     `[smoke-break] data file: ${dataFile} | access token: ${access}` +
@@ -79,6 +79,15 @@ function started() {
       ` | trusted proxies: ${socketPath ? 'the socket' : process.env.SMOKE_BREAK_TRUST_PROXY?.trim() || 'none'}` +
       ` | public host: ${process.env.SMOKE_BREAK_PUBLIC_HOST || 'not set'}`,
   );
+  if (s.tokenMode === 'shared') {
+    console.warn(
+      '[smoke-break] WARNING: one shared access token (SMOKE_BREAK_ACCESS_TOKEN): it can\'t be revoked for one person, limits are per address instead of per person, and anyone holding it can block new teams hub-wide. Use SMOKE_BREAK_ACCESS_TOKENS_FILE for a company deployment.',
+    );
+  } else if (s.tokenMode === 'none') {
+    console.warn(
+      '[smoke-break] WARNING: no access token required: anyone who can reach this hub can connect, make teams and ask to join them. Set SMOKE_BREAK_ACCESS_TOKENS_FILE for anything but local use.',
+    );
+  }
 }
 
 if (socketPath) {

@@ -158,7 +158,10 @@ if (window.top !== window.self) {
   const name = platform.savedName();
   const teamCode = linkedTeam();
   if (name && teamCode) {
-    void platform.clientId().then((clientId) => start({ type: 'hello', teamCode, clientId, name }));
+    void platform.clientId().then(
+      (clientId) => start({ type: 'hello', teamCode, clientId, name }),
+      (e: unknown) => onboard(e instanceof Error ? e.message : String(e)),
+    );
   } else {
     onboard();
   }

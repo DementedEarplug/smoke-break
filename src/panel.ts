@@ -103,12 +103,39 @@ function start(first: JoinMsg, joining: boolean, hub = platform.currentHub()) {
       return [button];
     },
     onCancelWaiting: leave,
+    storageNotice: () => platform.tokenNotice(hub),
   });
   net.connect();
 }
 
-void (async () => {
-  const identity = await platform.loadIdentity();
+/** The Keychain wouldn't give out the identity: say so, and offer to try again. */
+function cantLoadIdentity(message: string) {
+  current?.close();
+  current = null;
+  const again = h('button', { type: 'button', textContent: 'Try again' });
+  again.onclick = () => {
+    again.disabled = true;
+    void boot();
+  };
+  app.replaceChildren(
+    h(
+      'div',
+      { class: 'sb-center' },
+      h('div', { class: 'sb-card sb-onboarding' }, h('h1', { textContent: document.title }), h('p', { class: 'sb-error', textContent: message }), again),
+    ),
+  );
+}
+
+async function boot() {
+  let identity: platform.Identity | null;
+  try {
+    identity = await platform.loadIdentity();
+  } catch (e) {
+    // Never carry on with a made-up identity: that would lose the person's place and ownership.
+    return cantLoadIdentity(e instanceof Error ? e.message : String(e));
+  }
+  // The overlay gave up if it couldn't load the identity; this lets it try again.
+  void emit('identity-ready');
   const problem = platform.serverProblem();
   if (identity && problem) {
     // e.g. an old plain ws:// address to another machine: fix it without losing the team.
@@ -122,4 +149,6 @@ void (async () => {
   } else {
     onboard(problem ?? undefined);
   }
-})();
+}
+
+void boot();
