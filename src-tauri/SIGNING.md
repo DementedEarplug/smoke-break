@@ -95,7 +95,7 @@ What the script does:
 2. Writes a Tauri config override to
    `src-tauri/target/enterprise-build/tauri.override.json` that pins the CSP
    `connect-src` (both `csp` and `devCsp`) to exactly the app and your hub's
-   origin, `'self' ipc: http://ipc.localhost wss://breaks.acme.internal`, and
+   origin, `'self' ipc: wss://breaks.acme.internal`, and
    names the signing identity when there is one. Each CSP is written as one
    policy string (`connect-src …; default-src …; …`, the other directives as in
    `tauri.conf.json`), so `--check` can read where `connect-src` ends in the
@@ -344,7 +344,7 @@ given as directives instead of one string, the default build's) fails, and so
 does the default's source list anywhere. To look by hand (`$APP` is set in
 step 3), this should print one line: a count (one per CSP, `csp` and
 `devCsp`, in each architecture of the binary) and
-`connect-src 'self' ipc: http://ipc.localhost wss://breaks.acme.internal;`:
+`connect-src 'self' ipc: wss://breaks.acme.internal;`:
 
 ```sh
 grep -a -o -i "connect-src[^;]*;" "$APP"/Contents/MacOS/* | sort | uniq -c
@@ -359,8 +359,13 @@ the meeting host pin come from them):
 ```sh
 export VITE_SERVER_URL=wss://breaks.acme.internal/ws VITE_LOCK_SERVER=1 SMOKE_BREAK_MEETING_HOST=acme.zoom.us
 npm run build    # the frontend in dist/, which cargo embeds
-cd src-tauri && TAURI_CONFIG="$(cat target/enterprise-build/tauri.override.json)" cargo build --release
+cd src-tauri && TAURI_CONFIG="$(cat target/enterprise-build/tauri.override.json)" cargo build --release --features tauri/custom-protocol
 ```
+
+Don't leave out `--features tauri/custom-protocol` (the Tauri CLI adds it for
+you): without it cargo makes a development build, whose windows load from
+`http://localhost:5173` instead of the pages inside the app, so whatever is
+listening on that port on the Mac would run as the app.
 
 That gives a bare executable (`target/release/smoke-break`), not a bundle;
 `--check` needs it inside an `.app` (`Contents/MacOS/`), which `tauri build`
@@ -439,7 +444,7 @@ It prints a table and exits non-zero if any line says FAIL:
 | Server lock | the app was built with `VITE_LOCK_SERVER=1`, and the hub lock the native commands obey (the marker `sb-lock:v1:on:<hub> :end` that `src-tauri/src/lock.rs` reads at run time) is on and names the same hub as the record (an app built from older sources has no marker and fails) |
 | Shared access token | `VITE_HUB_TOKEN` was empty |
 | Meeting host pinned | a Zoom host is pinned, is in the code that checks links (not only in the record), and matches `SMOKE_BREAK_MEETING_HOST` if set |
-| CSP connect-src | there is a `connect-src` in the executable, every one is a complete directive (ended by `;`) whose sources are exactly `'self' ipc: http://ipc.localhost <your hub origin>` in any order, the hub compared as a whole, and nothing of the wide default is left (checked against `VITE_SERVER_URL` when the record has no usable hub) |
+| CSP connect-src | there is a `connect-src` in the executable, every one is a complete directive (ended by `;`) whose sources are exactly `'self' ipc: <your hub origin>` in any order, the hub compared as a whole, and nothing of the wide default is left (checked against `VITE_SERVER_URL` when the record has no usable hub) |
 | Signed | signed with a real identity (not unsigned or ad-hoc; `--allow-unsigned` turns this into a warning, for test builds only) |
 | `codesign --verify --deep --strict` | the signature is valid for everything in the bundle |
 | Hardened runtime | the code directory flags include `runtime` |

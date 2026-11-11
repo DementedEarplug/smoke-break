@@ -67,6 +67,19 @@ describe('admin CLI (item 2: ownership recovery)', () => {
     expect(text).not.toContain('5551234');
   });
 
+  it('won’t make an entry with no token label the owner on a hub with per-person tokens, unless told to (review 7)', () => {
+    const { file, owner, member } = setup();
+    const data = JSON.parse(readFileSync(file, 'utf8'));
+    data[0].roster = [{ id: owner, name: 'Gone', label: 'gone' }, { id: member, name: 'Pat' }];
+    writeFileSync(file, JSON.stringify(data));
+    const out: string[] = [];
+    expect(runAdmin(['--file', file, 'set-owner', '0a0b0c0d', member], (l) => out.push(l))).toBe(1);
+    expect(out.join('\n')).toMatch(/no access-token label yet/);
+    expect(JSON.parse(readFileSync(file, 'utf8'))[0].ownerId).toBe(owner);
+    expect(runAdmin(['--file', file, 'set-owner', '0a0b0c0d', member, '--unlabeled'], () => {})).toBe(0);
+    expect(JSON.parse(readFileSync(file, 'utf8'))[0].ownerId).toBe(member);
+  });
+
   it('hands a team to someone on its roster, changing nothing else', () => {
     const { file, member } = setup();
     const before = JSON.parse(readFileSync(file, 'utf8'));

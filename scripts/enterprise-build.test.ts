@@ -123,7 +123,7 @@ describe('makeOverride', () => {
 
   it('pins connect-src to exactly the hub in both CSPs, each one policy string with connect-src first', () => {
     const o = override();
-    const pinned = "connect-src 'self' ipc: http://ipc.localhost wss://breaks.acme.internal; ";
+    const pinned = "connect-src 'self' ipc: wss://breaks.acme.internal; ";
     expect(o.app.security.csp.startsWith(pinned)).toBe(true);
     expect(o.app.security.devCsp.startsWith(pinned)).toBe(true);
     expect(JSON.stringify(o)).not.toMatch(/wss: |wss:;|localhost:\*|127\.0\.0\.1/);
@@ -137,8 +137,12 @@ describe('makeOverride', () => {
   it('keeps the rest of each CSP from tauri.conf.json, whose connect-src it replaces', () => {
     const o = override();
     for (const key of ['csp', 'devCsp']) {
-      // The base is what the app's own connect-src starts with, so nothing it needs is lost.
-      expect(CONF.app.security[key]['connect-src'].startsWith(`${CSP_BASE} wss:`)).toBe(true);
+      // The base is the Mac part of the app's own connect-src; `http://ipc.localhost` (Windows only,
+      // and plain loopback on a Mac) is left out of the pinned build on purpose.
+      const own: string[] = CONF.app.security[key]['connect-src'].split(' ');
+      for (const src of CSP_BASE.split(' ')) expect(own).toContain(src);
+      expect(own).toContain('http://ipc.localhost');
+      expect(o.app.security[key]).not.toMatch(/ipc\.localhost/);
       const want = cspDirectives(CONF.app.security[key]);
       want.set('connect-src', [...CSP_BASE.split(' '), 'wss://breaks.acme.internal']);
       expect(cspDirectives(o.app.security[key])).toEqual(want);
@@ -149,7 +153,7 @@ describe('makeOverride', () => {
 
   it('takes a policy string as the base too, and refuses one with nothing but connect-src', () => {
     expect(pinnedPolicy("default-src 'self'; connect-src *; img-src data:", 'wss://h.example')).toBe(
-      "connect-src 'self' ipc: http://ipc.localhost wss://h.example; default-src 'self'; img-src data:",
+      "connect-src 'self' ipc: wss://h.example; default-src 'self'; img-src data:",
     );
     expect(() => pinnedPolicy({ 'connect-src': '*' }, 'wss://h.example')).toThrow(/no CSP/);
     expect(() => pinnedPolicy(null, 'wss://h.example')).toThrow(/no CSP/);
@@ -194,14 +198,14 @@ describe('checkEmbeddedCsp', () => {
 
   it('accepts a binary whose every connect-src is exactly the app and the hub, in any order', () => {
     expect(checkEmbeddedCsp(bin(policy(connectSrc(origin)), 'object-src', policy(connectSrc(origin))), origin)).toEqual([]);
-    expect(checkEmbeddedCsp(bin(`default-src 'self'; connect-src  ${origin} http://ipc.localhost 'self'\tipc:; img-src data:`), origin)).toEqual([]);
+    expect(checkEmbeddedCsp(bin(`default-src 'self'; connect-src  ${origin} 'self'\tipc:; img-src data:`), origin)).toEqual([]);
   });
 
   // The reviewers' cases: each one starts with the pinned sources and goes on.
   it.each([
     [`${connectSrc(origin)} wss:`, 'wss:'],
     [`${connectSrc(origin)} https://x wss://*`, 'https://x wss://*'],
-    [`'self' ipc: http://ipc.localhost wss://breaks.acme.internal.attacker.example`, 'wss://breaks.acme.internal.attacker.example'],
+    [`'self' ipc: wss://breaks.acme.internal.attacker.example`, 'wss://breaks.acme.internal.attacker.example'],
     [`${connectSrc(origin)} *`, '*'],
   ])('refuses connect-src %s', (sources, extra) => {
     const problems = checkEmbeddedCsp(bin(policy(sources)), origin);

@@ -39,8 +39,13 @@ import { MEETING_HOSTS } from '../shared/protocol.ts';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const TAURI_DIR = join(ROOT, 'src-tauri');
 
-/** What the windows need to talk to the app itself; the hub is added after these. */
-export const CSP_BASE = "'self' ipc: http://ipc.localhost";
+/**
+ * What the windows need to talk to the app itself; the hub is added after these.
+ * The default config also lists `http://ipc.localhost`, which only Windows uses:
+ * on a Mac that name is the loopback address, where any local process can listen,
+ * so the pinned build leaves it out.
+ */
+export const CSP_BASE = "'self' ipc:";
 /** Found in the default (unpinned) CSP after `wss:`; none of these may be left in the built app. */
 export const WIDE_SOURCES = ['ws://localhost:*', 'ws://127.0.0.1:*', 'ws://[::1]:*'];
 
@@ -251,7 +256,7 @@ export function connectSrcDirectives(text: string): FoundConnectSrc[] {
 /**
  * Problems with the CSP compiled into the app's executables. Every
  * `connect-src` in them must be a complete directive (ended by `;`) whose
- * sources are exactly `'self' ipc: http://ipc.localhost <hub origin>`, in any
+ * sources are exactly `'self' ipc: <hub origin>`, in any
  * order, the hub compared as a whole; at least one must be there; and nothing
  * that looks like a connect-src source list may sit anywhere else.
  */

@@ -19,7 +19,7 @@ import { fileURLToPath } from 'node:url';
 import { PUBLIC_ID, dataFileFromEnv, parseSavedTeam, writeAtomic } from './persistence.ts';
 
 const USAGE =
-  'Usage: node server/admin.ts [--file teams.json] list | codes <team-ref> | set-owner <team-ref> <member-id> | unban <team-ref> <member-id|label> | delete-team <team-ref> --yes\n' +
+  'Usage: node server/admin.ts [--file teams.json] list | codes <team-ref> | set-owner <team-ref> <member-id> [--unlabeled] | unban <team-ref> <member-id|label> | delete-team <team-ref> --yes\n' +
   'Run it as the hub\'s user (sudo -u <hub user> …), and stop the hub before set-owner, unban or delete-team.';
 
 type Raw = Record<string, unknown>;
@@ -133,6 +133,15 @@ export function runAdmin(argv: string[], out: (line: string) => void = console.l
     const member = team.roster.find((m) => m.id === target) ?? waiting;
     if (!member) {
       out(`${target} is not on team ${ref}'s roster or waiting to join it.`);
+      return 1;
+    }
+    // On a hub with per-person tokens, an entry with no label isn't tied to anyone yet: as owner
+    // it would go to whoever uses that device first, with any valid token, and nobody approves it.
+    const usesLabels = teams.some((t) => t.team?.roster.some((m) => m.label) || t.team?.pending.some((p) => p.label));
+    if (usesLabels && !member.label && !args.includes('--unlabeled')) {
+      out(
+        `${target} has no access-token label yet: they haven't connected since this hub started using per-person tokens. As owner, that device would be let in with the first valid token used on it, without anyone's approval. Have them connect once first (the owner approves them), or pick someone with a label (see list). To go ahead anyway, run again with --unlabeled.`,
+      );
       return 1;
     }
     // Only these fields change; everything else stays exactly as saved.

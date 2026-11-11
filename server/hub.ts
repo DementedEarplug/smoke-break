@@ -332,7 +332,8 @@ export function defaultsToLoopbackProxy(d: Omit<Deployment, 'tokenMode' | 'publi
 /**
  * The recommended protections a deployment lacks. In strict mode they're
  * `missing` (the hub won't start); otherwise each is one startup `warning`.
- * A non-loopback `HOST` is a warning in both: the hop from the proxy is plain ws://.
+ * A non-loopback `HOST` means the hop from the proxy is plain ws://: a warning outside strict
+ * mode, and `missing` in it unless SMOKE_BREAK_ENCRYPTED_HOP says the hop is encrypted.
  */
 export function checkDeployment(d: Deployment): { missing: string[]; warnings: string[] } {
   const remoteHost = d.listenHost !== undefined && !d.unixSocket && !isLoopbackHost(d.listenHost);
