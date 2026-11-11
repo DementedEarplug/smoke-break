@@ -75,12 +75,18 @@ describe('strict mode knows where a token was used from (items 2 and 4)', () => 
     expect(defaultsToLoopbackProxy({ ...base, enterprise: false, listenHost: '127.0.0.1' })).toBe(false);
     expect(defaultsToLoopbackProxy({ ...base, unixSocket: true, listenHost: undefined })).toBe(false);
     expect(defaultsToLoopbackProxy({ ...base, trustsProxy: true, listenHost: '127.0.0.1' })).toBe(false);
-    expect(checkDeployment({ ...base, listenHost: '10.0.0.2' }).missing).toEqual([expect.stringMatching(/set SMOKE_BREAK_TRUST_PROXY/)]);
-    // With the proxy's address it starts, with a warning that the hop from the proxy is plain ws://.
+    expect(checkDeployment({ ...base, listenHost: '10.0.0.2', encryptedHop: true }).missing).toEqual([expect.stringMatching(/set SMOKE_BREAK_TRUST_PROXY/)]);
+    // Even with the proxy's address, strict mode won't start while that hop is plain ws://…
     expect(checkDeployment({ ...base, trustsProxy: true, listenHost: '10.0.0.2' })).toEqual({
-      missing: [],
-      warnings: [expect.stringMatching(/HOST=10\.0\.0\.2 is not a loopback address: connections reach the hub as plain ws:\/\//)],
+      missing: [expect.stringMatching(/HOST=10\.0\.0\.2 is not a loopback address: connections reach the hub as plain ws:\/\/.*SMOKE_BREAK_ENCRYPTED_HOP=1/)],
+      warnings: [],
     });
+    // …unless the deployer says it is encrypted some other way.
+    expect(checkDeployment({ ...base, trustsProxy: true, listenHost: '10.0.0.2', encryptedHop: true })).toEqual({ missing: [], warnings: [] });
+    // Outside strict mode it stays a warning.
+    expect(checkDeployment({ ...base, enterprise: false, trustsProxy: true, listenHost: '10.0.0.2' }).warnings).toEqual([
+      expect.stringMatching(/HOST=10\.0\.0\.2 is not a loopback address/),
+    ]);
     expect(checkDeployment({ ...base, trustsProxy: true, listenHost: '127.0.0.1' })).toEqual({ missing: [], warnings: [] });
     // Outside strict mode nothing is refused for it.
     expect(checkDeployment({ ...base, enterprise: false, listenHost: '10.0.0.2' }).missing).toEqual([]);
@@ -98,14 +104,17 @@ describe('strict mode knows where a token was used from (items 2 and 4)', () => 
     expect(h.hub.stats().loopbackProxyDefault).toBe(false);
   });
 
-  it('npm run server: refuses a remote HOST without the proxy’s address (78), warns about the plain hop with it, and says it trusts loopback by default', async () => {
+  it('npm run server: refuses a remote HOST without the proxy’s address or with a plain hop (78), and says it trusts loopback by default', async () => {
     const strict = { SMOKE_BREAK_ENTERPRISE: '1', SMOKE_BREAK_ACCESS_TOKENS_FILE: tokensFile(['alice']), SMOKE_BREAK_PUBLIC_HOST: HOST, SMOKE_BREAK_PROXY_SECRET: SECRET };
     const refused = await run({ ...strict, PORT: '20610', HOST: '0.0.0.0' });
     expect(refused.code).toBe(78);
     expect(refused.out).toMatch(/the proxy's address: set SMOKE_BREAK_TRUST_PROXY/);
-    const remote = await run({ ...strict, PORT: '20611', HOST: '0.0.0.0', SMOKE_BREAK_TRUST_PROXY: '10.0.0.5' }, /data file:/);
-    expect(remote.out.match(/WARNING/g)).toHaveLength(1);
-    expect(remote.out).toMatch(/WARNING: HOST=0\.0\.0\.0 is not a loopback address: connections reach the hub as plain ws:\/\//);
+    const plain = await run({ ...strict, PORT: '20611', HOST: '0.0.0.0', SMOKE_BREAK_TRUST_PROXY: '10.0.0.5' });
+    expect(plain.code).toBe(78);
+    expect(plain.out).toMatch(/HOST=0\.0\.0\.0 is not a loopback address: connections reach the hub as plain ws:\/\//);
+    expect(plain.out).toMatch(/SMOKE_BREAK_ENCRYPTED_HOP=1/);
+    const remote = await run({ ...strict, PORT: '20611', HOST: '0.0.0.0', SMOKE_BREAK_TRUST_PROXY: '10.0.0.5', SMOKE_BREAK_ENCRYPTED_HOP: 'yes' }, /data file:/);
+    expect(remote.out).not.toMatch(/WARNING/);
     expect(remote.code).toBe(0);
     const local = await run({ ...strict, PORT: '20612' }, /data file:/);
     expect(local.out).toMatch(/trusted proxies: loopback \(strict mode default\)/);
@@ -157,6 +166,19 @@ describe('a device from before per-person tokens (item 3)', () => {
     expect(now.team.members.map((m) => m.id)).toEqual([id(cid.o)]);
     expect(events()).toContainEqual(expect.objectContaining({ event: 'unlabeled-member', member: id(cid.m2), outcome: 'dropped', label: 'm' }));
     expect((await hello('o', now.team.code, cid.m2, 'Mal')).msg).toMatchObject({ code: 'removed' });
+  });
+
+  it('the owner can’t hand the team to an entry that isn’t tied to a token yet (review 6)', async () => {
+    writeTeam([{ id: id(cid.o), name: 'Owner', label: 'o' }, { id: id(cid.r), name: 'Rita' }, { id: id(cid.m1), name: 'Mal', label: 'm' }]);
+    h.start(strict(['o', 'm']));
+    const o = await owner();
+    let from = o.msgs.length;
+    o.send({ type: 'transferOwner', id: id(cid.r) });
+    expect((await o.error(from)).message).toMatch(/hasn't connected since this hub started using per-person access tokens/);
+    // Someone already tied to their own token can still take it.
+    from = o.msgs.length;
+    o.send({ type: 'transferOwner', id: id(cid.m1) });
+    expect((await o.state((m) => m.team.ownerId === id(cid.m1), from)).team.ownerId).toBe(id(cid.m1));
   });
 
   it('a revoked person can’t use their unlabeled device with a colleague’s token: the owner sees it waiting, under that token’s label', async () => {

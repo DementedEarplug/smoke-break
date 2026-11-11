@@ -340,13 +340,14 @@ fn first_instance(identifier: &str) -> (bool, Option<single_instance::Guard>) {
 }
 
 /// Whether a window may navigate to `url`: the bundled pages (`tauri://localhost` on macOS and
-/// Linux, `http(s)://tauri.localhost` on Windows), plus the Vite dev server in dev builds.
+/// Linux; `http(s)://tauri.localhost` on Windows only, since elsewhere that name is just this
+/// machine's loopback address, where anyone can listen), plus the Vite dev server in dev builds.
 fn own_page(url: &tauri::Url, dev: bool) -> bool {
     let host = url.host_str().unwrap_or("");
     let no_login = url.username().is_empty() && url.password().is_none();
     match url.scheme() {
         "tauri" => no_login && host == "localhost",
-        "http" | "https" if host == "tauri.localhost" => no_login && url.port().is_none(),
+        "http" | "https" if cfg!(windows) && host == "tauri.localhost" => no_login && url.port().is_none(),
         "http" => dev && no_login && host == "localhost" && url.port() == Some(5173),
         _ => false,
     }
@@ -449,8 +450,9 @@ mod tests {
         let ok = |u: &str, dev: bool| own_page(&tauri::Url::parse(u).unwrap(), dev);
         assert!(ok("tauri://localhost/panel.html", false));
         assert!(ok("tauri://localhost/overlay.html?x=1", false));
-        assert!(ok("http://tauri.localhost/panel.html", false));
-        assert!(ok("https://tauri.localhost/panel.html", false));
+        // Windows serves the app's pages from this name; elsewhere it's only the loopback address.
+        assert_eq!(ok("http://tauri.localhost/panel.html", false), cfg!(windows));
+        assert_eq!(ok("https://tauri.localhost/panel.html", true), cfg!(windows));
         assert!(ok("http://localhost:5173/panel.html", true));
         // The dev server only counts in dev builds.
         assert!(!ok("http://localhost:5173/panel.html", false));

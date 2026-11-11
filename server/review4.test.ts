@@ -299,13 +299,15 @@ describe('strict mode, SMOKE_BREAK_ENTERPRISE=1 (item 5)', () => {
     expect(message).toMatch(/SMOKE_BREAK_PUBLIC_HOST/);
     expect(message).toMatch(/SMOKE_BREAK_PROXY_SECRET or SMOKE_BREAK_SOCKET/);
     expect(() => h.start({ ...strict, accessTokensFile: tokensFile() })).toThrow(/SMOKE_BREAK_PROXY_SECRET or SMOKE_BREAK_SOCKET/);
-    // A non-loopback HOST is fine with the proxy secret and the proxy's address (review 5); on a Unix socket, HOST doesn't apply.
-    expect(() => h.start({ ...strict, accessTokensFile: tokensFile(), proxySecret: 'proxy-secret-0123456789ab', trustProxy: '10.0.0.5', listenHost: '0.0.0.0' })).not.toThrow();
+    // A non-loopback HOST needs the proxy secret, the proxy's address (review 5) and an encrypted hop (review 6); on a Unix socket, HOST doesn't apply.
+    expect(() => h.start({ ...strict, accessTokensFile: tokensFile(), proxySecret: 'proxy-secret-0123456789ab', trustProxy: '10.0.0.5', listenHost: '0.0.0.0' })).toThrow(/SMOKE_BREAK_ENCRYPTED_HOP/);
+    expect(() => h.start({ ...strict, accessTokensFile: tokensFile(), proxySecret: 'proxy-secret-0123456789ab', trustProxy: '10.0.0.5', listenHost: '0.0.0.0', encryptedHop: true })).not.toThrow();
     expect(() => h.start({ ...strict, accessTokensFile: tokensFile(), unixSocket: true })).not.toThrow();
     expect(checkDeployment({ enterprise: true, tokenMode: 'file', publicHosts: [HOST], proxySecret: false, unixSocket: false, trustsProxy: false, listenHost: '0.0.0.0' }).missing).toEqual([
       expect.stringMatching(/SMOKE_BREAK_PROXY_SECRET or SMOKE_BREAK_SOCKET/),
       expect.stringMatching(/HOST=0\.0\.0\.0 is not a loopback address/),
       expect.stringMatching(/set SMOKE_BREAK_TRUST_PROXY/), // review 5
+      expect.stringMatching(/SMOKE_BREAK_ENCRYPTED_HOP=1/), // review 6
     ]);
     for (const host of ['127.0.0.1', 'localhost', '::1', '[::1]']) {
       expect(checkDeployment({ enterprise: true, tokenMode: 'file', publicHosts: [HOST], proxySecret: false, unixSocket: false, trustsProxy: false, listenHost: host }).missing).toHaveLength(1);

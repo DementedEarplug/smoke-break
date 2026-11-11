@@ -293,6 +293,8 @@ export interface HubOptions {
   enterprise?: boolean;
   /** The TCP address the hub listens on (not with a Unix socket), checked in strict mode. */
   listenHost?: string;
+  /** The hop from a proxy on another machine is encrypted some other way (SMOKE_BREAK_ENCRYPTED_HOP). */
+  encryptedHop?: boolean;
 }
 
 /** What `checkDeployment` looks at. */
@@ -308,6 +310,8 @@ export interface Deployment {
    */
   trustsProxy: boolean;
   listenHost?: string;
+  /** SMOKE_BREAK_ENCRYPTED_HOP: the deployer says the hop from a remote proxy is encrypted some other way. */
+  encryptedHop?: boolean;
 }
 
 export const isLoopbackHost = (host: string) => {
@@ -332,7 +336,7 @@ export function defaultsToLoopbackProxy(d: Omit<Deployment, 'tokenMode' | 'publi
  */
 export function checkDeployment(d: Deployment): { missing: string[]; warnings: string[] } {
   const remoteHost = d.listenHost !== undefined && !d.unixSocket && !isLoopbackHost(d.listenHost);
-  const plainHop = remoteHost
+  const plainHop = remoteHost && !d.encryptedHop
     ? [
         `HOST=${d.listenHost} is not a loopback address: connections reach the hub as plain ws:// (unencrypted), so anyone on the network between the proxy and the hub can read every access token, the proxy secret, invite codes and meeting links. Keep the proxy on this machine (HOST=127.0.0.1 or SMOKE_BREAK_SOCKET), or encrypt that hop (a private link, WireGuard, or TLS terminated on this host).`,
       ]
@@ -355,7 +359,11 @@ export function checkDeployment(d: Deployment): { missing: string[]; warnings: s
     if (remoteHost && !d.trustsProxy) {
       missing.push(`the proxy's address: set SMOKE_BREAK_TRUST_PROXY to it (HOST=${d.listenHost} is not a loopback address, so it isn't assumed)`);
     }
-    return { missing, warnings: plainHop };
+    // Strict mode doesn't run with tokens crossing a network in the clear on a warning alone.
+    if (plainHop.length) {
+      missing.push(`${plainHop[0]} If that hop is already encrypted, say so with SMOKE_BREAK_ENCRYPTED_HOP=1.`);
+    }
+    return { missing, warnings: [] };
   }
   const warnings: string[] = [...plainHop];
   if (!d.publicHosts.length) {
@@ -556,7 +564,14 @@ export function createHub(opts: HubOptions) {
     allowedOrigins: opts.allowedOrigins ?? envList(process.env.SMOKE_BREAK_ALLOWED_ORIGINS),
     allowLocalhostPages: opts.allowLocalhostPages ?? false,
   };
-  const setup = { enterprise, proxySecret: !!proxyDigest, unixSocket: opts.unixSocket ?? false, trustsProxy: trusted !== null, listenHost: opts.listenHost };
+  const setup = {
+    enterprise,
+    proxySecret: !!proxyDigest,
+    unixSocket: opts.unixSocket ?? false,
+    trustsProxy: trusted !== null,
+    listenHost: opts.listenHost,
+    encryptedHop: opts.encryptedHop ?? envBool('SMOKE_BREAK_ENCRYPTED_HOP'),
+  };
   /** Strict mode's default: a proxy secret on loopback means the proxy is on this machine. */
   const loopbackProxyDefault = defaultsToLoopbackProxy(setup);
   if (loopbackProxyDefault) trusted = parseTrustedProxies(true);
@@ -1754,6 +1769,11 @@ export function createHub(opts: HubOptions) {
     if (id === me.id) return sendError(ws, 'You already own this team.');
     const target = PUBLIC_ID.test(id) ? team.roster.get(id) : undefined;
     if (!target) return sendError(ws, 'No such member.');
+    // With per-person tokens, an entry from before them isn't tied to anyone yet: whoever used that
+    // device first, with any valid token, would become the owner without ever being approved.
+    if (tokens.mode === 'file' && !target.label) {
+      return sendError(ws, `${target.name || 'That person'} hasn't connected since this hub started using per-person access tokens. They need to connect once before they can own the team.`);
+    }
     // Handing a team over doesn't free a slot (it still counts for whoever made it), and can't push anyone over the cap.
     const to = target.label ? teamsOf(target.label, team) : null;
     if (to && to.held >= limits.teamsPerLabel) {
