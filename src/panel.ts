@@ -3,63 +3,152 @@
 
 import './style.css';
 import { emit } from '@tauri-apps/api/event';
+import type { Net } from './net.ts';
 import * as platform from './platform.ts';
 import { createSession } from './session.ts';
 import { type JoinMsg, createAppearancePanel, createTeamPanel, h, showOnboarding } from './shell.ts';
 
 document.documentElement.classList.add('sb-panel-window');
 const app = document.getElementById('app')!;
+/** The running session, so going back to onboarding can stop its retries. */
+let current: Net | null = null;
 
-function onboard(error?: string) {
+function onboard(error?: string, keep?: { teamCode?: string; askToken?: boolean }) {
+  current?.close();
+  current = null;
   showOnboarding(app, {
     prefillName: platform.savedName() || (localStorage.getItem('sb:lastName') ?? ''),
     error,
+    // Still a member of the saved team: offer to rejoin it (e.g. with a new token or server).
+    teamCode: keep?.teamCode,
+    askToken: keep?.askToken,
+    onOtherTeam: () => onboard(),
     onSubmit: (first) => start(first, true),
   });
 }
 
-function start(first: JoinMsg, joining: boolean) {
+/**
+ * `hub` is the hub `first.clientId` was made for. `joining` is set when this
+ * came from onboarding: the overlay then starts over once the team is known.
+ */
+function start(first: JoinMsg, joining: boolean, hub = platform.currentHub()) {
+  current?.close();
   const panelEl = h('div', { class: 'sb-card sb-panel sb-panel--window' });
   const lookEl = h('div', { class: 'sb-card sb-panel sb-panel--window' });
   app.replaceChildren(panelEl, lookEl);
   createAppearancePanel(lookEl);
 
-  const net = createSession(first, {
-    onTeam(team, you) {
-      panel.setTeam(team, you);
-      if (joining) {
-        joining = false;
-        void emit('identity-changed');
-      }
+  const announce = () => {
+    if (!joining) return;
+    joining = false;
+    void emit('identity-changed');
+  };
+  const net = createSession(
+    first,
+    {
+      onTeam(team, you) {
+        panel.setTeam(team, you);
+        announce();
+      },
+      onError: (message) => panel.setError(message),
+      onFatal(message, _forget, code) {
+        // The session has already dropped a team that's gone for good (bad
+        // code, removed, owner said no); anything else keeps it to retry later.
+        const askToken = code === 'unauthorized';
+        const saved = platform.savedTeam(hub);
+        onboard(message, saved || askToken ? { teamCode: saved, askToken } : undefined);
+      },
+      onRetrying(message, code, retryInMs) {
+        if (code === 'unauthorized') {
+          // Retrying won't help until someone enters the right token.
+          const teamCode = platform.savedTeam(hub) || (first.type === 'hello' ? first.teamCode : '');
+          return onboard(message, { teamCode, askToken: true });
+        }
+        panel.setNotice(`${message} Trying again in ${Math.round(retryInMs / 1000)} s.`);
+      },
+      onCantConnect(message, withToken) {
+        // Probably a token the hub refused at the door, possibly just the
+        // network. Keep backing off, say so, and offer to fix the token.
+        const teamCode = platform.savedTeam(hub) || (first.type === 'hello' ? first.teamCode : '');
+        panel.setNotice(message, {
+          label: withToken ? 'Change access token' : 'Enter access token',
+          run: () => onboard(message, { teamCode, askToken: true }),
+        });
+      },
+      onPending() {
+        // The session saved the team and keeps asking; the overlay picks it up
+        // and waits quietly (hidden) too.
+        panel.setWaiting(first.type === 'hello' ? first.teamCode : '');
+        announce();
+      },
+      onStatus: (s) => panel.setStatus(s),
     },
-    onError: (message) => panel.setError(message),
-    onFatal(message) {
-      platform.leaveTeam();
-      onboard(message);
-    },
-    onStatus: (s) => panel.setStatus(s),
-  });
+    hub,
+  );
+  current = net;
 
+  /** Stop, forget the team (on this hub), and let the overlay know. */
+  const leave = () => {
+    net.close();
+    platform.leaveTeam(hub);
+    void emit('identity-changed');
+    onboard();
+  };
   const panel = createTeamPanel(panelEl, {
     net,
     hint: 'Click the pack to start a break · drag it anywhere · right-click it for do-not-disturb',
     actions: () => {
-      const leave = h('button', { textContent: 'Leave team', className: 'secondary' });
-      leave.onclick = () => {
-        net.close();
-        platform.leaveTeam();
-        void emit('identity-changed');
-        onboard();
-      };
-      return [leave];
+      const button = h('button', { textContent: 'Leave team', className: 'secondary' });
+      button.onclick = leave;
+      return [button];
     },
+    onCancelWaiting: leave,
+    storageNotice: () => platform.tokenNotice(hub),
   });
   net.connect();
 }
 
-const identity = platform.loadIdentity();
-if (identity) {
-  start({ type: 'hello', teamCode: identity.teamCode, clientId: identity.clientId, name: identity.name }, false);
-} else {
-  onboard();
+/** The Keychain wouldn't give out the identity: say so, and offer to try again. */
+function cantLoadIdentity(message: string) {
+  current?.close();
+  current = null;
+  const again = h('button', { type: 'button', textContent: 'Try again' });
+  again.onclick = () => {
+    again.disabled = true;
+    void boot();
+  };
+  app.replaceChildren(
+    h(
+      'div',
+      { class: 'sb-center' },
+      h('div', { class: 'sb-card sb-onboarding' }, h('h1', { textContent: document.title }), h('p', { class: 'sb-error', textContent: message }), again),
+    ),
+  );
 }
+
+async function boot() {
+  let identity: platform.Identity | null;
+  try {
+    identity = await platform.loadIdentity();
+  } catch (e) {
+    // Never carry on with a made-up identity: that would lose the person's place and ownership.
+    return cantLoadIdentity(e instanceof Error ? e.message : String(e));
+  }
+  // The overlay gave up if it couldn't load the identity; this lets it try again.
+  void emit('identity-ready');
+  const problem = platform.serverProblem();
+  if (identity && problem) {
+    // e.g. an old plain ws:// address to another machine: fix it without losing the team.
+    onboard(problem, { teamCode: identity.teamCode });
+  } else if (identity) {
+    start(
+      { type: 'hello', teamCode: identity.teamCode, clientId: identity.clientId, name: identity.name },
+      false,
+      identity.hub,
+    );
+  } else {
+    onboard(problem ?? undefined);
+  }
+}
+
+void boot();

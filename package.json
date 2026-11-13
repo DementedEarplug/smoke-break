@@ -11,6 +11,7 @@
     "desktop": "tauri dev",
     "desktop:demo": "SMOKE_BREAK_MINUTE_MS=3000 tauri dev",
     "desktop:build": "tauri build",
+    "desktop:build:enterprise": "node scripts/enterprise-build.ts",
     "build": "tsc --noEmit && vite build",
     "share": "vite build && vite preview --host",
     "typecheck": "tsc --noEmit",
@@ -18,7 +19,6 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.4",
-    "@tauri-apps/plugin-opener": "^2.7.2",
     "ws": "^8.22.0"
   },
   "devDependencies": {

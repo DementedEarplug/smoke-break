@@ -1,0 +1,16 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "panel",
+  "description": "Team & settings: onboarding, the team panel and the pack's look. It saves the access token people type in, and tells the overlay when the identity or the look changes.",
+  "windows": ["panel"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-emit",
+    "allow-keychain-available",
+    "allow-token-get",
+    "allow-token-set",
+    "allow-identity-init",
+    "allow-client-id-pin",
+    "allow-client-id"
+  ]
+}

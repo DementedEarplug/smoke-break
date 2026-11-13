@@ -246,6 +246,71 @@ body {
   background: #3ac06a;
 }
 
+.sb-card .sb-members button,
+.sb-card .sb-members button:active {
+  font-size: 10px;
+  padding: 1px 6px 3px;
+  margin-left: 6px;
+}
+
+.sb-confirm {
+  font-size: 12px;
+}
+
+.sb-confirm p {
+  margin: 8px 0 0;
+}
+
+.sb-confirm .sb-row {
+  margin: 6px 0 12px;
+}
+
+.sb-members .sb-confirm {
+  margin-left: 16px;
+}
+
+.sb-tag {
+  margin-left: 6px;
+  padding: 0 4px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  border: 1px solid currentColor;
+}
+
+.sb-id {
+  margin-left: 6px;
+  padding: 0 4px;
+  font-size: 11px;
+  background: var(--paper-shade);
+  color: var(--muted);
+}
+
+/* The access-token label: who someone really is, so it stands out more than the name they typed. */
+.sb-label {
+  margin-left: 6px;
+  padding: 0 4px;
+  font-size: 11px;
+  font-weight: bold;
+  color: var(--ink);
+  border: 1px solid var(--ink);
+  background: var(--paper);
+  overflow-wrap: anywhere;
+}
+
+.sb-notice-action {
+  margin: 6px 0 0;
+}
+
+.sb-waiting .sb-field-label {
+  margin-top: 0;
+}
+
+.sb-waiting .sb-hint {
+  margin: 0 0 12px;
+}
+
 .sb-radio {
   flex-direction: row !important;
   align-items: center;

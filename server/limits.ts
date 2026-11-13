@@ -1,33 +1,70 @@
 // Small in-memory rate limiters for the hub. Good enough for one process.
 
+/** Keys beyond this are dropped oldest-first, so an address-rotation flood can't grow the map without bound. */
+const MAX_KEYS = 50_000;
+
 /** Allows `max` events per `windowMs` for each key (e.g. an IP address). */
 export class WindowLimiter {
+  /**
+   * Kept in order of each key's latest hit (a key is re-inserted when it's hit),
+   * so keys that have gone quiet are always at the front and housekeeping only
+   * ever looks at the expired ones, never the whole table.
+   */
   private hits = new Map<string, number[]>();
   private readonly max: number;
   private readonly windowMs: number;
+  private readonly maxKeys: number;
 
-  constructor(max: number, windowMs: number) {
+  constructor(max: number, windowMs: number, maxKeys = MAX_KEYS) {
     this.max = max;
     this.windowMs = windowMs;
+    this.maxKeys = maxKeys;
+  }
+
+  private recent(key: string, now: number): number[] {
+    const ts = this.hits.get(key) ?? [];
+    let i = 0;
+    while (i < ts.length && now - ts[i] >= this.windowMs) i++;
+    return i ? ts.slice(i) : ts;
   }
 
   /** True if the key has used up its limit (without recording anything). */
   blocked(key: string, now = Date.now()): boolean {
-    return (this.hits.get(key) ?? []).filter((t) => now - t < this.windowMs).length >= this.max;
+    return this.recent(key, now).length >= this.max;
+  }
+
+  /** Events recorded for the key within the window. */
+  count(key: string, now = Date.now()): number {
+    return this.recent(key, now).length;
   }
 
   /** Records an event and returns false if the key is over its limit. */
   take(key: string, now = Date.now()): boolean {
-    const recent = (this.hits.get(key) ?? []).filter((t) => now - t < this.windowMs);
+    const recent = this.recent(key, now);
     const ok = recent.length < this.max;
-    if (ok) recent.push(now);
-    if (recent.length) this.hits.set(key, recent);
-    else this.hits.delete(key);
-    // Forget idle keys now and then so the map can't grow without bound.
-    if (this.hits.size > 10_000) {
-      for (const [k, ts] of this.hits) if (now - ts[ts.length - 1] >= this.windowMs) this.hits.delete(k);
+    if (ok) {
+      // Move the key to the back: it now has the newest hit.
+      recent.push(now);
+      this.hits.delete(key);
+      this.hits.set(key, recent);
+    } else {
+      this.hits.set(key, recent); // keeps its place; its newest hit didn't change
     }
+    this.sweep(now);
     return ok;
+  }
+
+  /** Drops expired keys from the front; stops at the first live one. */
+  private sweep(now: number) {
+    for (const [k, ts] of this.hits) {
+      const expired = !ts.length || now - ts[ts.length - 1] >= this.windowMs;
+      if (!expired && this.hits.size <= this.maxKeys) break;
+      this.hits.delete(k);
+    }
+  }
+
+  get size() {
+    return this.hits.size;
   }
 }
 

@@ -1,27 +1,47 @@
 // Browser prototype: a fake "desktop" with the floating pack and the team panel.
 
 import './style.css';
+import { INVITE_CODE } from '../shared/protocol.ts';
 import { loadAppearance, onAppearanceChange, saveAppearance } from './appearance.ts';
 import * as platform from './platform.ts';
 import { createSession } from './session.ts';
-import { type JoinMsg, createAppearancePanel, createTeamPanel, h, showOnboarding } from './shell.ts';
+import {
+  APP_PATH,
+  type JoinMsg,
+  appLink,
+  cleanInviteCode,
+  createAppearancePanel,
+  createTeamPanel,
+  h,
+  showOnboarding,
+} from './shell.ts';
 import { lighterSkin, packSkin } from './widget/skins.ts';
 import { Widget } from './widget/widget.ts';
 
 const app = document.getElementById('app')!;
 const params = new URLSearchParams(location.search);
 
+/** Keeps the address bar on the app's own path, whatever path the page was opened on. */
+const replaceUrl = () => history.replaceState(null, '', `${APP_PATH}?${params}`);
+
 // A "fresh" tab is a separate teammate for local testing: drop the copied identity.
 const fresh = params.has('fresh');
 if (fresh) {
   platform.resetTabIdentity();
   params.delete('fresh');
-  history.replaceState(null, '', `${location.pathname}?${params}`);
+  replaceUrl();
 }
 
-function onboard(error?: string) {
+/** The invite code from the link, if it is one. */
+function linkedTeam(): string | null {
+  const code = cleanInviteCode(params.get('team') ?? '');
+  return INVITE_CODE.test(code) ? code : null;
+}
+
+function onboard(error?: string, askToken = false) {
   showOnboarding(app, {
-    teamCode: params.get('team') ?? undefined,
+    teamCode: linkedTeam() ?? undefined,
+    askToken,
     prefillName: platform.savedName() || (fresh ? '' : (localStorage.getItem('sb:lastName') ?? '')),
     error,
     onSubmit: start,
@@ -29,6 +49,8 @@ function onboard(error?: string) {
 }
 
 function start(first: JoinMsg) {
+  const hub = platform.currentHub();
+  const teamCode = first.type === 'hello' ? first.teamCode : '';
   const desktop = h('div', { class: 'sb-desktop' });
   const panelEl = h('aside', { class: 'sb-card sb-panel' });
   const lookEl = h('aside', { class: 'sb-card sb-panel' });
@@ -40,8 +62,9 @@ function start(first: JoinMsg) {
     onTeam(team, you) {
       if (params.get('team') !== team.code) {
         params.set('team', team.code);
-        history.replaceState(null, '', `${location.pathname}?${params}`);
+        replaceUrl();
       }
+      widget.root.hidden = false;
       widget.setTeam(team, you);
       panel.setTeam(team, you);
     },
@@ -49,13 +72,50 @@ function start(first: JoinMsg) {
       widget.showToast(message);
       panel.setError(message);
     },
-    onFatal: onboard,
+    onFatal(message, forget, code) {
+      // The link's code is dead: don't offer to join it again. (The session
+      // has already dropped the saved team.)
+      if (forget) {
+        params.delete('team');
+        replaceUrl();
+      }
+      onboard(message, code === 'unauthorized');
+    },
+    onRetrying(message, code, retryInMs) {
+      // Only a corrected token fixes this one: ask for it.
+      if (code === 'unauthorized') {
+        net.close();
+        return onboard(message, true);
+      }
+      widget.showToast(message, 6000);
+      panel.setNotice(`${message} Trying again in ${Math.round(retryInMs / 1000)} s.`);
+    },
+    onCantConnect(message, withToken) {
+      // Probably a token the hub refused at the door, possibly just the
+      // network: keep backing off, and offer to enter the token.
+      panel.setNotice(message, {
+        label: withToken ? 'Change access token' : 'Enter access token',
+        run: () => {
+          net.close();
+          onboard(message, true);
+        },
+      });
+    },
+    onPending() {
+      // Keep the code in the address, so a reload keeps waiting for the same team.
+      if (params.get('team') !== teamCode) {
+        params.set('team', teamCode);
+        replaceUrl();
+      }
+      widget.root.hidden = true;
+      panel.setWaiting(teamCode);
+    },
     onStatus: (s) => panel.setStatus(s),
-  });
+  }, hub);
 
   const look = loadAppearance();
   const widget = new Widget(desktop, {
-    storageKey: first.clientId,
+    doNotDisturb: platform.doNotDisturbStore(hub),
     now: () => net.now(),
     send: (m) => net.send(m),
     scale: look.scale,
@@ -73,17 +133,38 @@ function start(first: JoinMsg) {
     hint: 'Click the pack to start a break · drag to move it · right-click for do-not-disturb',
     actions: () => {
       const teammateTab = h('button', { textContent: 'Open a teammate tab' });
-      teammateTab.onclick = () => window.open(`${location.pathname}?team=${params.get('team')}&fresh=1`, '_blank');
+      teammateTab.onclick = () => {
+        const code = params.get('team');
+        window.open(appLink(code ? { team: code, fresh: '1' } : { fresh: '1' }), '_blank');
+      };
       return [teammateTab];
+    },
+    onCancelWaiting() {
+      net.close();
+      platform.leaveTeam(hub);
+      params.delete('team');
+      replaceUrl();
+      onboard();
     },
   });
   net.connect();
 }
 
-const name = platform.savedName();
-const teamCode = params.get('team');
-if (name && teamCode) {
-  start({ type: 'hello', teamCode: teamCode.toUpperCase(), clientId: platform.clientId(), name });
+if (window.top !== window.self) {
+  // Framed by another page (clickjacking): don't show anything clickable.
+  // The server should also send `frame-ancestors 'none'`, which a <meta> can't.
+  app.replaceChildren(h('p', { textContent: 'Open Smoke Break in its own tab.' }));
 } else {
-  onboard();
+  const name = platform.savedName();
+  const teamCode = linkedTeam();
+  if (name && teamCode) {
+    void platform.clientId().then(
+      (clientId) => start({ type: 'hello', teamCode, clientId, name }),
+      (e: unknown) => onboard(e instanceof Error ? e.message : String(e)),
+    );
+  } else {
+    // Older versions named a do-not-disturb key after the client id; that goes too.
+    platform.dropLegacyDnd();
+    onboard();
+  }
 }

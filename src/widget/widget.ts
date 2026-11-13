@@ -2,24 +2,22 @@
 // dragging, and click handling. Runs inside a page (browser prototype) or as
 // the whole content of the transparent desktop overlay window.
 
+import { type Break, type ClientMsg, type TeamView, clampLength } from '../../shared/protocol.ts';
+import { drawText, textWidth } from './font.ts';
+import { LINK_WAIT_MS, bubbleLines, timeLeft } from './limits.ts';
 import {
-  type Break,
-  type ClientMsg,
-  type TeamView,
-  clampLength,
-  isValidMeetingLink,
-} from '../../shared/protocol.ts';
-import { drawText, textWidth, wrap } from './font.ts';
+  type LightWait,
+  isParticipant,
+  lightWaitStep,
+  meetingTarget,
+  pendingLinkStep,
+  startLightWait,
+} from './meetingFlow.ts';
 import { type Hit, Scene, type SceneInput } from './scene.ts';
 import { type LighterSkin, type PackSkin, LIGHTER_SKINS, PACK_SKINS } from './skins.ts';
 import { COPY, type Theme } from './theme.ts';
 import { H, MOUTH_Y, PACK_W, PACK_X, W } from './sprites.ts';
 
-const BUBBLE_MAX_CHARS = 15;
-/** How long the freshly lit cigarette shows before the call opens. */
-const LIT_PAUSE_MS = 700;
-/** Open the call anyway if the animation never gets there (e.g. a slow server). */
-const MAX_LIGHT_WAIT_MS = 4000;
 /** Gap (art pixels) between the bubble's tail and whatever is tallest in the scene. */
 const BUBBLE_GAP = 3;
 const DRAG_THRESHOLD = 4;
@@ -29,8 +27,11 @@ const QUIET_FRAME_MS = 250;
 const WAKE_MS = 1000;
 
 export interface WidgetOptions {
-  /** Private per-identity key for local storage (so teammate tabs don't share settings). */
-  storageKey: string;
+  /**
+   * Where do-not-disturb is kept (`platform.doNotDisturbStore`: per hub on the
+   * desktop, per tab in the browser). Never keyed by the client id.
+   */
+  doNotDisturb: { load(): boolean; save(on: boolean): void };
   now(): number;
   send(msg: ClientMsg): void;
   /** Set when the widget is the whole overlay window rather than an element on a page. */
@@ -54,12 +55,6 @@ const fmtClock = (ms: number) => {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 };
 
-/** The break's meeting link, if it's one we're willing to open (the hub checks too). */
-function safeMeetingUrl(team: TeamView): string | null {
-  const url = team.brk?.meetingUrl;
-  return url && isValidMeetingLink(url) ? url : null;
-}
-
 function joinNames(names: string[]): string {
   if (names.length <= 1) return names[0] ?? '';
   if (names.length === 2) return `${names[0]} & ${names[1]}`;
@@ -79,8 +74,11 @@ export class Widget {
   private flickAt: number | null = null;
   /** My public member id; empty until the first state arrives. */
   private me = '';
-  /** Lit but waiting for the light-up animation to finish before opening the call. */
-  private meetingAfterLight: { since: number; litSeen: number | null } | null = null;
+  /**
+   * Lit (or joined and lit) and waiting for the hub to take us in and the
+   * light-up animation to finish before opening the call.
+   */
+  private meetingAfterLight: LightWait | null = null;
   /** Browser: the delayed popup was blocked, so the next click on the pack opens it. */
   private meetingBlocked = false;
   private toast: { text: string; until: number } | null = null;
@@ -88,6 +86,8 @@ export class Widget {
   private pendingMeetingWindow: Window | null = null;
   /** Desktop: open the meeting as soon as its link arrives. */
   private pendingMeetingOpen = false;
+  /** performance.now() when the call was promised; given up after `LINK_WAIT_MS`. */
+  private pendingMeetingSince = 0;
   private lastBubbleText: string | null = null;
   private drag: { id: number; x: number; y: number; left: number; top: number; moved: boolean; hit: Hit } | null =
     null;
@@ -100,6 +100,8 @@ export class Widget {
   private lastWake = performance.now();
   /** Set while waiting on a slow quiet-mode frame instead of requestAnimationFrame. */
   private quietTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Logged the first failed frame already (don't flood the console at 60 fps). */
+  private frameFailed = false;
   private readonly input: SceneInput = {
     brk: null,
     me: '',
@@ -115,7 +117,7 @@ export class Widget {
     parent: HTMLElement,
     private readonly opts: WidgetOptions,
   ) {
-    this.dnd = localStorage.getItem(this.dndKey) === '1';
+    this.dnd = opts.doNotDisturb.load();
     this.scale = opts.scale ?? 3;
     this.root = document.createElement('div');
     this.root.className = opts.host ? 'sb-widget sb-widget--overlay' : 'sb-widget';
@@ -155,8 +157,20 @@ export class Widget {
   private frame = (t: number) => {
     const dt = Math.min(QUIET_FRAME_MS / 1000, (t - this.lastFrame) / 1000);
     this.lastFrame = t;
-    this.tick(dt);
-    if (this.quiet) {
+    try {
+      this.tick(dt);
+    } catch (e) {
+      // One bad frame (e.g. odd data from the hub) mustn't stop the pack for good.
+      if (!this.frameFailed) console.error('Smoke Break: frame failed', e);
+      this.frameFailed = true;
+    }
+    let quiet = true;
+    try {
+      quiet = this.quiet;
+    } catch {
+      // Fall back to the slow timer.
+    }
+    if (quiet) {
       this.quietTimer = setTimeout(() => {
         this.quietTimer = null;
         this.frame(performance.now());
@@ -191,15 +205,22 @@ export class Widget {
     this.team = team;
     this.me = you;
     this.wake();
-    const url = safeMeetingUrl(team);
-    if (url && this.pendingMeetingWindow) {
-      this.pendingMeetingWindow.location.href = url;
-      this.pendingMeetingWindow = null;
+    // The link reaches participants only, so it can turn up a state or two after we joined.
+    if (!isParticipant(team, you)) this.meetingBlocked = false;
+    if (!this.pendingMeetingOpen && !this.pendingMeetingWindow) return;
+    const next = pendingLinkStep(team, you, performance.now() - this.pendingMeetingSince);
+    if (next === 'wait') return;
+    const tab = this.pendingMeetingWindow;
+    const open = this.pendingMeetingOpen;
+    this.pendingMeetingWindow = null;
+    this.pendingMeetingOpen = false;
+    if (next === 'drop') {
+      // We left (or the break ended) before the link came: don't leave a blank tab behind.
+      tab?.close();
+      return;
     }
-    if (url && this.pendingMeetingOpen) {
-      this.pendingMeetingOpen = false;
-      this.opts.host?.openUrl(url);
-    }
+    if (tab) tab.location.href = next.url;
+    if (open) this.opts.host?.openUrl(next.url);
   }
 
   setScale(scale: number) {
@@ -239,7 +260,7 @@ export class Widget {
   setDnd(on: boolean) {
     if (on === this.dnd) return;
     this.dnd = on;
-    localStorage.setItem(this.dndKey, on ? '1' : '0');
+    this.opts.doNotDisturb.save(on);
     this.showToast(on ? 'Do not disturb on' : 'Do not disturb off', 1500);
     this.opts.host?.onDndChange(on);
   }
@@ -305,6 +326,7 @@ export class Widget {
     this.scene.update(input, dt);
     this.scene.draw(input);
     this.maybeOpenMeeting();
+    this.expirePendingMeeting();
 
     if (this.toast && performance.now() > this.toast.until) this.toast = null;
     this.renderBubble(this.bubbleText());
@@ -343,7 +365,7 @@ export class Widget {
         if (mine) return hover?.target === 'myCig' ? 'Click to put it back' : this.copy.lightUp;
         return `${names} ${plural ? 'are' : 'is'} heading out. Click to join`;
       case 'lit': {
-        const left = b.endsAt === null ? 0 : b.endsAt - this.opts.now();
+        const left = timeLeft(b, this.opts.now());
         if (mine && mine.litAt === null) return this.copy.lightUp;
         if (mine) {
           if (hover?.target === 'myCig') return `${fmtClock((left / b.minuteMs) * 60_000)} left. ${this.copy.leaveLit}`;
@@ -369,8 +391,9 @@ export class Widget {
     this.bubble.hidden = text === null;
     if (text === null) return;
 
-    const lines = wrap(text, BUBBLE_MAX_CHARS);
-    const textW = Math.max(...lines.map(textWidth));
+    // At most a few short lines, whatever the hub sent (names, error messages).
+    const lines = bubbleLines(text);
+    const textW = Math.max(0, ...lines.map(textWidth));
     const w = textW + 8;
     const bodyH = lines.length * 7 + 5;
     const h = bodyH + 2;
@@ -447,22 +470,20 @@ export class Widget {
   /** Let people watch their cigarette catch before the call takes focus. */
   private openMeetingAfterLight() {
     this.meetingBlocked = false;
-    this.meetingAfterLight = { since: performance.now(), litSeen: null };
+    this.meetingAfterLight = startLightWait(performance.now());
   }
 
   private maybeOpenMeeting() {
     const wait = this.meetingAfterLight;
     if (!wait) return;
-    if (!this.myParticipant) {
-      this.meetingAfterLight = null;
-      return;
-    }
-    const now = performance.now();
-    if (wait.litSeen === null && this.scene.isLit(this.me)) wait.litSeen = now;
-    if ((wait.litSeen !== null && now - wait.litSeen >= LIT_PAUSE_MS) || now - wait.since >= MAX_LIGHT_WAIT_MS) {
-      this.meetingAfterLight = null;
-      this.openMeeting();
-    }
+    // A late joiner isn't a participant (and has no link) until the hub accepts the join.
+    const step = lightWaitStep(wait, performance.now(), {
+      participant: isParticipant(this.team, this.me),
+      lit: this.scene.isLit(this.me),
+    });
+    if (step === 'wait') return;
+    this.meetingAfterLight = null;
+    if (step === 'open') this.openMeeting();
   }
 
   /**
@@ -471,26 +492,44 @@ export class Widget {
    */
   private openMeeting() {
     const team = this.team;
-    const url = team && safeMeetingUrl(team);
+    const target = meetingTarget(team);
     const host = this.opts.host;
-    if (host) {
-      if (url) host.openUrl(url);
-      else if (team?.meetingProvider === 'fixed-link' && !team.zoomLink) {
-        this.showToast('No Zoom link yet. Add one in settings', 4000);
-      } else this.pendingMeetingOpen = true;
-    } else if (url) {
-      const w = window.open(url, '_blank');
+    if (target === 'no-link') {
+      this.showToast(
+        team?.ownerId === this.me ? 'No Zoom link yet. Add one in settings' : 'No Zoom link yet. Ask the team owner',
+        4000,
+      );
+    } else if (host) {
+      if (target === 'later') {
+        this.pendingMeetingOpen = true;
+        this.pendingMeetingSince = performance.now();
+      } else host.openUrl(target.url);
+    } else if (target !== 'later') {
+      const w = window.open(target.url, '_blank');
       if (w) w.opener = null;
       else this.popupBlocked();
-    } else if (team?.meetingProvider === 'fixed-link' && !team.zoomLink) {
-      this.showToast('No Zoom link yet. Add one in settings', 4000);
     } else {
-      // The link is still being created: open a tab now and point it there when it arrives.
+      // The link isn't here yet: open a tab while the click still allows it, and
+      // point it at the call when the link arrives (`setTeam`).
       const w = window.open('about:blank', '_blank');
       if (w) w.opener = null;
       else this.popupBlocked();
       this.pendingMeetingWindow = w;
+      this.pendingMeetingSince = performance.now();
     }
+  }
+
+  /**
+   * A call promised before its link came, and it still hasn't: give up, so a
+   * link the hub sends much later doesn't pop a call open out of nowhere (and
+   * don't leave a blank tab behind).
+   */
+  private expirePendingMeeting() {
+    if (!this.pendingMeetingOpen && !this.pendingMeetingWindow) return;
+    if (performance.now() - this.pendingMeetingSince < LINK_WAIT_MS) return;
+    this.pendingMeetingOpen = false;
+    this.pendingMeetingWindow?.close();
+    this.pendingMeetingWindow = null;
   }
 
   private popupBlocked() {
@@ -502,11 +541,6 @@ export class Widget {
     if (!this.canAdjustLength) return;
     const next = clampLength(this.brk!.lengthMin + delta);
     if (next !== this.brk!.lengthMin) this.opts.send({ type: 'setLength', lengthMin: next });
-  }
-
-  /** Per identity, so teammate tabs in one browser don't share it. */
-  private get dndKey() {
-    return `sb:dnd:${this.opts.storageKey}`;
   }
 
   private toggleDnd() {

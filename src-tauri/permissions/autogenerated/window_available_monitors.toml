@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-window-available-monitors"
+description = "Enables the window_available_monitors command without any pre-configured scope."
+commands.allow = ["window_available_monitors"]
+
+[[permission]]
+identifier = "deny-window-available-monitors"
+description = "Denies the window_available_monitors command without any pre-configured scope."
+commands.deny = ["window_available_monitors"]

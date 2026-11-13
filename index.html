@@ -3,6 +3,18 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      Browser version only (the desktop windows get their CSP from tauri.conf.json).
+      It talks only to the server that served it. Inline styles stay allowed
+      because the Vite dev server injects CSS as <style> tags. frame-ancestors
+      can't be set from a meta tag: the server must send it as a header (main.ts
+      also refuses to run inside a frame).
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'"
+    />
+    <meta name="referrer" content="no-referrer" />
     <title>Smoke Break</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 8' shape-rendering='crispEdges'><rect x='1' y='2' width='6' height='6' fill='%231a1020'/><rect x='2' y='3' width='4' height='4' fill='%23f4ecd8'/><rect x='2' y='3' width='4' height='1' fill='%23d23a3a'/><rect x='3' y='0' width='1' height='2' fill='%23ff8a30'/></svg>" />
   </head>

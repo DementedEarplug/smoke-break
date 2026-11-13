@@ -4,6 +4,7 @@
 // break style (styles/) decides what it looks like.
 
 import type { Break, Phase } from '../../shared/protocol.ts';
+import { MAX_LEAVING_ITEMS, MAX_PARTICLES, shownParticipants, timeLeft } from './limits.ts';
 import type { LighterSkin, PackSkin } from './skins.ts';
 import * as S from './sprites.ts';
 import { STYLES } from './styles/index.ts';
@@ -108,7 +109,7 @@ export class Scene implements SceneView {
       this.minuteMs = brk.minuteMs;
       const total = brk.lengthMin * brk.minuteMs;
       if (brk.phase === 'lit' && brk.endsAt !== null) {
-        this.remainingMs = Math.max(0, brk.endsAt - input.now);
+        this.remainingMs = timeLeft(brk, input.now);
         this.burnFrac = Math.min(1, this.remainingMs / total);
       } else if (brk.phase === 'out' && brk.outReason === 'burned') {
         this.burnFrac = 0;
@@ -119,8 +120,8 @@ export class Scene implements SceneView {
       }
     }
 
-    // Reconcile items with participants.
-    const desired = visible && brk!.phase !== 'out' ? brk!.participants : [];
+    // Reconcile items with participants (as many as can be drawn; see limits.ts).
+    const desired = visible && brk!.phase !== 'out' ? shownParticipants(brk!.participants, me) : [];
     const { start, spacing } = style.layout(desired.length);
     const standing = desired.filter((p) => p.litAt);
     const seen = new Set<string>();
@@ -166,6 +167,15 @@ export class Scene implements SceneView {
       if (v.lit) style.burst(v, this);
     }
     this.synced = true;
+    // A hub that swaps everyone out on every update would pile up items
+    // animating out: past a few, the oldest just go (Maps iterate oldest first).
+    let leaving = this.items.size - seen.size;
+    for (const v of this.items.values()) {
+      if (leaving <= MAX_LEAVING_ITEMS) break;
+      if (!v.removing) continue;
+      this.items.delete(v.id);
+      leaving--;
+    }
 
     // Deleting from a Map while iterating it is safe.
     for (const v of this.items.values()) {
@@ -215,6 +225,7 @@ export class Scene implements SceneView {
   // ── For styles ────────────────────────────────────────────────────────────
 
   puff(x: number, y: number) {
+    if (this.particles.length >= MAX_PARTICLES) return;
     this.particles.push({
       kind: 'puff',
       x,
@@ -229,6 +240,7 @@ export class Scene implements SceneView {
   }
 
   bit(x: number, y: number, vx: number, color: string) {
+    if (this.particles.length >= MAX_PARTICLES) return;
     this.particles.push({ kind: 'bit', x, y, vx, vy: 0, age: 0, life: 1.5, seed: 0, color });
   }
 

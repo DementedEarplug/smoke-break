@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-open-meeting"
+description = "Enables the open_meeting command without any pre-configured scope."
+commands.allow = ["open_meeting"]
+
+[[permission]]
+identifier = "deny-open-meeting"
+description = "Denies the open_meeting command without any pre-configured scope."
+commands.deny = ["open_meeting"]

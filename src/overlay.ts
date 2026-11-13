@@ -5,16 +5,8 @@ import './style.css';
 import { type Appearance, loadAppearance, onAppearanceChange, saveAppearance } from './appearance.ts';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import {
-  type Window,
-  availableMonitors,
-  currentMonitor,
-  cursorPosition,
-  getCurrentWindow,
-  LogicalSize,
-  PhysicalPosition,
-} from '@tauri-apps/api/window';
-import { openUrl } from '@tauri-apps/plugin-opener';
+import { getCurrentWindow } from '@tauri-apps/api/window';
+import { normalizeMeetingLink } from '../shared/protocol.ts';
 import * as platform from './platform.ts';
 import { createSession } from './session.ts';
 import { lighterSkin, packSkin } from './widget/skins.ts';
@@ -46,39 +38,123 @@ function layoutFor(scale: number) {
 }
 
 document.documentElement.classList.add('sb-overlay');
-const win = getCurrentWindow();
+
+type Point = { x: number; y: number };
+type Size = { width: number; height: number };
+type Monitor = { position: Point; size: Size; scaleFactor: number };
+
+/**
+ * The overlay's own window, through the app's `window_*` commands
+ * (src-tauri/src/lib.rs). They act on the calling window only; Tauri's own
+ * window commands would act on any window a `label` names. Positions and
+ * sizes read back are physical pixels; `setSize` takes logical ones.
+ */
+const win = {
+  show: () => invoke<void>('window_show'),
+  hide: () => invoke<void>('window_hide'),
+  setSize: (width: number, height: number) => invoke<void>('window_set_size', { width, height }),
+  setPosition: (x: number, y: number) => invoke<void>('window_set_position', { x: Math.round(x), y: Math.round(y) }),
+  startDragging: () => invoke<void>('window_start_dragging'),
+  setIgnoreCursorEvents: (ignore: boolean) => invoke<void>('window_set_ignore_cursor_events', { ignore }),
+  outerPosition: () => invoke<Point>('window_outer_position'),
+  outerSize: () => invoke<Size>('window_outer_size'),
+  scaleFactor: () => invoke<number>('window_scale_factor'),
+  currentMonitor: () => invoke<Monitor | null>('window_current_monitor'),
+  availableMonitors: () => invoke<Monitor[]>('window_available_monitors'),
+  cursorPosition: () => invoke<Point>('window_cursor_position'),
+  // Window events only need the event permission.
+  onMoved: (f: (p: Point) => void) => getCurrentWindow().onMoved((e) => f(e.payload)),
+  onScaleChanged: (f: (scale: number) => void) => getCurrentWindow().onScaleChanged((e) => f(e.payload.scaleFactor)),
+};
+type Win = typeof win;
 
 // Joining or leaving a team happens in the settings window; start over when it does.
 void listen('identity-changed', () => location.reload());
 
-const identity = platform.loadIdentity();
-if (identity) {
-  void start(identity);
-} else {
-  void win.hide();
-  void invoke('show_panel');
-}
+/** The Keychain wouldn't give out the identity; the settings window says so and offers to retry. */
+let identityFailed = false;
+void listen('identity-ready', () => {
+  if (identityFailed) location.reload();
+});
+
+void (async () => {
+  let identity: platform.Identity | null = null;
+  try {
+    identity = await platform.loadIdentity();
+  } catch {
+    identityFailed = true;
+  }
+  // A refused server address is explained (and fixed) in the settings window.
+  if (identity && !platform.serverProblem(identity.hub)) {
+    void start(identity);
+  } else {
+    void win.hide();
+    void invoke('show_panel');
+  }
+})();
 
 async function start(id: platform.Identity) {
   let mouseDown = false;
+  /** Waiting for the team owner's OK: the pack stays hidden until we're in. */
+  let waiting = false;
+  /** The window has its size and position and may be shown. */
+  let placed = false;
 
+  let askedForToken = false;
+  /** Got a team update since starting, i.e. the hub took our token at least once. */
+  let connected = false;
   const net = createSession(
     { type: 'hello', teamCode: id.teamCode, clientId: id.clientId, name: id.name },
     {
-      onTeam: (team, you) => widget.setTeam(team, you),
+      onTeam: (team, you) => {
+        connected = true;
+        widget.setTeam(team, you);
+        if (waiting) {
+          waiting = false;
+          if (placed) void win.show();
+        }
+      },
       onError: (message) => widget.showToast(message),
       onFatal: async () => {
-        // The team is gone (e.g. the server lost it): send them back to onboarding.
-        platform.leaveTeam();
+        // The team is gone (bad code, removed, the owner said no; the session
+        // has dropped it): back to onboarding. Otherwise (e.g. the server
+        // address is refused) the settings window explains and keeps the team.
         await win.hide();
         await invoke('show_panel');
       },
+      onCantConnect: () => {
+        // The session keeps backing off. If this never worked since the app
+        // started, it's most likely the token (a new or revoked one): the
+        // settings window says so and offers to change it. A dropped network
+        // later on only gets the toast.
+        widget.showToast('Can’t connect to the hub', 6000);
+        if (!connected && !askedForToken) {
+          askedForToken = true;
+          void invoke('show_panel');
+        }
+      },
+      // The settings window shows the waiting screen; the session keeps asking.
+      onPending: () => {
+        if (waiting) return;
+        waiting = true;
+        void win.hide();
+      },
+      onRetrying: (message, code) => {
+        // Keep the team and let the session back off; just say why the pack is quiet.
+        widget.showToast(message, 6000);
+        if (code === 'unauthorized' && !askedForToken) {
+          // Only someone typing in the right token fixes this; the settings window asks for it.
+          askedForToken = true;
+          void invoke('show_panel');
+        }
+      },
     },
+    id.hub,
   );
 
   let look = loadAppearance();
   const widget = new Widget(document.getElementById('app')!, {
-    storageKey: id.clientId,
+    doNotDisturb: platform.doNotDisturbStore(id.hub),
     now: () => net.now(),
     send: (m) => net.send(m),
     scale: look.scale,
@@ -88,7 +164,15 @@ async function start(id: platform.Identity) {
         mouseDown = false;
         void win.startDragging();
       },
-      openUrl: (url) => void openUrl(url),
+      // The Rust side checks the link again (https, exact Zoom host) and opens
+      // only its own re-serialized copy; JS has no general "open a URL" permission.
+      openUrl: (url) => {
+        const link = normalizeMeetingLink(url);
+        if (!link) return widget.showToast("That meeting link doesn't look right, so it wasn't opened", 5000);
+        invoke('open_meeting', { url: link }).catch(() =>
+          widget.showToast("Couldn't open the meeting link", 5000),
+        );
+      },
       onDndChange: (on) => void invoke('set_dnd', { on }),
     },
   });
@@ -102,7 +186,7 @@ async function start(id: platform.Identity) {
   widget.setTheme(look.theme);
   positionWidget(look.scale);
   const { width, height } = layoutFor(look.scale);
-  await win.setSize(new LogicalSize(width, height));
+  await win.setSize(width, height);
 
   onAppearanceChange(async (next: Appearance) => {
     const prev = look;
@@ -123,7 +207,8 @@ async function start(id: platform.Identity) {
   window.addEventListener('pointerup', () => (mouseDown = false));
 
   await placeWindow(win);
-  await win.show();
+  placed = true;
+  if (!waiting) await win.show();
   await clickThrough(win, widget, () => mouseDown);
 }
 
@@ -131,11 +216,11 @@ async function start(id: platform.Identity) {
  * The window ignores the mouse except over the pack, lighter, cigarettes, or
  * length buttons. While ignoring, the webview gets no events, so poll the cursor.
  */
-async function clickThrough(win: Window, widget: Widget, isMouseDown: () => boolean) {
+async function clickThrough(win: Win, widget: Widget, isMouseDown: () => boolean) {
   let origin = await win.outerPosition();
   let scale = await win.scaleFactor();
-  void win.onMoved((e) => (origin = e.payload));
-  void win.onScaleChanged((e) => (scale = e.payload.scaleFactor));
+  void win.onMoved((p) => (origin = p));
+  void win.onScaleChanged((s) => (scale = s));
 
   let ignoring: boolean | null = null;
   const setIgnore = (on: boolean) => {
@@ -147,7 +232,7 @@ async function clickThrough(win: Window, widget: Widget, isMouseDown: () => bool
   const poll = async () => {
     let next = CURSOR_POLL_MS;
     try {
-      const p = await cursorPosition();
+      const p = await win.cursorPosition();
       const x = (p.x - origin.x) / scale;
       const y = (p.y - origin.y) / scale;
       const inside = x >= 0 && y >= 0 && x < window.innerWidth && y < window.innerHeight;
@@ -167,25 +252,20 @@ async function clickThrough(win: Window, widget: Widget, isMouseDown: () => bool
 }
 
 /** Resize the window for a new scale, keeping the pack's bottom-center where it was on screen. */
-async function resizeKeepingPack(win: Window, from: number, to: number) {
+async function resizeKeepingPack(win: Win, from: number, to: number) {
   const a = layoutFor(from);
   const b = layoutFor(to);
   const [pos, dpr] = await Promise.all([win.outerPosition(), win.scaleFactor()]);
-  await win.setSize(new LogicalSize(b.width, b.height));
-  await win.setPosition(
-    new PhysicalPosition(
-      Math.round(pos.x + (a.packCenterX - b.packCenterX) * dpr),
-      Math.round(pos.y + (a.packBottom - b.packBottom) * dpr),
-    ),
-  );
+  await win.setSize(b.width, b.height);
+  await win.setPosition(pos.x + (a.packCenterX - b.packCenterX) * dpr, pos.y + (a.packBottom - b.packBottom) * dpr);
 }
 
 /** Restore the last position if it's still on a screen, otherwise bottom-right of the current one. */
-async function placeWindow(win: Window) {
+async function placeWindow(win: Win) {
   const size = await win.outerSize();
   try {
     const saved = JSON.parse(localStorage.getItem(POS_KEY) ?? '') as { x: number; y: number };
-    const monitors = await availableMonitors();
+    const monitors = await win.availableMonitors();
     const onScreen = monitors.some(
       (m) =>
         saved.x + size.width / 2 >= m.position.x &&
@@ -193,24 +273,19 @@ async function placeWindow(win: Window) {
         saved.y + size.height / 2 >= m.position.y &&
         saved.y + size.height / 2 < m.position.y + m.size.height,
     );
-    if (onScreen) await win.setPosition(new PhysicalPosition(saved.x, saved.y));
+    if (onScreen) await win.setPosition(saved.x, saved.y);
     else throw new Error('off screen');
   } catch {
-    const m = await currentMonitor();
+    const m = await win.currentMonitor();
     if (m) {
       const margin = 24 * m.scaleFactor;
-      await win.setPosition(
-        new PhysicalPosition(
-          Math.round(m.position.x + m.size.width - size.width - margin),
-          Math.round(m.position.y + m.size.height - size.height - margin * 3),
-        ),
-      );
+      await win.setPosition(m.position.x + m.size.width - size.width - margin, m.position.y + m.size.height - size.height - margin * 3);
     }
   }
 
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
-  void win.onMoved((e) => {
+  void win.onMoved((p) => {
     clearTimeout(saveTimer);
-    saveTimer = setTimeout(() => localStorage.setItem(POS_KEY, JSON.stringify(e.payload)), 300);
+    saveTimer = setTimeout(() => localStorage.setItem(POS_KEY, JSON.stringify(p)), 300);
   });
 }
