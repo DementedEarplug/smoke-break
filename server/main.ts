@@ -1,6 +1,6 @@
 // Standalone hub for the desktop app: `npm run server` (listens on 127.0.0.1:8787 by default,
 // or on a Unix socket with SMOKE_BREAK_SOCKET). Run it behind a TLS reverse proxy so apps
-// connect over wss:// (see README).
+// connect over wss:// (see docs/hosting.md).
 
 import { chmodSync, lstatSync, unlinkSync } from 'node:fs';
 import { createServer } from 'node:http';
