@@ -2,19 +2,19 @@
 
 A little pixel-art pack of cigarettes that floats on your desktop and gets your team on a break together.
 
-Click the pack to invite your team. When a second person joins, a lighter appears. Light up and everyone's Zoom call opens. Your cigarette then burns down as the break timer (10–15 minutes).
+Click the pack to invite your team. When a second person joins, a lighter appears. Light up and everyone's Zoom call opens. Your cigarette then burns down as the break timer, which lasts 10 to 15 minutes.
 
 Not a smoker? Pick another **break style**:
 
-- **Water:** a water cooler. You fill a cup instead of lighting up, and the jug drains as the timer.
-- **Coffee:** a coffee maker pours everyone a mug, and the pot drains as the timer.
-- **Donut:** a bakery box of donuts. Yours gets sprinkles, then gets eaten bite by bite as the timer.
+- **Water.** A water cooler. You fill a cup instead of lighting up, and the jug drains as the timer.
+- **Coffee.** A coffee maker pours everyone a mug, and the pot drains as the timer.
+- **Donut.** A bakery box of donuts. Yours gets sprinkles, then gets eaten bite by bite as the timer.
 
 Styles and skins are personal. Everyone shares the same break, but each person sees their own style.
 
 [![Smoke Break in action (36-second video)](brag-output/brag.jpg)](brag-output/brag.mp4)
 
-> **Status:** working prototype. The desktop app has only been built and tested on macOS. Windows and Linux are tracked in [#1](https://github.com/DementedEarplug/smoke-break/issues/1).
+> This is a working prototype. Nobody has built or tested the desktop app on anything but macOS yet. Issue [#1](https://github.com/DementedEarplug/smoke-break/issues/1) tracks Windows and Linux support.
 
 ## How it works
 
@@ -39,7 +39,7 @@ npm install
 npm run desktop
 ```
 
-This starts a hub on your computer and opens the app. The first time, the **Settings** window opens: enter your name, then start a team or join one with an invite code. After that, the pack floats in the bottom-right corner of your screen.
+This starts a hub on your computer and opens the app. The first time, the **Settings** window opens. Enter your name, then start a team or join one with an invite code. After that, the pack floats in the bottom-right corner of your screen.
 
 The app lives in the menu bar and has no Dock icon. The menu-bar icon has **Settings…**, **Do not disturb**, **Launch at login** and **Quit**.
 
@@ -62,9 +62,9 @@ Open http://localhost:5173 and start a team. To try a break by yourself, click *
 2. **Add your Zoom link.** In the team panel, open **Settings** and paste the team's Zoom meeting link. It must be an `https://` link on `zoom.us`, `zoom.com` or `zoomgov.com`, because it opens automatically on everyone's computer when a break starts.
 3. **Invite people.** Share the invite code (desktop) or invite link (browser) from the team panel. Teammates enter it the first time they open the app.
 4. **Let them in.** Someone with the right code doesn't join straight away. They show up under **waiting** in your team panel, and you let them in or turn them away. Someone turned away can't ask that team again for a day. You can switch approval off in Settings so the code alone is enough, unless the hub runs in strict mode.
-5. **Pick a default break length** in Settings (10–15 minutes). Whoever starts a break can still change it before anyone joins.
+5. **Pick a default break length** in Settings, from 10 to 15 minutes. Whoever starts a break can still change it before anyone joins.
 
-The team panel lists everyone on the team, online or not. Names stay reserved while their owners are offline. As the owner you can also:
+The team panel lists everyone on the team, online or not. A name stays reserved for its person while they're offline. As the owner you can also:
 
 - **Remove** someone. This also replaces the invite code, so they can't simply rejoin.
 - **Change the invite code** at any time.
@@ -85,7 +85,7 @@ The **My pack** panel lets you change the size, the pack and lighter skins, and 
 
 ## Hosting a hub for your team
 
-When teammates are on different computers, run the hub on a machine they can all reach, such as a small server, behind HTTPS. The full setup is in **[docs/hosting.md](docs/hosting.md)**: access tokens, the HTTPS proxy, running it as a service, building the app for your hub, and day-to-day admin.
+When teammates are on different computers, run the hub on a machine they can all reach, such as a small server, behind HTTPS. The full setup is in [docs/hosting.md](docs/hosting.md). It covers access tokens, the HTTPS proxy, running it as a service, building the app for your hub, and day-to-day admin.
 
 > **Don't use the dev server as your team's hub.** `npm run dev` and `npm run share` run a hub inside the development server. They use plain, unencrypted HTTP and serve the project's files. They're fine on a network you trust, but don't expose them to the internet or put a tunnel in front of them.
 
@@ -97,10 +97,10 @@ In short:
 
 - **Only people you give an access token to can connect.** The hub checks the token before it accepts a connection. With one token per person, deleting someone's token cuts them off within seconds.
 - **Knowing the invite code isn't enough to join.** The team owner approves each new person, and removing someone removes all of their devices.
-- **Only Zoom meeting links are allowed**, and both the hub and each app check them before anything opens. Only people in a break receive its link.
-- **Nobody can pose as someone else.** Each device has a private ID that teammates never see, and names can't be copied with lookalike letters.
-- **The hub limits** message sizes, connections and how often people can change things, so one person can't overwhelm it.
-- **The Mac app** stores its token in the Keychain and can only connect to your hub when built with `npm run desktop:build:enterprise`.
+- **Only Zoom meeting links are allowed.** The hub and each app both check a link before anything opens. Only people in a break receive its link.
+- **Nobody can pose as someone else.** Each device has a private ID that teammates never see, and nobody can copy a teammate's name with lookalike letters.
+- **The hub has limits.** It caps message sizes, connections and how often people can change things, so one person can't overwhelm it.
+- **The Mac app keeps its token in the Keychain.** When you build it with `npm run desktop:build:enterprise`, it can only connect to your hub.
 
 What the hub defends against, and what it doesn't, is in [docs/hosting.md](docs/hosting.md#security-model). Signing and shipping the Mac app is in [src-tauri/SIGNING.md](src-tauri/SIGNING.md).
 
@@ -117,7 +117,7 @@ During development the hub runs inside the Vite dev server (see `vite.config.ts`
 | Path | What it holds |
 | --- | --- |
 | `shared/protocol.ts` | Messages, types and validation shared by the apps and the hub |
-| `server/breakMachine.ts` | The break state machine: idle → pending → lighter → lit → out |
+| `server/breakMachine.ts` | The break state machine, which moves through idle, pending, lighter, lit and out |
 | `server/hub.ts` | The hub: teams, rosters, approvals, invite codes, timers, identity and limits |
 | `server/persistence.ts` | The saved team file: format, upgrades from older hubs, safe writes |
 | `server/accessTokens.ts` | Shared and per-person access tokens |
