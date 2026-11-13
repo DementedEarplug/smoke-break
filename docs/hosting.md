@@ -2,7 +2,7 @@
 
 The hub is the small server every Smoke Break app connects to. On one computer, `npm run desktop` starts one for you. For a team on different computers, run it on a machine everyone can reach and put HTTPS in front of it. This guide covers that setup, what to check before a company rollout, and day-to-day admin.
 
-Shipping the Mac app itself (signing, notarizing, rolling it out) is covered in [src-tauri/SIGNING.md](../src-tauri/SIGNING.md).
+[src-tauri/SIGNING.md](../src-tauri/SIGNING.md) covers shipping the Mac app itself: signing, notarizing and rolling it out.
 
 > **The dev and preview servers are not a hub deployment.** `npm run dev` and `npm run share` run a hub inside Vite for development and quick tests on a network you trust. They use plain HTTP and serve the project's files. Don't expose them to the internet or put a tunnel in front of them.
 
@@ -25,22 +25,22 @@ Shipping the Mac app itself (signing, notarizing, rolling it out) is covered in 
 
 For a company rollout you need every item below. The setup steps after it explain each one.
 
-- [ ] **Strict mode:** `SMOKE_BREAK_ENTERPRISE=1`. The hub then refuses to start (exit status 78, listing what's missing) unless the rest of this list is in place. See [what strict mode checks](#what-strict-mode-checks).
+- [ ] **Strict mode is on** (`SMOKE_BREAK_ENTERPRISE=1`). The hub then refuses to start (exit status 78, listing what's missing) unless the rest of this list is in place. See [what strict mode checks](#what-strict-mode-checks).
 - [ ] **A per-person tokens file** in `SMOKE_BREAK_ACCESS_TOKENS_FILE`, one line per person, file mode `0600`. No shared `SMOKE_BREAK_ACCESS_TOKEN`. ([Step 1](#1-give-each-person-a-token))
 - [ ] **An HTTPS reverse proxy on the same machine as the hub**, so apps connect over `wss://`. Add either a proxy secret (`SMOKE_BREAK_PROXY_SECRET`) or a Unix socket (`SMOKE_BREAK_SOCKET`) so nothing can connect around the proxy. ([Step 2](#2-put-https-in-front-of-it))
 - [ ] **`SMOKE_BREAK_PUBLIC_HOST`** set to the hub's hostname.
 - [ ] **A dedicated user and the systemd service** below, with a `0700` data directory and a `0600` settings file. ([Step 3](#3-run-it-as-a-service))
 - [ ] **The app built with `npm run desktop:build:enterprise`**, then signed, notarized and rolled out as described in [SIGNING.md](../src-tauri/SIGNING.md#2-build-time-settings-for-your-company). Not `npm run desktop:build`, and no `VITE_HUB_TOKEN`. ([Step 4](#4-build-the-app-for-your-hub))
-- [ ] **A plan for people leaving:** delete their line from the tokens file and they're cut off within seconds. If they owned a team, hand it to someone else with [`admin.ts set-owner`](#admin-tasks). See also [A stolen laptop or a departed employee](../src-tauri/SIGNING.md#a-stolen-laptop-or-a-departed-employee).
+- [ ] **You have a plan for people leaving.** Delete a person's line from the tokens file and the hub cuts them off within seconds. If they owned a team, hand it to someone else with [`admin.ts set-owner`](#admin-tasks). See also [A stolen laptop or a departed employee](../src-tauri/SIGNING.md#a-stolen-laptop-or-a-departed-employee).
 - [ ] **Audit log collection and alerts.** Alert at least on `limit`, `transfer-owner`, `owner-token-revoked` and `audit-dropped`. ([Audit log](#audit-log))
 
-Even better: make the hub reachable only on your VPN or behind your single sign-on proxy, so strangers can't reach it at all.
+Even better, make the hub reachable only on your VPN or behind your single sign-on proxy, so strangers can't reach it at all.
 
 ### What strict mode checks
 
 The hub can't see the HTTPS proxy, only what you tell it about it. With `SMOKE_BREAK_ENTERPRISE=1`:
 
-- It refuses to start without a per-person tokens file (a shared token, or none, is refused), without `SMOKE_BREAK_PUBLIC_HOST`, and without either `SMOKE_BREAK_PROXY_SECRET` or `SMOKE_BREAK_SOCKET`.
+- It refuses to start without a per-person tokens file (it refuses a shared token, or none), without `SMOKE_BREAK_PUBLIC_HOST`, and without either `SMOKE_BREAK_PROXY_SECRET` or `SMOKE_BREAK_SOCKET`.
 - It refuses to listen on a network address other machines can reach (a non-loopback `HOST`), because the hop from the proxy to the hub isn't encrypted. If you've encrypted that hop some other way, set `SMOKE_BREAK_ENCRYPTED_HOP=1`; the hub then also requires `SMOKE_BREAK_PROXY_SECRET` and `SMOKE_BREAK_TRUST_PROXY`.
 - On a loopback `HOST` with a proxy secret and no `SMOKE_BREAK_TRUST_PROXY`, it trusts the client address the proxy reports from loopback, so the audit log names the real client rather than the proxy.
 - Owner approval stays on for every team. Owners can't switch it off, and teams saved with it off get it switched back on at startup.
@@ -98,7 +98,7 @@ If the revoked person owned a team, the audit log says so (`owner-token-revoked`
 install -m 600 -o smoke-break tokens.new /etc/smoke-break/tokens.tmp && mv /etc/smoke-break/tokens.tmp /etc/smoke-break/tokens
 ```
 
-If the hub ever reads a file that's unreadable, malformed or has the wrong permissions, it fails closed: **no token is valid until the file is fixed**. New connections are refused and everyone connected with a per-person token is disconnected. Their apps keep their team and keep retrying. The log says why, once.
+If the hub ever reads a file that's unreadable, malformed or has the wrong permissions, it fails closed: **no token is valid until you fix the file**. The hub refuses new connections and disconnects everyone connected with a per-person token is disconnected. Their apps keep their team and keep retrying. The log says why, once.
 
 #### The shared-token alternative
 
@@ -109,11 +109,11 @@ If the hub ever reads a file that's unreadable, malformed or has the wrong permi
 - Anyone holding it can use up the hub-wide allowance for new teams and block team creation for everyone.
 - Changing it locks every app out until each one has the new token.
 
-Strict mode refuses a shared token. Outside strict mode, the hub prints a warning at startup for each recommended protection it's missing: a shared token or none at all, no `SMOKE_BREAK_PUBLIC_HOST`, `SMOKE_BREAK_TRUST_PROXY` without a proxy secret or socket, and a non-loopback `HOST`.
+Strict mode refuses a shared token. Outside strict mode, the hub prints a warning at startup for each recommended protection it's missing. Those are a shared token or none at all, no `SMOKE_BREAK_PUBLIC_HOST`, `SMOKE_BREAK_TRUST_PROXY` without a proxy secret or socket, and a non-loopback `HOST`.
 
 ### 2. Put HTTPS in front of it
 
-Any reverse proxy that handles WebSockets works: Caddy, nginx, a cloud load balancer. It should:
+Any reverse proxy that handles WebSockets works, such as Caddy, nginx or a cloud load balancer. It should:
 
 - handle HTTPS for your hostname (say `breaks.example.com`),
 - forward `/ws` to the hub,
@@ -128,8 +128,8 @@ The hub listens on `127.0.0.1` by default, so other machines can only reach it t
 
 **If anyone else can log in to the hub's machine, use a proxy secret or a Unix socket.** Any process on the machine can connect to `127.0.0.1` directly, skip the proxy and fake its own `X-Forwarded-For`, to pose as other addresses or get a colleague's address locked out.
 
-- **Proxy secret:** set `SMOKE_BREAK_PROXY_SECRET` to a long random value (`openssl rand -hex 32`) and have the proxy send it in an `X-Smoke-Break-Proxy` header. The hub refuses every connection without it, and only believes `X-Forwarded-For` when it's present. Keep the secret where other users can't read it: the hub's settings file (`0600`) and a proxy config file only root can read.
-- **Unix socket:** set `SMOKE_BREAK_SOCKET=/run/smoke-break/hub.sock` and the hub listens there instead of on a port (`HOST`, `PORT` and `SMOKE_BREAK_TRUST_PROXY` then don't apply). The socket is created with mode `0660`, so only the hub's user and group can connect. Put the proxy's user in the hub's group, and nobody else. A socket left over from a crash is removed at startup; anything else at that path stops the hub from starting.
+- **Proxy secret.** Set `SMOKE_BREAK_PROXY_SECRET` to a long random value (`openssl rand -hex 32`) and have the proxy send it in an `X-Smoke-Break-Proxy` header. The hub refuses every connection without it, and only believes `X-Forwarded-For` when it's present. Keep the secret where other users can't read it: the hub's settings file (`0600`) and a proxy config file only root can read.
+- **Unix socket.** Set `SMOKE_BREAK_SOCKET=/run/smoke-break/hub.sock` and the hub listens there instead of on a port (`HOST`, `PORT` and `SMOKE_BREAK_TRUST_PROXY` then don't apply). The hub creates the socket with mode `0660`, so only the hub's user and group can connect. Put the proxy's user in the hub's group, and nobody else. A socket left over from a crash is removed at startup; anything else at that path stops the hub from starting.
 
 Caddy:
 
@@ -169,7 +169,7 @@ Run the hub under a supervisor such as systemd so it comes back after a crash or
 
 If it can't start, it exits with:
 
-- **status 78** when only an admin can fix the problem: an unreadable or invalid team file, a data directory other users can write to, a bad tokens file, an invalid setting, something strict mode requires, a file in the way of `SMOKE_BREAK_SOCKET`, or no permission to listen.
+- **status 78** when only an admin can fix the problem. Examples are an unreadable or invalid team file, a data directory other users can write to, a bad tokens file, an invalid setting, something strict mode requires, a file in the way of `SMOKE_BREAK_SOCKET`, or no permission to listen.
 - **status 1** for problems that may clear by themselves, such as the port still being in use by a hub that's shutting down.
 
 Restarting on 78 changes nothing, so the service below doesn't. It also gives up after 5 failed starts in 5 minutes.
@@ -246,9 +246,9 @@ Both builds put `Smoke Break.app` and a `.dmg` in `src-tauri/target/release/bund
 
 ## The team file
 
-Teams are saved to `$SMOKE_BREAK_DATA_DIR/teams.json` (by default `.data/teams.json` in the repo), readable only by the user running the hub. The file holds every invite code and Zoom link, so keep it away from anything a web server serves and out of backups other people can read. Breaks in progress live only in memory, so restarting the hub ends them.
+The hub saves teams to `$SMOKE_BREAK_DATA_DIR/teams.json` (by default `.data/teams.json` in the repo), readable only by the user running the hub. The file holds every invite code and Zoom link, so keep it away from anything a web server serves and out of backups other people can read. Breaks in progress live only in memory, so restarting the hub ends them.
 
-Saves are atomic: the hub writes a fresh, randomly named temporary file and renames it into place, never following a symlink.
+Saves are atomic. The hub writes a fresh, randomly named temporary file and renames it into place, never following a symlink.
 
 **If the file can't be used, the hub refuses to start** (exit status 78) rather than start with no teams, which would make every app forget its team. That happens when the file can't be read (wrong owner or permissions), isn't a valid team list, or contains no valid team at all. The error names the file and, for a corrupt file, the `teams.json.corrupt-<timestamp>` copy it kept. Fix or restore the file, or move it away if you really want to start with no teams.
 
@@ -261,19 +261,19 @@ All these backup copies are `0600`. The hub doesn't write a copy that's identica
 On first start, the hub converts the team file to the current format and keeps the old one as `teams.json.pre-roster-<timestamp>`.
 
 - Everyone the old hub remembered becomes a team member. They're shown without a name until they reconnect.
-- Owners and removals are kept, and approval is switched on for every team.
+- The hub keeps owners and removals, and switches approval on for every team.
 - Teams with an old 6-character invite code get a new 10-character one. Members still get back in with the old code and then receive the new one.
 - Teammates the old hub didn't remember (older hubs only remembered each team's owner) aren't turned away. Their app's attempt with the old 6-character code becomes a join request the owner sees under **waiting**. This works while approval stays on and until the owner replaces the invite code. After that, the old code no longer works for anyone not on the team, and the owner shares the current code instead.
 - Teams from before owners existed have nobody to approve anyone, so nobody gets in until you assign an owner with `admin.ts set-owner`. The audit log names each such team once (`ownerless-team`), and `admin.ts list` shows who has asked to join it.
 
 ### Switching to per-person tokens
 
-Team members from before per-person tokens (from an older hub, or added under a shared token or none) have no token tied to them yet. Each is tied to a token the first time it's used with one:
+Team members from before per-person tokens (from an older hub, or added under a shared token or none) have no token tied to them yet. The hub ties each entry to the first token it's used with:
 
-- **The owner's own entry** is tied to the owner's token straight away, without approval.
+- **The owner's own entry** gets tied to the owner's token straight away, without approval.
 - **Everyone else** needs the owner's approval once, on any team that requires approval (every team in strict mode). Their first attempt moves them to **waiting**, with their name and their token's label. Once approved, they get back in with the code they have, even an old one, and receive the current one.
-- **On a team with approval off** (outside strict mode), the first token used is tied without asking.
-- **A token whose label was removed from the team**, or turned away from it, is refused, and that entry is dropped from the team and banned.
+- **On a team with approval off** (outside strict mode), the hub ties the first token used without asking.
+- **A token whose label was removed from the team**, or turned away from it, gets refused. The hub then drops that entry from the team and bans it.
 
 The audit log records each of these (`unlabeled-member`). In strict mode, the startup `load` line counts the entries not yet tied to a token (`unlabeledMembers`).
 
@@ -311,7 +311,7 @@ Each line has a timestamp, the client's address and, with per-person tokens, the
 | `unlabeled-member` | A member from before per-person tokens was used with a token for the first time (`label`). They were tied to it (`bound`, plus `owner` if it's the owner), moved to the waiting list (`waiting`), or `dropped` because that label was removed or turned away. |
 | `create` | A team was made. Includes the label's totals: `labelTeams` (teams counted against its limit), `labelOwns`, `labelCreated` (teams it made that still exist) and `labelCreatesToday`. |
 | `join`, `join-requested`, `join-failed` | Someone joined, asked to join, or was refused (with the reason). |
-| `rename` | A member connected under a new name (`from`, `to`). A few a minute per person are logged; the rest are counted in `suppressed`. |
+| `rename` | A member connected under a new name (`from`, `to`). The log records a few a minute per person and counts the rest in `suppressed`. |
 | `approve-member`, `deny-member` | The owner let someone in, or turned them away for a day. |
 | `remove-member` | The owner removed someone. `alsoRemoved` lists their other devices under the same label; `ownDevice` marks one of the owner's own devices. |
 | `transfer-owner` | The owner handed the team over. Includes the new owner's label (`toLabel`), who made the team (`createdBy`), and both labels' counts afterwards (`labelOwns`, `labelCreated`, `toLabelOwns`, `toLabelCreated`). |
@@ -320,7 +320,7 @@ Each line has a timestamp, the client's address and, with per-person tokens, the
 | `tokens-file-broken` | The tokens file can't be used. No token is valid until it's fixed. |
 | `token-revoked` | Connections of a revoked label (or everyone's, while the file is broken) were closed. |
 | `owner-token-revoked`, `ownerless-team` | A team's owner lost their token, or a team has no owner at all. An admin should run `set-owner`. |
-| `team-forgotten` | A team was forgotten while the hub ran: unused for 90 days, or a junk team cleared to make room. Teams already that old at startup are counted in `load` as `expired`. |
+| `team-forgotten` | A team was forgotten while the hub ran: unused for 90 days, or a junk team cleared to make room. The `load` line counts teams already that old at startup as `expired`. |
 | `limit` | A limit was hit. `kind` says which: `unauthorized`, `origin`, `proxy-secret`, `bad-codes`, `join-leave`, `set-length`, `presence`, `rename`, `settings`, `teams-per-label` and others. |
 | `suppressed`, `audit-dropped`, `audit-queued` | Lines held back by the log's own limits, with counts. |
 
@@ -330,9 +330,9 @@ Each line has a timestamp, the client's address and, with per-person tokens, the
 
 So nobody can flood out the lines that matter, different kinds of lines draw from separate budgets:
 
-- **Refused connections** (no token or a wrong one, wrong origin or host, missing proxy secret) can be caused by anyone who can reach the hub. They share one small budget: a burst of 10, then 2 a second. The rest are counted by kind in an `audit-dropped` line once a minute.
-- **Other lines from connections without a token label** (shared token or open hub): up to 50 a second.
-- **Lines from people with a token label, and owners' settings changes:** up to 20 a second, which nothing else can use.
+- **Refused connections** (no token or a wrong one, wrong origin or host, missing proxy secret) can come from anyone who can reach the hub. They share one small budget, a burst of 10 and then 2 a second. An `audit-dropped` line counts the rest by kind once a minute.
+- **Other lines from connections without a token label** (shared token or open hub) get up to 50 a second.
+- **Lines from people with a token label, and owners' settings changes,** get up to 20 a second, which nothing else can use.
 - **Security events** (removals, approvals and denials, ownership and code changes, revoked tokens, token reloads, forgotten and ownerless teams, `unlabeled-member`, and `load`) are never dropped for being over budget. They queue and are written in order at up to 20 a second. Only if 10,000 are waiting are more lost, and the hub says so (`audit-dropped` with `"class":"critical"`, and on stderr).
 
 Lines a client can trigger over and over (failed joins, limit hits, name changes) are also limited to a few a minute per reason and per address or label. A periodic `suppressed` line counts the rest.
@@ -345,16 +345,16 @@ Lines a client can trigger over and over (failed joins, limit hits, name changes
 | `PORT` | Port for `npm run server`. Default `8787`. |
 | `HOST` | Address `npm run server` listens on. Default `127.0.0.1`. Keep the default and run the HTTPS proxy on the same machine; see [step 2](#2-put-https-in-front-of-it). Any other address gets a startup warning, and strict mode refuses it unless `SMOKE_BREAK_ENCRYPTED_HOP` is on. |
 | `SMOKE_BREAK_ENCRYPTED_HOP` | On/off. Only for a proxy on another machine: turn it on once the hop from that proxy to the hub is encrypted some other way. The hub can't verify this. It drops the warning and lets strict mode start, but then also requires `SMOKE_BREAK_PROXY_SECRET` and `SMOKE_BREAK_TRUST_PROXY`. |
-| `SMOKE_BREAK_SOCKET` | Listen on this Unix socket (mode `0660`) instead of `HOST` and `PORT`. Only the hub's user and group can connect, and whatever connects is treated as the proxy. |
-| `SMOKE_BREAK_PROXY_SECRET` | A secret (16 to 512 printable characters, no spaces) the proxy must send in `X-Smoke-Break-Proxy`. Connections without it are refused, and `X-Forwarded-For` is only believed with it. Use it, or the socket, whenever other users can log in to the hub's machine. |
+| `SMOKE_BREAK_SOCKET` | Listen on this Unix socket (mode `0660`) instead of `HOST` and `PORT`. Only the hub's user and group can connect, and the hub treats whatever connects as the proxy. |
+| `SMOKE_BREAK_PROXY_SECRET` | A secret (16 to 512 printable characters, no spaces) the proxy must send in `X-Smoke-Break-Proxy`. The hub refuses connections without it, and only believes `X-Forwarded-For` with it. Use it, or the socket, whenever other users can log in to the hub's machine. |
 | `SMOKE_BREAK_ACCESS_TOKENS_FILE` | The per-person tokens file. See [step 1](#1-give-each-person-a-token). Can't be combined with `SMOKE_BREAK_ACCESS_TOKEN`. |
 | `SMOKE_BREAK_ACCESS_TOKEN` | One token shared by everyone, instead of the file. The weaker option; see [the shared-token alternative](#the-shared-token-alternative). Use a long random value. |
-| `SMOKE_BREAK_PUBLIC_HOST` | The hostname or hostnames the hub answers to, comma-separated. Connections for any other `Host` are refused, which blocks attacks where a web page tricks your browser into reaching the hub. Strongly recommended. |
+| `SMOKE_BREAK_PUBLIC_HOST` | The hostname or hostnames the hub answers to, comma-separated. The hub refuses connections for any other `Host`, which blocks attacks where a web page tricks your browser into reaching the hub. Strongly recommended. |
 | `SMOKE_BREAK_TRUST_PROXY` | The reverse proxies in front of the hub: IPs and CIDR ranges, comma-separated (e.g. `127.0.0.1` or `10.0.0.0/24`). An on value (`1`, `true`, `yes`, `on`) means loopback only; an off value means none. `X-Forwarded-For` is believed only from these addresses. When unset it's never believed, except in strict mode as described above. An invalid entry stops the hub (exit status 78). |
 | `SMOKE_BREAK_DATA_DIR` | Directory for `teams.json`. Default `.data/` in the repo. Must not be writable by other users. |
 | `SMOKE_BREAK_CONNECTIONS_PER_IP` | Connections allowed from one address, or one token label, once they've identified themselves. Default 500. Each app holds two connections, so the default fits about 250 people behind one office address. Connections that haven't identified themselves yet have a smaller separate allowance (100 per address or label, 2000 in total). |
 | `SMOKE_BREAK_MAX_CONNECTIONS` | Identified connections allowed in total. Default 10000. |
-| `SMOKE_BREAK_MAX_TEAMS` | Maximum number of teams. Default 2000. When full, the least recently used junk team that's been idle for a day is forgotten to make room. A junk team never had a break with two or more people and doesn't have two different token labels on it. Teams people actually use are never forgotten; new teams are refused instead. |
+| `SMOKE_BREAK_MAX_TEAMS` | Maximum number of teams. Default 2000. When it's full, the hub forgets the least recently used junk team that's been idle for a day to make room. A junk team never had a break with two or more people and doesn't have two different token labels on it. Teams people actually use are never forgotten; new teams are refused instead. |
 | `SMOKE_BREAK_TEAMS_PER_LABEL` | Teams one person (token label) may hold. Default 5. This counts teams they own plus teams they made that still exist, even ones they handed over. At the limit they can't make another team, and nobody can hand them one. `admin.ts set-owner` isn't held to it. |
 | `SMOKE_BREAK_IDENTITIES_PER_LABEL` | Devices one person may have in a team, including ones waiting for approval. Default 3. |
 | `SMOKE_BREAK_ALLOWED_ORIGINS` | Extra web origins allowed to connect, comma-separated. Only needed if you serve the browser version from a different host than the hub. |
@@ -364,14 +364,14 @@ Lines a client can trigger over and over (failed joins, limit hits, name changes
 
 ### What's protected
 
-- **Identity:** each device has a private random ID that proves who it is. Teammates only ever see a one-way hash of it, so nobody can act as someone else. Names must be unique within a team, including offline members, and the comparison ignores case, character width, invisible characters and common lookalike letters.
-- **Access:** with a tokens file, only people you give a token to can connect, and the token is checked before the connection is accepted. Invite codes are 10 characters. By default, someone with the right code still needs the owner's approval. With per-person tokens, each device is tied to the label it joined with and works under no other.
-- **Revocation:** deleting someone's line closes their connections within seconds and leaves them no way back in: not with their old devices under another token, not as a new device, not with an old code. The one exception is a device of theirs from before per-person tokens that hasn't connected since (see [Switching to per-person tokens](#switching-to-per-person-tokens)). A tokens file that becomes unreadable, malformed or readable by others fails closed.
-- **Removal:** the owner can remove anyone on the team, online or not. That closes their connections, takes them out of any break, bans them from the team and replaces the invite code at once. They never receive the new code. With per-person tokens it removes the whole person: every device under their label, their pending requests, and any future attempt from that label. Without per-person tokens, a removed person needs a new identity, the current code and (with approval on) the owner's approval to come back.
-- **Team settings** can only be changed by the owner. Meeting links must be Zoom meeting links, are stored in one standard form, and are checked by the hub and again by each app. Only the owner sees the team's link outside a break; during a break only the people in it receive it.
-- **Proxies:** `X-Forwarded-For` is only believed from trusted proxies (or the Unix socket), and only together with the proxy secret when one is set.
-- **Origins:** the hub only accepts browser connections from the desktop app, from `SMOKE_BREAK_ALLOWED_ORIGINS`, or from pages on its own `SMOKE_BREAK_PUBLIC_HOST`, so other websites can't drive it. Non-browser clients send no origin and are limited only by the access token. The dev server also accepts pages it serves on `localhost`, refuses to serve the team file, `.env` files and keys, and sends headers that stop it being framed.
-- **Desktop app:** it has a content security policy and can only open Zoom meeting links. The enterprise build locks it to your hub and your Zoom host.
+- **Identity.** Each device has a private random ID that proves who it is. Teammates only ever see a one-way hash of it, so nobody can act as someone else. Names must be unique within a team, including offline members, and the comparison ignores case, character width, invisible characters and common lookalike letters.
+- **Access.** With a tokens file, only people you give a token to can connect, and the hub checks the token before it accepts the connection. Invite codes are 10 characters. By default, someone with the right code still needs the owner's approval. With per-person tokens, each device is tied to the label it joined with and works under no other.
+- **Revocation.** Deleting someone's line closes their connections within seconds and leaves them no way back in. They can't return with their old devices under another token, as a new device, or with an old code. The one exception is a device of theirs from before per-person tokens that hasn't connected since (see [Switching to per-person tokens](#switching-to-per-person-tokens)). A tokens file that becomes unreadable, malformed or readable by others fails closed.
+- **Removal.** The owner can remove anyone on the team, online or not. That closes their connections, takes them out of any break, bans them from the team and replaces the invite code at once. They never receive the new code. With per-person tokens it removes the whole person: every device under their label, their pending requests, and any future attempt from that label. Without per-person tokens, a removed person needs a new identity, the current code and (with approval on) the owner's approval to come back.
+- **Team settings.** Only the owner can change them. Meeting links must be Zoom meeting links. The hub stores each one in a standard form, and the hub and each app both check it. Only the owner sees the team's link outside a break; during a break only the people in it receive it.
+- **Proxies.** The hub only believes `X-Forwarded-For` from trusted proxies or the Unix socket, and only together with the proxy secret when you've set one.
+- **Origins.** The hub only accepts browser connections from the desktop app, from `SMOKE_BREAK_ALLOWED_ORIGINS`, or from pages on its own `SMOKE_BREAK_PUBLIC_HOST`, so other websites can't drive it. Non-browser clients send no origin, so only the access token limits them. The dev server also accepts pages it serves on `localhost`, refuses to serve the team file, `.env` files and keys, and sends headers that stop it being framed.
+- **Desktop app.** It has a content security policy and can only open Zoom meeting links. The enterprise build locks it to your hub and your Zoom host.
 
 ### Limits the hub enforces
 
@@ -382,9 +382,9 @@ The hub caps, among other things:
 - wrong invite-code guesses (never applied to existing members);
 - message rates per connection and per person;
 - break changes (joining, leaving, changing the length): 6 per 10 seconds per member and per person, then a "slow down" message;
-- other changes that update the whole team (coming online, going offline, renaming, settings): another 6 per 10 seconds;
-- owner actions: removing, handing over and changing the code 5 times a minute; approving or turning away 20 times a minute;
-- team updates: changes within 150 ms are sent together, and big teams' updates are spaced to average at most about 2 MB a second.
+- other changes that update the whole team (coming online, going offline, renaming, settings), at another 6 per 10 seconds;
+- removing, handing over and changing the code, at 5 times a minute, and approving or turning people away, at 20 times a minute;
+- team updates. The hub sends changes made within 150 ms together, and spaces big teams' updates to average at most about 2 MB a second.
 
 Connections that haven't identified themselves must do so within 3 seconds and get their own small allowance, so they can't use up what identified connections need. A connection is only ever closed for its own flooding, never because someone else used up a shared budget. Connections that stop answering pings are dropped. Teams nobody has used for 90 days are forgotten. The exact numbers are in `DEFAULT_LIMITS` in `server/hub.ts`.
 
@@ -407,7 +407,7 @@ Connections that haven't identified themselves must do so within 3 seconds and g
 - **There's no single sign-on.** The hub doesn't talk to your company's identity provider. People get their token from whoever runs the hub, and leaving the company doesn't cut them off until their line is deleted.
 - **Approval and removal can't take back what people already saw.** A member can pass on the code, the team list or a meeting link from a break. If a removed person had the Zoom link, change the meeting's passcode.
 - **The Mac app protects its stored secrets from other user accounts and from a stolen, locked laptop (with FileVault), but not from malware running as the same user.** See [Where secrets are stored](../src-tauri/SIGNING.md#where-secrets-are-stored).
-- **The hub admin can read everything the hub holds:** names, teams, who's online, token labels, invite codes and meeting links. The audit log has names, labels and client addresses, but never codes or links.
+- **The hub admin can read everything the hub holds.** That includes names, teams, who's online, token labels, invite codes and meeting links. The audit log has names, labels and client addresses, but never codes or links.
 - **Devices from before per-person tokens aren't tied to a token until they're used with one.** Until then, whoever has the owner's old device and any valid token can take that team. See [Switching to per-person tokens](#switching-to-per-person-tokens).
 - **The hub doesn't encrypt the hop from the proxy.** HTTPS ends at the proxy, so keep it on the hub's machine or protect that hop yourself.
 - **Rate limits don't stop a large distributed attack.** Without per-person tokens, people who share an office address with an attacker share its message budget (though only the flooding connection is closed). With no token at all, many addresses can still fill the allowance for new connections.
